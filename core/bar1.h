@@ -6,8 +6,8 @@
 // fixed slots for the scanout surfaces, one per screen, so the framebuffers' apertures are known before GSP-RM is
 // up; slot i at BAR1_FB_OFF + i * BAR1_FB_SIZE
 #define BAR1_FB_OFF 0x200000ull
-#define BAR1_FB_SIZE 0x1000000ull  // 16 MB: 2560x1600 at 32 bpp
-#define BAR1_FB_SLOTS 4  // the most heads Turing to Ada have; 66 MB of a 256 MB BAR1
+#define BAR1_FB_SIZE 0x2200000ull  // 34 MB: 3840x2160 at 32 bpp
+#define BAR1_FB_SLOTS 4  // the most heads Turing to Ada have; 138 MB of a 256 MB BAR1
 
 struct bar1 {
     struct gsp *s;

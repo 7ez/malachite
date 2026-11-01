@@ -6,11 +6,17 @@
 
 #include "plat.h"
 
+extern "C" {
+#include "../core/bar1.h"
+}
+
+#define BAR1_NEEDED (BAR1_FB_OFF + BAR1_FB_SLOTS * BAR1_FB_SIZE)
+
 namespace {
 
 enum { PCI_COMMAND = 0x04, PCI_HEADER_TYPE = 0x0e, BAR1_LO = 0x14, BAR1_HI = 0x18 };
 enum { BRIDGE_PREF_BASE = 0x24, BRIDGE_PREF_LIMIT = 0x26, BRIDGE_PREF_BASE_HI = 0x28, BRIDGE_PREF_LIMIT_HI = 0x2c };
-enum { MAX_RANGES = 96, MAX_ANCESTORS = 8 };
+enum { MAX_RANGES = 96, MAX_ANCESTORS = 8, PCI_REBAR_CAPABILITY = 0x15 };
 
 struct range {
     uint64_t lo, hi;  // inclusive
@@ -142,6 +148,28 @@ bool pick(const ranges &windows, const ranges &used, uint64_t size, uint64_t *ba
     return false;
 }
 
+// BAR1's control register in the Resizable BAR capability and its sizes, bit n for 1 MB << n; 0 without one
+uint32_t rebar_ctrl(IOPCIDevice *pci, uint32_t *sizes)
+{
+    // extendedFindPCICapability finds nothing here, the list being there all the same
+    uint32_t cap = 0x100, header = pci->extendedConfigRead32(cap);
+    for (int i = 0; cap && (header & 0xffff) != PCI_REBAR_CAPABILITY && i < 64; i++) {
+        cap = header >> 20;
+        header = pci->extendedConfigRead32(cap);
+    }
+    if (!cap || (header & 0xffff) != PCI_REBAR_CAPABILITY)
+        return 0;
+    uint32_t count = pci->extendedConfigRead32(cap + 8) >> 5 & 7;
+    for (uint32_t i = 0; i < count; i++) {
+        uint32_t ctrl = cap + 8 + i * 8;
+        if ((pci->extendedConfigRead32(ctrl) & 7) == 1) {
+            *sizes = pci->extendedConfigRead32(ctrl - 4) >> 4;
+            return ctrl;
+        }
+    }
+    return 0;
+}
+
 }  // namespace
 
 // BAR1's size by writing ones with decode off, 0 when it isn't a 64-bit memory BAR
@@ -189,27 +217,47 @@ bool pci_place_bar1(IOPCIDevice *pci, uint64_t *base, uint64_t *size)
     bool widened = false, placed = false;
     range old = {};
     bool had_window = bridge && bridge_window(bridge, &old);
-    if (used.full) {
-        log_msg("Malachite: too many PCI ranges to place BAR1 safely\n");
-    } else if (!bridge) {
-        if (root)
-            windows_of(root, &windows);
-        placed = pick(windows, used, *size, base);
-    } else if (had_window && old.hi - old.lo + 1 >= *size && old.lo >= 1ull << 32) {
-        windows_of(bridge, &windows);
-        placed = pick(windows, used, *size, base);
-    } else if ((bridge->configRead16(BRIDGE_PREF_BASE) & 0xf) == 1 && above && !(had_window && others_in(used, old))) {
+    auto place = [&](uint64_t want) {
+        windows.n = 0;
+        if (!bridge) {
+            if (root)
+                windows_of(root, &windows);
+            return pick(windows, used, want, base);
+        }
+        if (had_window && old.hi - old.lo + 1 >= want && old.lo >= 1ull << 32) {
+            windows_of(bridge, &windows);
+            return pick(windows, used, want, base);
+        }
+        if ((bridge->configRead16(BRIDGE_PREF_BASE) & 0xf) != 1 || !above || (had_window && others_in(used, old)))
+            return false;
         // the bridge's window is absent or too small, and no other device lives in it: move it into free space above
         windows_of(above, &windows);
-        placed = pick(windows, used, *size, base);
-        if (placed) {
-            saved[0] = bridge->configRead32(BRIDGE_PREF_BASE_HI);
-            saved[1] = bridge->configRead32(BRIDGE_PREF_LIMIT_HI);
-            saved[2] = bridge->configRead16(BRIDGE_PREF_BASE);
-            saved[3] = bridge->configRead16(BRIDGE_PREF_LIMIT);
-            set_bridge_window(bridge, *base, *base + *size - 1);
-            bridge->setMemoryEnable(true);
-            widened = true;
+        if (!pick(windows, used, want, base))
+            return false;
+        saved[0] = bridge->configRead32(BRIDGE_PREF_BASE_HI);
+        saved[1] = bridge->configRead32(BRIDGE_PREF_LIMIT_HI);
+        saved[2] = bridge->configRead16(BRIDGE_PREF_BASE);
+        saved[3] = bridge->configRead16(BRIDGE_PREF_LIMIT);
+        set_bridge_window(bridge, *base, *base + want - 1);
+        bridge->setMemoryEnable(true);
+        widened = true;
+        return true;
+    };
+
+    if (used.full) {
+        log_msg("Malachite: too many PCI ranges to place BAR1 safely\n");
+    } else {
+        placed = place(*size);
+        uint32_t sizes = 0, ctrl = placed ? 0 : rebar_ctrl(pci, &sizes);
+        // A smaller BAR1 beats no screens at all: without them WindowServer composites in software, which macOS 26
+        // asserts in, again at each start and then at each boot
+        for (int n = 62 - __builtin_clzll(*size >> 20); ctrl && !placed && 1ull << (n + 20) >= BAR1_NEEDED; n--) {
+            if (!(sizes >> n & 1) || !place(1ull << (n + 20)))
+                continue;
+            log_msg("Malachite: no room for a %llu MB BAR1, using %u MB\n", (unsigned long long)(*size >> 20), 1u << n);
+            pci->extendedConfigWrite32(ctrl, (pci->extendedConfigRead32(ctrl) & ~(0x3fu << 8)) | (uint32_t)n << 8);
+            *size = 1ull << (n + 20);
+            placed = true;
         }
     }
     if (!placed) {
@@ -227,7 +275,8 @@ bool pci_place_bar1(IOPCIDevice *pci, uint64_t *base, uint64_t *size)
 
     pci->configWrite32(BAR1_LO, (uint32_t)*base | (old_lo & 0xf));
     pci->configWrite32(BAR1_HI, (uint32_t)(*base >> 32));
-    if (pci->configRead32(BAR1_HI) != (uint32_t)(*base >> 32) || (pci->configRead32(BAR1_LO) & ~0xfu) != (uint32_t)*base) {
+    if (pci->configRead32(BAR1_HI) != (uint32_t)(*base >> 32) || (pci->configRead32(BAR1_LO) & ~0xfu) != (uint32_t)*base ||
+        bar1_size_of(pci) != *size) {
         log_msg("Malachite: BAR1 did not take %#llx\n", (unsigned long long)*base);
         pci->configWrite32(BAR1_LO, old_lo);
         pci->configWrite32(BAR1_HI, old_hi);

@@ -206,6 +206,13 @@ private func copyPayload(_ pkg: String, efi: String?, legacy: Bool, saved: [Stri
     }
     say("  test programs")
 
+    // the app changes the extra resolutions as the user, without asking for a password
+    if !exists(scaledFile) {
+        try steps.write("", to: scaledFile)
+    }
+    steps.tool("/usr/sbin/chown", ["root:admin", scaledFile])
+    steps.tool("/bin/chmod", ["664", scaledFile])
+
     // tells the app a move from the old install is unfinished
     if legacy {
         try steps.write("", to: "\(supportDir)/migrating")

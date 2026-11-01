@@ -27,8 +27,6 @@ final class Model: ObservableObject {
     // a first install's choices
     @Published var useEFI = true
     @Published var fullBar = false
-    @Published var scaled = ((try? String(contentsOfFile: scaledFile, encoding: .utf8)) ?? "")
-        .split(separator: "\n").joined(separator: ", ")
     // an install from before the name Malachite, which the next install moves over
     @Published var legacy = false
     @Published var startAtLogin = UserDefaults.standard.object(forKey: "startAtLogin") as? Bool ?? true {
@@ -245,20 +243,6 @@ final class Model: ObservableObject {
 
     private func fields(of name: String) -> [String: String] {
         parseFields((try? String(contentsOfFile: "\(supportDir)/\(name)", encoding: .utf8)) ?? "")
-    }
-
-    // rendered this big and scaled down to the panel by the display engine; the driver reads them as it starts
-    func saveScaled() {
-        let sizes = scaled.split { ", \n".contains($0) }.map(String.init)
-        guard sizes.allSatisfy({ $0.range(of: #"^\d+x\d+$"#, options: .regularExpression) != nil }) else {
-            status = "Sizes look like 2560x1440"
-            return
-        }
-        start("Saving resolutions") {
-            let out = await admin("printf '%s\\n' \(quote(sizes.joined(separator: "\n"))) > \(quote(scaledFile))")
-            return Report(title: "Resolutions", text: out.status == 0 ? "Saved. Restart to use them.\n" : out.text,
-                          canRestart: out.status == 0)
-        }
     }
 
     func runChecks() {

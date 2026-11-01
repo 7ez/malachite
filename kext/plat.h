@@ -16,6 +16,6 @@ struct plat {
     IOBufferMemoryDescriptor *fw[MALACHITE_FW_COUNT];
 };
 
-// BAR1 at its full size where macOS left it unassigned; false leaves the BAR as it was
+// BAR1 where macOS left it unassigned, shrunk if the full size has no room; size is what it ended up
 bool pci_place_bar1(IOPCIDevice *pci, uint64_t *base, uint64_t *size);
 void pci_restore_bar1(IOPCIDevice *pci, uint64_t base);

@@ -108,6 +108,23 @@ private func sendMode() async -> Int32 {
     }
 }
 
+private func scaledMode(_ args: [String]) -> Int32 {
+    let sizes = args.compactMap(Size.init)
+    guard sizes.count == args.count, sizes.count <= scaledLimit else {
+        return usage("usage: --scaled [2560x1440 ...], \(scaledLimit) at most, none to clear them")
+    }
+    let text = sizes.map { "\($0.text)\n" }.joined()
+    guard (try? text.write(toFile: scaledFile, atomically: false, encoding: .utf8)) != nil else {
+        say("Couldn't write \(scaledFile)")
+        return 1
+    }
+    guard sendScaled(sizes) else {
+        say("Saved, but the driver didn't take them: update it, or restart")
+        return 1
+    }
+    return 0
+}
+
 // the command line modes, for recovery over SSH or with a dark screen; nil when the app should open its window
 func cli(_ args: [String]) -> Int32? {
     guard args.count > 1 else { return nil }
@@ -120,6 +137,7 @@ func cli(_ args: [String]) -> Int32? {
     // the app that installs is often a copy in Downloads, and a login item has to be registered by the app it launches
     case "--login-item": return (try? SMAppService.mainApp.register()) == nil ? 1 : 0
     case "--collect-logs": return collectMode(rest.first ?? ".")
+    case "--scaled": return scaledMode(rest)
     case "--send-logs":
         guard requireRoot("--send-logs", say: say) else { return 1 }
         Task {

@@ -796,6 +796,7 @@ class Gpu : public IOService
     uint32_t safe_sync = 0;
     struct disp_size scaled[DISP_MAX_SCALED];  // the images scaled.txt offers on panels they suit
     uint32_t nscaled = 0;
+    void add_scaled_size(uint32_t w, uint32_t h);
     void read_scaled();
     static void autostart(thread_call_param_t self, thread_call_param_t);
     static void interrupt(OSObject *owner, IOInterruptEventSource *sender, int count);
@@ -803,6 +804,7 @@ class Gpu : public IOService
 
 public:
     uint32_t wait_event(uint32_t seen, uint32_t timeout_us);
+    IOReturn set_scaled(const uint64_t *sizes, uint32_t n);
 
     bool start(IOService *provider) override;
     void stop(IOService *provider) override;
@@ -894,9 +896,23 @@ public:
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) override;
 };
 
+class DisplayUserClient : public IOUserClient
+{
+    OSDeclareDefaultStructors(DisplayUserClient)
+
+public:
+    Gpu *owner = nullptr;
+
+    bool start(IOService *provider) override;
+    IOReturn clientClose() override;
+    IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *, OSObject *,
+                            void *) override;
+};
+
 MalachiteDefineClass(Gpu, IOService)
 MalachiteDefineClass(UserClient, IOUserClient)
 MalachiteDefineClass(VideoUserClient, IOUserClient)
+MalachiteDefineClass(DisplayUserClient, IOUserClient)
 MalachiteDefineClass(SurfaceNub, IOService)
 
 // A file of the root volume read whole into wired memory, or nullptr (not there yet, or not readable)
@@ -980,7 +996,14 @@ void Gpu::autostart(thread_call_param_t p0, thread_call_param_t)
     log_msg("Malachite: GPU and displays up\n");
 }
 
-// "2560x1440" a line, those a framebuffer has room for; a file the app writes, so a change takes a restart
+void Gpu::add_scaled_size(uint32_t w, uint32_t h)
+{
+    uint64_t pitch = (w * 4ull + 255) & ~255ull;
+    if (w && h && nscaled < DISP_MAX_SCALED && pitch * h <= BAR1_FB_SIZE)
+        scaled[nscaled++] = { w, h };
+}
+
+// "2560x1440" a line, the list the app last set
 void Gpu::read_scaled()
 {
     IOBufferMemoryDescriptor *f = read_file("/Library/Application Support/Malachite/scaled.txt");
@@ -997,11 +1020,49 @@ void Gpu::read_scaled()
             h = h * 10 + (uint32_t)(*p++ - '0');
         while (p < end && *p++ != '\n') {
         }
-        uint64_t pitch = (w * 4ull + 255) & ~255ull;
-        if (w && h && pitch * h <= BAR1_FB_SIZE)
-            scaled[nscaled++] = { w, h };
+        add_scaled_size(w, h);
     }
     f->release();
+}
+
+// The extra resolutions replaced while the driver runs. WindowServer can't have the mode it shows go away under it, so
+// a scaled one that is lit stays listed until it has left it. Framebuffer tells macOS as a hot-plugged monitor would.
+IOReturn Gpu::set_scaled(const uint64_t *sizes, uint32_t n)
+{
+    if (n % 2 || n > 2 * DISP_MAX_SCALED)
+        return kIOReturnBadArgument;
+    take();
+    nscaled = 0;
+    for (uint32_t i = 0; i < n; i += 2)
+        add_scaled_size((uint32_t)sizes[i], (uint32_t)sizes[i + 1]);
+    if (disp) {
+        struct disp_mode lit[SCREENS] = {};
+        for (screen &sc : screens) {
+            if (!sc.shown || !sc.mode)
+                continue;
+            const struct disp_mode &m = disp->out[sc.out].modes[sc.mode - 1];
+            lit[index(sc)] = m;
+            bool kept = !m.view_w;
+            for (uint32_t i = 0; i < nscaled; i++)
+                kept |= scaled[i].w == m.view_w && scaled[i].h == m.view_h;
+            if (!kept)
+                add_scaled_size(m.view_w, m.view_h);
+        }
+        disp_set_scaled(disp, scaled, nscaled);
+        for (screen &sc : screens) {
+            if (!sc.shown || !sc.mode)
+                continue;
+            const struct disp_output *o = &disp->out[sc.out];
+            for (uint32_t i = 0; i < o->nmodes; i++)
+                if (!memcmp(&o->modes[i], &lit[index(sc)], sizeof(o->modes[i])))
+                    sc.mode = i + 1;
+            publish_surface(sc, false);
+            sc.changed = true;
+        }
+    }
+    give();
+    tell_nubs();
+    return kIOReturnSuccess;
 }
 
 // What GSP-RM says the GPU is doing, for kern.malachite_power, next to what the driver itself has sent it (busy time is
@@ -3814,7 +3875,8 @@ void Gpu::publish_surface(screen &sc, bool hotplug)
     }
     if (OSArray *modes = OSArray::withCapacity(o->nmodes)) {
         for (uint32_t i = 0; i < o->nmodes; i++)
-            list_mode(modes, i + 1, &o->modes[i]);
+            if (!o->modes[i].view_w || i + 1 == sc.mode || disp_mode_possible(disp, index(sc), &o->modes[i]))
+                list_mode(modes, i + 1, &o->modes[i]);
         nub->setProperty(SURFACE_MODES, modes);
         modes->release();
     }
@@ -3870,6 +3932,10 @@ IOReturn Gpu::set_mode(screen &sc, uint32_t id)
         return kIOReturnSuccess;
     // a DisplayPort sink only lists modes its fastest link carries; disp_modeset trains the one this mode needs
     const struct disp_mode *t = &o->modes[id - 1];
+    if (t->view_w && !disp_mode_possible(disp, index(sc), t)) {
+        log_msg("Malachite: screen %d can't show %ux%u at %u kHz\n", index(sc), mode_w(t), mode_h(t), t->clock);
+        return kIOReturnUnsupportedMode;
+    }
     uint32_t pitch = (mode_w(t) * 4 + 255) & ~255u;
     uint64_t size = (uint64_t)pitch * mode_h(t);
     if (size > BAR1_FB_SIZE)
@@ -4425,6 +4491,24 @@ static const SInt32 MAX_VIDEO_CLIENTS = 8;
 
 IOReturn Gpu::newUserClient(task_t task, void *security, UInt32 type, OSDictionary *props, IOUserClient **handler)
 {
+    if (type == MALACHITE_DISPLAY_CLIENT) {
+        if (IOUserClient::clientHasPrivilege(security, kIOClientPrivilegeLocalUser) != kIOReturnSuccess)
+            return kIOReturnNotPrivileged;
+        DisplayUserClient *uc = OSTypeAlloc(DisplayUserClient);
+        if (!uc)
+            return kIOReturnNoMemory;
+        if (!uc->initWithTask(task, security, type, props) || !uc->attach(this)) {
+            uc->release();
+            return kIOReturnError;
+        }
+        if (!uc->start(this)) {
+            uc->detach(this);
+            uc->release();
+            return kIOReturnError;
+        }
+        *handler = uc;
+        return kIOReturnSuccess;
+    }
     if (type != MALACHITE_VIDEO_CLIENT)
         return IOService::newUserClient(task, security, type, props, handler);
     // any process may open one, and each costs a GPU context: few enough at a time that they can't use up
@@ -4503,6 +4587,26 @@ void Gpu::video_close(uintptr_t ctx, struct video_h264 *h, uint32_t decoded)
         video_h264_close(&c->video, h);
     ctx_close(ctx);
     IOLockUnlock(lock);
+}
+
+bool DisplayUserClient::start(IOService *provider)
+{
+    owner = OSDynamicCast(Gpu, provider);
+    return owner && IOUserClient::start(provider);
+}
+
+IOReturn DisplayUserClient::clientClose()
+{
+    terminate();
+    return kIOReturnSuccess;
+}
+
+IOReturn DisplayUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args, IOExternalMethodDispatch *,
+                                           OSObject *, void *)
+{
+    if (selector != MALACHITE_DISPLAY_SET_SCALED)
+        return kIOReturnUnsupported;
+    return owner->set_scaled(args->scalarInput, args->scalarInputCount);
 }
 
 bool VideoUserClient::start(IOService *provider)

@@ -149,6 +149,18 @@ static void add_scaled(struct disp_output *o, const struct disp_size *sizes, uin
     }
 }
 
+void disp_set_scaled(struct disp *d, const struct disp_size *sizes, uint32_t n)
+{
+    d->nscaled = n;
+    memcpy(d->scaled, sizes, n * sizeof(*sizes));
+    for (int i = 0; i < d->n; i++) {
+        struct disp_output *o = &d->out[i];
+        while (o->nmodes && o->modes[o->nmodes - 1].view_w)
+            o->nmodes--;
+        add_scaled(o, sizes, n);
+    }
+}
+
 // manufacturer, name and the detailed timings out of an EDID: the base block's (the first is the preferred mode)
 // and those of CEA-861 extension blocks
 static void edid_describe(const uint8_t *e, uint32_t size, struct disp_output *o)
