@@ -84,6 +84,7 @@ struct MenuView: View {
 
 struct MainView: View {
     @ObservedObject var model: Model
+    @State private var showResolutions = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -108,13 +109,12 @@ struct MainView: View {
                 Toggle("Full BAR (Resizable BAR on in BIOS)", isOn: $model.fullBar)
                     .disabled(!model.useEFI)
             }
-            Toggle("Start at login", isOn: $model.startAtLogin)
-            if model.installed != nil {
-                HStack {
-                    Text("Extra resolutions")
-                    TextField("2560x1440", text: $model.scaled)
-                    Button("Save") {
-                        model.saveScaled()
+            HStack {
+                Toggle("Start at login", isOn: $model.startAtLogin)
+                if model.installed != nil {
+                    Spacer()
+                    Button("Resolutions") {
+                        showResolutions = true
                     }
                 }
             }
@@ -150,6 +150,9 @@ struct MainView: View {
         }
         .padding()
         .frame(minWidth: 620, minHeight: 420, alignment: .topLeading)
+        .sheet(isPresented: $showResolutions) {
+            ResolutionsView()
+        }
     }
 
     private var summary: String {

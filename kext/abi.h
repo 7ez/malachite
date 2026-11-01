@@ -31,6 +31,12 @@ struct malachite_shot {
 // IOServiceOpen type for H.264 decoding (VideoUserClient): open to any process, each client a GPU context of its
 // own that goes with it
 #define MALACHITE_VIDEO_CLIENT 1
+// IOServiceOpen type for display settings (DisplayUserClient): open to the user at the console
+#define MALACHITE_DISPLAY_CLIENT 2
+
+enum {
+    MALACHITE_DISPLAY_SET_SCALED,  // scalars: the width and height of each extra resolution, the list now
+};
 
 enum {
     // scalars: width and height in macroblocks, surfaces, bitstream bytes; again for a stream of another size.

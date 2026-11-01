@@ -10,6 +10,7 @@
 #include "../hw/clc57e.h"
 #include "../nvrm/disp.h"
 #include "../nvrm/gsp.h"
+#include "../nvrm/imp.h"
 #include "cursor.h"
 #include "disp.h"
 #include "disp_nouveau.h"
@@ -23,6 +24,7 @@
 
 
 #define DISP_ROOT 0xd1500000u
+#define DISP_SW 0xd150c372u
 #define FB_CTXDMA 0xfb000001u
 #define RAMHT_BITS 10      // GA102's 0x2000-byte RAMHT, at the start of the instance memory
 #define CTXDMA_OFF 0x8000  // well clear of anything GSP-RM might put at the start of object memory
@@ -183,6 +185,61 @@ static uint32_t scale_factor(uint32_t in, uint32_t out)
     return (in * 1024 + out - 1) / out;
 }
 
+static void imp_head(NVC372_CTRL_IS_MODE_POSSIBLE_PARAMS *p, int head, const struct disp_mode *t)
+{
+    struct disp_raster m;
+    raster(t, &m);
+    NVC372_CTRL_IMP_HEAD *h = &p->head[p->numHeads++];
+    h->headIndex = (NvU8)head;
+    h->maxPixelClkKHz = t->clock;
+    h->rasterSize.width = m.htotal;
+    h->rasterSize.height = m.vtotal;
+    h->rasterBlankStart.X = m.hblanks;
+    h->rasterBlankStart.Y = m.vblanks;
+    h->rasterBlankEnd.X = m.hblanke;
+    h->rasterBlankEnd.Y = m.vblanke;
+    h->control.masterLockPin = h->control.slaveLockPin = NV_DISP_LOCK_PIN_UNSPECIFIED;
+    h->maxDownscaleFactorH = scale_factor(mode_w(t), t->hactive);
+    h->maxDownscaleFactorV = scale_factor(mode_h(t), t->vactive);
+    h->outputScalerVerticalTaps = 2;
+    h->minFrameIdle.leadingRasterLines = (NvU16)(m.vblanke + 1);
+    h->minFrameIdle.trailingRasterLines = (NvU16)(m.vtotal - (m.vblanke + 1 + t->vactive));
+    h->lut = NVC372_CTRL_IMP_LUT_USAGE_1025;
+    h->cursorSize32p = 256 / 32;
+
+    NVC372_CTRL_IMP_WINDOW *w = &p->window[p->numWindows++];
+    w->windowIndex = (NvU32)head * 2;
+    w->owningHead = (NvU32)head;
+    w->formatUsageBound = NVC372_CTRL_FORMAT_RGB_PACKED_1_BPP | NVC372_CTRL_FORMAT_RGB_PACKED_2_BPP |
+                          NVC372_CTRL_FORMAT_RGB_PACKED_4_BPP | NVC372_CTRL_FORMAT_RGB_PACKED_8_BPP;
+    w->maxPixelsFetchedPerLine = mode_w(t);
+    w->maxDownscaleFactorH = w->maxDownscaleFactorV = 1024;
+    w->inputScalerVerticalTaps = 2;
+    w->lut = w->tmoLut = NVC372_CTRL_IMP_LUT_USAGE_1025;
+}
+
+// What GSP-RM says of head showing t next to what the others show, as nvkms asks before a modeset: the display engine
+// takes a mode beyond it and then stops, and macOS restores it at every boot
+int disp_mode_possible(struct disp *d, int head, const struct disp_mode *t)
+{
+    if (!d->imp)
+        return 0;
+    NVC372_CTRL_IS_MODE_POSSIBLE_PARAMS *p = mem_alloc(sizeof(*p));
+    if (!p)
+        return 0;
+    for (int h = 0; h < (int)d->heads; h++) {
+        if (h == head)
+            imp_head(p, h, t);
+        else if (d->head[h].display)
+            imp_head(p, h, &d->head[h].timing);
+    }
+    const NVC372_CTRL_IS_MODE_POSSIBLE_PARAMS *r =
+        rm_control(d->s, d->c.client, DISP_SW, NVC372_CTRL_CMD_IS_MODE_POSSIBLE, p, sizeof(*p));
+    int possible = r && r->bIsPossible;
+    mem_free(p);
+    return possible;
+}
+
 // one interlocked update of the core and a window, as nvkms does (UpdateWindowC3, UpdateCoreC3): the window
 // waits for the core; returns once the core channel is idle again, i.e. GSP-RM's supervisors have run
 static int commit(struct disp *d, int head)
@@ -219,6 +276,8 @@ static int setup(struct disp *d)
         return 0;
     if (rm_alloc(d->s, d->c.client, d->c.device, DISP_ROOT, gsp_gpu(d->s)->chip->disp, NULL, 0))
         return -1;
+    if (!d->imp)
+        d->imp = !rm_alloc(d->s, d->c.client, d->c.device, DISP_SW, NVC372_DISPLAY_SW, NULL, 0);
     if (dchan_new(d, &d->core, gsp_gpu(d->s)->chip->core, 0, 0x680000))
         return -1;
     d->ntfy = vram_alloc(gsp_vram(d->s), 0x1000, 0x1000);
@@ -352,6 +411,7 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
             sor, o->protocol, head, w, h, (unsigned)(centi / 100), (unsigned)(centi % 100), m.htotal, m.vtotal,
             m.clock);
     hd->sor = sor;
+    hd->timing = *t;
     hd->display = o->id;
     // take the head off whatever the EFI firmware lit first (nvkms shuts heads down before reattaching them)
     struct dchan *c = &d->core, *wc = &hd->wndw;

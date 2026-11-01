@@ -16,10 +16,10 @@ private func keep(_ text: String, containing words: [String] = [], skipping: Boo
     return kept.prefix(first ?? kept.count).map { "\($0)\n" }.joined()
 }
 
-private func kernelLog(_ predicate: String, to file: String) {
+private func kernelLog(_ predicate: String, to file: String, last: String = "boot") {
     FileManager.default.createFile(atPath: file, contents: nil)
     if let handle = FileHandle(forWritingAtPath: file) {
-        capture("/usr/bin/log", ["show", "--last", "boot", "--style", "compact", "--predicate", predicate], log: handle)
+        capture("/usr/bin/log", ["show", "--last", last, "--style", "compact", "--predicate", predicate], log: handle)
         try? handle.close()
     }
 }
@@ -92,10 +92,13 @@ func collectLogs(into dir: String, say: Say) throws -> String {
     // why a kext of the driver's did or didn't load (the auxiliary collection's policy, missing approval, dependencies)
     kernelLog("eventMessage CONTAINS \"pl.aochi\" OR eventMessage CONTAINS \"AuxKC\" OR eventMessage CONTAINS \"NVFB\" "
               + "OR (process == \"kernelmanagerd\" AND eventMessage CONTAINS[c] \"aochi\")", to: "\(out)/kexts.txt")
+    // a boot that failed is over by the time someone can send logs
+    kernelLog("process == \"kernel\" AND eventMessage CONTAINS \"Malachite: \"", to: "\(out)/earlier-boots.txt", last: "3d")
     if fm.fileExists(atPath: kmutilLog) {
         try? fm.copyItem(atPath: kmutilLog, toPath: "\(out)/malachite-kmutil.log")
     }
     try trim("\(out)/metal.txt", to: 20_000_000)
+    try trim("\(out)/earlier-boots.txt", to: 5_000_000)
 
     try fm.createDirectory(atPath: "\(out)/reports", withIntermediateDirectories: true)
     let home = ProcessInfo.processInfo.environment["HOME"] ?? ""

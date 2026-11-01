@@ -73,6 +73,7 @@ struct disp_head {
     uint32_t curs_w[2], curs_h[2];  // the size of the image each holds
     uint32_t sor;             // the OR the last modeset drove
     uint32_t display;         // and the display on it, 0 before the first
+    struct disp_mode timing;  // and the mode it shows
     uint32_t dp_bw, dp_lanes;  // the DisplayPort link it trained, lanes 0 for none
     int dp_ef;
 };
@@ -97,11 +98,15 @@ struct disp {
     int dp_wm_increased;  // its SORs take the higher SST watermark limits
     struct disp_size scaled[DISP_MAX_SCALED];  // images to offer on any panel they suit
     uint32_t nscaled;
+    int imp;  // GSP-RM's object that checks modes exists
 };
 
 int disp_probe(struct gsp *s, struct disp *d, const struct disp_size *scaled, uint32_t nscaled);
 // out[] again from what GSP-RM says is connected now; the order stays that of the board's displays
 void disp_read_outputs(struct disp *d);
+// the scaled modes of every output anew, for these sizes; modes[] index of the others stay
+void disp_set_scaled(struct disp *d, const struct disp_size *sizes, uint32_t n);
+int disp_mode_possible(struct disp *d, int head, const struct disp_mode *t);
 void disp_fini(struct disp *d);
 // what disp_fini frees, once GSP-RM is gone with the display objects in it (a power cycle): no RPCs
 void disp_forget(struct disp *d);

@@ -51,9 +51,9 @@ the full BAR, which the driver places itself. That works on some boards and not 
 ## Extra resolutions
 
 Malachite can render more pixels than a monitor has and let the display engine scale them down, like DSR on Windows.
-Add sizes such as `2560x1440` under Extra resolutions in the app and restart. They show up in Displays for every
-monitor of the same shape that is smaller, up to twice its size. The list is kept in
-`/Library/Application Support/Malachite/scaled.txt`.
+Open Resolutions in the app, turn on the sizes you want and press Use, no restart needed. They also show up in Displays.
+Sizes go up to twice the panel and 3840x2160, in the panel's shape. Over SSH:
+`sudo /Applications/Malachite.app/Contents/MacOS/Malachite --scaled 2560x1440 3840x2160`.
 
 ## Building
 
