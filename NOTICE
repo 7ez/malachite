@@ -1,0 +1,9 @@
+Malachite includes or is based on the following.
+
+sdk/, nvrm/, hw/    Headers from NVIDIA's open GPU kernel modules, MIT.
+                    https://github.com/NVIDIA/open-gpu-kernel-modules
+core/, compiler/    Parts follow nouveau (Linux, MIT) and Mesa's NVK, NIL and NAK (MIT).
+                    https://gitlab.freedesktop.org/mesa/mesa
+
+NVIDIA's GSP firmware is not in this repository. It is NVIDIA's, under its own licence, and the release packages carry
+that licence with it.

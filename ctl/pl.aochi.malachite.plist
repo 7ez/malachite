@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>pl.aochi.malachite</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/sh</string>
+		<string>-c</string>
+		<string>fw="/Library/Application Support/Malachite/570"; /usr/local/bin/malachitectl "$fw" start disp; sleep 60; /usr/local/bin/malachitectl "$fw" show</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/var/log/malachite.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/malachite.log</string>
+</dict>
+</plist>

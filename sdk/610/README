@@ -1,0 +1,4 @@
+Headers from NVIDIA's open-gpu-kernel-modules 610.57.04 (e4a5faa2), MIT licensed, unchanged:
+inc/ is src/common/sdk/nvidia/inc, unix/ is src/nvidia/arch/nvalloc/unix/include.
+They define the NVRM escape ABI NVK's NVRM backend is built against; only core/rmfe and the
+tools that talk to it include them. The GSP-RM side uses the r570 structs in nvrm/.

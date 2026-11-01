@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>Malachite</string>
+	<key>CFBundleIdentifier</key>
+	<string>pl.aochi.malachite</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Malachite</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>0.1</string>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.kpi.iokit</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.bsd</key>
+		<string>8.0</string>
+		<key>com.apple.kpi.unsupported</key>
+		<string>8.0</string>
+		<key>com.apple.iokit.IOPCIFamily</key>
+		<string>1.0.0b1</string>
+		<key>com.apple.iokit.IOGraphicsFamily</key>
+		<string>1.0.0b1</string>
+		<key>com.apple.iokit.IOAcceleratorFamily2</key>
+		<string>2.0.0</string>
+		<key>com.apple.iokit.IOSurface</key>
+		<string>87.0</string>
+		<key>com.apple.AppleGraphicsDeviceControl</key>
+		<string>1.0.0</string>
+	</dict>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<key>MalachiteGpu</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>pl.aochi.malachite</string>
+			<key>IOClass</key>
+			<string>MalachiteGpu</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOUserClientClass</key>
+			<string>MalachiteUserClient</string>
+			<!-- any NVIDIA display controller; start() takes Turing and later -->
+			<key>IOPCIClassMatch</key>
+			<string>0x03000000&amp;0xff000000</string>
+			<key>IOPCIMatch</key>
+			<string>0x000010de&amp;0x0000ffff</string>
+			<key>IOProbeScore</key>
+			<integer>20000</integer>
+		</dict>
+		<key>NVDAMalachiteFramebuffer</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>pl.aochi.malachite</string>
+			<key>IOClass</key>
+			<string>NVDAMalachiteFramebuffer</string>
+			<key>IOProviderClass</key>
+			<string>IOService</string>
+			<key>IONameMatch</key>
+			<string>MalachiteSurface</string>
+		</dict>
+		<key>MalachiteAccelerator</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>pl.aochi.malachite</string>
+			<key>IOClass</key>
+			<string>MalachiteAccelerator</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<!-- coexists with MalachiteGpu via a distinct match category -->
+			<!-- any NVIDIA display controller; start() takes Turing and later -->
+			<key>IOPCIClassMatch</key>
+			<string>0x03000000&amp;0xff000000</string>
+			<key>IOPCIMatch</key>
+			<string>0x000010de&amp;0x0000ffff</string>
+			<key>IOMatchCategory</key>
+			<string>IOAccelerator</string>
+			<key>IOProbeScore</key>
+			<integer>200000</integer>
+		</dict>
+		<key>MalachiteGraphicsControl</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>pl.aochi.malachite</string>
+			<key>IOClass</key>
+			<string>MalachiteGraphicsControl</string>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<!-- any NVIDIA display controller; start() takes Turing and later -->
+			<key>IOPCIClassMatch</key>
+			<string>0x03000000&amp;0xff000000</string>
+			<key>IOPCIMatch</key>
+			<string>0x000010de&amp;0x0000ffff</string>
+			<!-- the framebuffer category, as Apple's paravirtual GPU control takes it: the GPU's framebuffer is
+			     ours, not an IONDRVFramebuffer over the firmware's one -->
+			<key>IOMatchCategory</key>
+			<string>IOFramebuffer</string>
+			<key>IOProbeScore</key>
+			<integer>2000000</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>

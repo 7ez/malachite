@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>NVVideo</string>
+	<key>CFBundleIdentifier</key>
+	<string>pl.aochi.NVVideo</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>NVVideo</string>
+	<key>CFBundlePackageType</key>
+	<string>BNDL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1</string>
+	<key>CFBundleVersion</key>
+	<string>0.1</string>
+	<key>CMClassImplementations</key>
+	<array>
+		<dict>
+			<key>CMClassID</key>
+			<string>com.apple.videotoolbox.videodecoder</string>
+			<key>CMClassImplementationID</key>
+			<string>pl.aochi.videodecoder.avc.nvdec</string>
+			<key>CMClassImplementationName</key>
+			<string>NVIDIA H.264 (NVDEC)</string>
+			<key>CMClassImplementationVersion</key>
+			<integer>1</integer>
+			<key>CMManufacturer</key>
+			<string>Aochi</string>
+			<key>CMExecutableArchitectures</key>
+			<array>
+				<string>x86_64</string>
+			</array>
+			<key>CMFactoryFunction</key>
+			<string>NVDecH264_CreateInstance</string>
+			<key>CMMatchingInfo</key>
+			<dict>
+				<key>VTCodecType</key>
+				<string>avc1</string>
+				<key>VTCodecName</key>
+				<string>H.264</string>
+				<key>VTIsHardwareAccelerated</key>
+				<true/>
+				<key>VTRating</key>
+				<integer>1000</integer>
+			</dict>
+		</dict>
+	</array>
+</dict>
+</plist>
