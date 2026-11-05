@@ -3385,6 +3385,9 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
                (unsigned long)z.pixelFormat);
     }
 
+    unsigned ncolour = 0;
+    for (unsigned i = 0; i < 8; i++)
+        ncolour += descriptor.colorAttachments[i].texture != nil;
     for (unsigned i = 0; i < 8; i++) {
         MTLRenderPassColorAttachmentDescriptor *ca = descriptor.colorAttachments[i];
         MalachiteTexture *t = (MalachiteTexture *)ca.texture;
@@ -3430,9 +3433,9 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
                                    ca.loadAction == MTLLoadActionClear, 0, {},
                                    { (float)c.red, (float)c.green, (float)c.blue, (float)c.alpha } };
         // a block-linear shadow, copied in and back by the copy engine, for what the 3D class can't render to: a
-        // pitch-linear target beside a depth buffer, or rows or a start not on 128 bytes (an IOSurface 357
-        // pixels wide)
-        if (!ct.blocklinear && (_pass.zt || (ct.pitch & 127) || (ct.addr & 127))) {
+        // pitch-linear target beside a depth buffer or another colour target (a pass with one draws nothing to any
+        // of them), or rows or a start not on 128 bytes (an IOSurface 357 pixels wide)
+        if (!ct.blocklinear && (_pass.zt || ncolour > 1 || (ct.pitch & 127) || (ct.addr & 127))) {
             uint32_t bytes = _pass.width * tex_format_info((enum tex_format)f).bytes;
             uint32_t width = (bytes + 63) & ~63u, rows = (_pass.height + 7) & ~7u;  // one-GOB blocks: 64 B x 8 rows
             id<MTLBuffer> shadow = malachite_shadow(((id<MTLCommandBuffer>)cb).commandQueue, i, (NSUInteger)width * rows);
