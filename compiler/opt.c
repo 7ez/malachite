@@ -13,6 +13,7 @@
 static unsigned g_pending;
 static int g_no_range;  // AIRC_NORANGE=1: no folding that rests on a value's known upper bound
 static int g_no_sat;    // AIRC_NOSAT=1: a clamp to [0, 1] stays a min, a max and an add
+static int g_no_local_forward;
 
 static int is_float(const struct ir_val *v, uint32_t bits)
 {
@@ -1030,6 +1031,97 @@ int airc_const_locals(struct ir_func *f, struct airc_info *info)
     return 1;
 }
 
+// Local memory at fixed addresses, within a block: a load of a word stored there earlier is the value stored, and a
+// store overwritten before anything could read it goes. Code built without optimisation (Apple's GL compiler's)
+// changes a vector in memory a lane at a time, loading all of it and storing all of it back each time. A store of
+// an undefined value goes too. AIRC_NOLOCALFWD=1 turns it off.
+struct local_word {
+    int64_t at;
+    int bytes;
+    struct ir_val *val;    // what the bytes hold, as far as this block knows
+    struct ir_val *store;  // the store that put it there, while nothing could have read it since
+};
+
+static int local_forward(struct ir_func *f)
+{
+    if (g_no_local_forward)
+        return 0;
+    int changed = 0;
+    struct local_word *w = NULL;
+    unsigned cap = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next) {
+        unsigned n = 0;
+        for (struct ir_val *v = b->first, *next; v; v = next) {
+            next = v->next;
+            int fixed_store = v->op == IR_STL && v->nsrc == 2 && !v->src[0];
+            int fixed_load = v->op == IR_LDL && !v->nsrc;
+            if (v->op == IR_CALL || (v->op == IR_LDL && !fixed_load)) {
+                for (unsigned i = 0; i < n; i++)
+                    w[i].store = NULL;
+                if (v->op == IR_CALL)
+                    n = 0;
+                continue;
+            }
+            if (v->op == IR_STL && !fixed_store) {
+                for (unsigned i = 0; i < n; i++)
+                    w[i].val = NULL;
+                continue;
+            }
+            if (!fixed_store && !fixed_load)
+                continue;
+            unsigned same = n;
+            for (unsigned i = 0; i < n; i++) {
+                if (w[i].at == v->imm && w[i].bytes == v->aux) {
+                    same = i;
+                } else if (w[i].at < v->imm + v->aux && v->imm < w[i].at + w[i].bytes) {
+                    w[i].store = NULL;
+                    if (fixed_store)
+                        w[i].val = NULL;
+                }
+            }
+            if (same == n) {
+                if (n == cap) {
+                    cap = cap ? 2 * cap : 64;
+                    w = realloc(w, cap * sizeof(*w));
+                }
+                w[n++] = (struct local_word){ v->imm, v->aux, fixed_load ? v : NULL, NULL };
+                if (fixed_load)
+                    continue;
+            }
+            if (fixed_load) {
+                struct ir_val *val = live(w[same].val);
+                w[same].store = NULL;
+                if (val && v->aux == 4 && val->type == v->type) {
+                    replace_all(f, v, val);
+                    changed = 1;
+                } else if (!val) {
+                    w[same].val = v;
+                }
+                continue;
+            }
+            if (w[same].val && live(w[same].val) == live(v->src[1])) {  // what's there already
+                ir_remove(v);
+                changed = 1;
+                continue;
+            }
+            if (w[same].store) {
+                ir_remove(w[same].store);
+                changed = 1;
+            }
+            w[same].val = v->src[1];
+            w[same].store = v;
+            if (v->src[1]->op == IR_UNDEF) {
+                ir_remove(v);
+                w[same].store = NULL;
+                changed = 1;
+            }
+        }
+    }
+    free(w);
+    resolve(f);  // before dce: a load another is now read as has no readers of its own yet
+    return changed;
+}
+
 // What a 32-bit value is known to be a multiple of, as a power of two up to 16 (4). The kernel's threadgroup
 // variables are laid out 16-byte aligned from 0, and the dispatcher puts each [[threadgroup(n)]] buffer after them
 // aligned as much.
@@ -1181,6 +1273,7 @@ void airc_opt(struct ir_func *f)
 {
     g_no_range = airc_pass_off("AIRC_NORANGE");
     g_no_sat = airc_pass_off("AIRC_NOSAT");
+    g_no_local_forward = airc_pass_off("AIRC_NOLOCALFWD");
     // right after the front end each phi's inputs follow its block's predecessor order
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v && v->op == IR_PHI; v = v->next) {
@@ -1201,6 +1294,7 @@ void airc_opt(struct ir_func *f)
         resolve(f);
         changed |= simplify_phis(f);
         changed |= cse(f);
+        changed |= local_forward(f);
         changed |= dce(f);
         if (!changed)
             break;
