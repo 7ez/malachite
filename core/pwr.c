@@ -28,17 +28,3 @@ void pwr_read(struct gsp *s, struct pwr *out)
     }
     mem_free(cp);
 }
-
-int pwr_idle_cap(struct gsp *s, int idle, uint64_t idle_us, uint64_t busy_us)
-{
-    const struct rm_client *in = gsp_internal(s);
-    NV2080_CTRL_PERF_AGGRESSIVE_PSTATE_NOTIFY_PARAMS p = { .bGpuIsIdle = idle, .idleTimeUs = idle_us, .busyTimeUs = busy_us };
-    return rm_control(s, in->client, in->subdevice, NV2080_CTRL_CMD_PERF_AGGRESSIVE_PSTATE_NOTIFY, &p, sizeof(p)) ? 0 : -1;
-}
-
-int pwr_boost_clear(struct gsp *s)
-{
-    const struct rm_client *in = gsp_internal(s);
-    NV2080_CTRL_PERF_BOOST_PARAMS p = { .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_CLEAR };
-    return rm_control(s, in->client, in->subdevice, NV2080_CTRL_CMD_PERF_BOOST, &p, sizeof(p)) ? 0 : -1;
-}

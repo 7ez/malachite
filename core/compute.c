@@ -139,6 +139,21 @@ void compute_qmd_set_local(uint32_t *q, uint32_t bytes)
     QSET(q, QF_SLM_LOW_SIZE, (bytes + 15) & ~15u);
 }
 
+#define QF_RELEASE1_ADDRESS_LOWER 927, 896
+#define QF_RELEASE1_ADDRESS_UPPER 935, 928
+#define QF_RELEASE1_ENABLE 951, 951
+#define QF_RELEASE1_STRUCTURE_SIZE 959, 958
+#define QF_RELEASE1_PAYLOAD_LOWER 991, 960
+
+void compute_qmd_set_stamp(uint32_t *q, uint64_t va, uint32_t payload)
+{
+    QSET(q, QF_RELEASE1_ADDRESS_LOWER, (uint32_t)va);
+    QSET(q, QF_RELEASE1_ADDRESS_UPPER, va >> 32);
+    QSET(q, QF_RELEASE1_PAYLOAD_LOWER, payload);
+    QSET(q, QF_RELEASE1_STRUCTURE_SIZE, 0);  // four words: the payload, then the time at +8
+    QSET(q, QF_RELEASE1_ENABLE, 1);
+}
+
 void compute_set_local_memory(struct chan *ch, uint64_t va, uint64_t per_tpc)
 {
     uint32_t push[] = {
@@ -156,13 +171,13 @@ void compute_set_tex_pools(struct chan *ch, uint64_t header_va, uint32_t headers
         MTHD(1, C_SET_TEX_HEADER_POOL_A, 3), (uint32_t)(header_va >> 32), (uint32_t)header_va, headers - 1,
         MTHD(1, C_SET_TEX_SAMPLER_POOL_A, 3), (uint32_t)(sampler_va >> 32), (uint32_t)sampler_va, samplers - 1,
     };
-    chan_submit(ch, push, sizeof(push) / 4);
+    chan_push(ch, push, sizeof(push) / 4);  // the launch or draw after it kicks
 }
 
 void compute_wait_idle(struct chan *ch)
 {
     uint32_t push[] = { MTHD(1, C_WAIT_FOR_IDLE, 1), 0 };
-    chan_submit(ch, push, sizeof(push) / 4);
+    chan_push(ch, push, sizeof(push) / 4);  // the launch after it kicks
 }
 
 void compute_launch(struct chan *ch, uint64_t qmd_va)

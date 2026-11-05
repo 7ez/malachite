@@ -103,14 +103,19 @@ uint64_t CommandQueue::processSegmentKernelCommand(IOAccelSegmentResourceList *r
         return IOAccelCommandQueue::processSegmentKernelCommand(resList, cmd, end);
     memcpy(&h, cmd, sizeof(h));
     void *ctx = (void *)queue_ctx(this);
+    if (h.opcode & MALACHITE_CMD_OPENGL) {
+        async = 0;
+        h.opcode &= ~MALACHITE_CMD_OPENGL;
+    }
 
-    if (h.opcode == MALACHITE_CMD_COPY_BUF2BUF) {
+    if (h.opcode == MALACHITE_CMD_COPY_BUF2BUF || h.opcode == MALACHITE_CMD_UPLOAD) {
         struct malachite_copy_buf2buf p;
         if (!record_payload(cmd, end, h.len, &p, sizeof(p)))
             return 0;
         if (gGpu) {
-            IOReturn r = gGpu->callPlatformFunction(NVGPU_FN_COPY, true, (void *)(uintptr_t)p.srcAddr,
-                                                     (void *)(uintptr_t)p.dstAddr, (void *)(uintptr_t)p.size, ctx);
+            IOReturn r = gGpu->callPlatformFunction(h.opcode == MALACHITE_CMD_UPLOAD ? NVGPU_FN_UPLOAD : NVGPU_FN_COPY, true,
+                                                     (void *)(uintptr_t)p.srcAddr, (void *)(uintptr_t)p.dstAddr,
+                                                     (void *)(uintptr_t)p.size, ctx);
             if (r != kIOReturnSuccess)
                 failed_log("queue: copy failed 0x%x\n", r);
         } else {
@@ -151,6 +156,16 @@ uint64_t CommandQueue::processSegmentKernelCommand(IOAccelSegmentResourceList *r
         return 0;
     }
 
+    if (h.opcode == MALACHITE_CMD_PUSH) {
+        struct malachite_push p;
+        if (!record_payload(cmd, end, h.len, &p, sizeof(p)) || !gGpu)
+            return 0;
+        IOReturn r = rm::queue_push(gGpu, ctx, &p);
+        if (r != kIOReturnSuccess)
+            failed_log("queue: push failed 0x%x\n", r);
+        return 0;
+    }
+
     if (h.opcode == MALACHITE_CMD_COPY_2D) {
         struct nvgpu_copy2d c;
         if (!record_payload(cmd, end, h.len, &c, sizeof(c)) || !gGpu)
@@ -181,12 +196,15 @@ static IOGraphicsAccelerator2 *queue_accel(IOAccelCommandQueue *q)
 
 uint64_t CommandQueue::processCommandBuffer(unsigned int a, unsigned int b)
 {
+    if (gGpu)
+        gGpu->callPlatformFunction(NVGPU_FN_CB_BEGIN, true, (void *)queue_ctx(this), nullptr, nullptr, nullptr);
     uint64_t r = IOAccelCommandQueue::processCommandBuffer(a, b);
     if (async < 0)
-        async = gGpu && gGpu->callPlatformFunction(NVGPU_FN_ASYNC, true, (void *)queue_ctx(this), nullptr, nullptr,
+        async = gGpu && gGpu->callPlatformFunction(NVGPU_FN_ASYNC, true, (void *)queue_ctx(this), &app, nullptr,
                                                      nullptr) == kIOReturnSuccess;
     if (gGpu && gStampsFollowGPU && async)
-        static_cast<Accelerator *>(queue_accel(this))->stampEvent((IOAccelEvent *)((char *)this + 0x5c8), queue_ctx(this));
+        static_cast<Accelerator *>(queue_accel(this))->stampEvent((IOAccelEvent *)((char *)this + 0x5c8), queue_ctx(this),
+                                                                  app);
     else if (gGpu)
         gGpu->callPlatformFunction(NVGPU_FN_SYNC, true, (void *)queue_ctx(this), nullptr, nullptr, nullptr);
     charge_gpu_time(queue_ctx(this));

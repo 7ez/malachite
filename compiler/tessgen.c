@@ -2,7 +2,7 @@
 // from AIR. A draw has a vertex a patch: the vertex stage hands the patch's draw position and instance on, and the
 // tessellation init stage, a thread a control point, fetches the control points and the per-patch data from the
 // vertex buffers as the vertex descriptor lays them out (converting each format as the vertex fetch unit would),
-// and the patch's tessellation factors from the factor buffer.
+// and the patch's tessellation factors from the factor buffer. A kernel's stage input is fetched the same way.
 #include <string.h>
 #include "airc_int.h"
 #include "../core/sph.h"
@@ -106,8 +106,9 @@ static void ast(struct ir_val *vtx, unsigned at, int flags, struct ir_val **v, u
 }
 
 // n / d for a constant d, exactly, by a multiply (Granlund and Montgomery's round-up method)
-static struct ir_val *udiv(struct ir_val *n, uint32_t d)
+struct ir_val *airc_udiv(struct ir_block *b, struct ir_val *n, uint32_t d)
 {
+    g_b = b;
     if (d <= 1)
         return n;
     unsigned l = 32 - __builtin_clz(d - 1);  // ceil(log2 d)
@@ -128,16 +129,16 @@ static struct ir_val *element(const struct airc_tess_attr *a, struct ir_val *cp,
     case STEP_PER_PATCH:
         return pid;
     case STEP_PER_INSTANCE:
-        return op(IR_ADD, IR_I32, udiv(instance, a->rate), base);
+        return op(IR_ADD, IR_I32, airc_udiv(g_b, instance, a->rate), base);
     default:
         return k32(0);
     }
 }
 
-// the components of element idx of a's buffer, as the post-tessellation function reads them: floats for the float
-// and normalised formats, integers otherwise; those the format lacks 0, 0, 0, 1
-static void fetch(const struct airc_tess_attr *a, unsigned loc, struct ir_val *idx, struct ir_val *v[4])
+void airc_fetch(struct ir_block *b, const struct airc_tess_attr *a, unsigned loc, struct ir_val *buffer,
+                struct ir_val *idx, struct ir_val *v[4])
 {
+    g_b = b;
     static const struct {
         uint8_t code, n, bits;
     } widths[] = {
@@ -155,9 +156,7 @@ static void fetch(const struct airc_tess_attr *a, unsigned loc, struct ir_val *i
         }
     if (!n || !type)
         airc_fail("attribute %u: format %#x", loc, a->format);
-    if (a->buffer >= AIRC_TESS_BUFFERS)
-        airc_fail("attribute %u: buffer %u", loc, a->buffer);
-    struct ir_val *at = addr(cbuf(IR_I64, AIRC_TESS_BUFFER(a->buffer)), idx, a->stride);
+    struct ir_val *at = addr(buffer, idx, a->stride);
     struct ir_val *word[4];
     unsigned total = code >= 0x30 ? 32 : n * bits;
     for (unsigned w = 0; w * 32 < total; w++)  // Metal keeps attributes on 4 bytes
@@ -194,6 +193,13 @@ static void fetch(const struct airc_tess_attr *a, unsigned loc, struct ir_val *i
         v[0] = v[2];
         v[2] = r;
     }
+}
+
+static void fetch(const struct airc_tess_attr *a, unsigned loc, struct ir_val *idx, struct ir_val *v[4])
+{
+    if (a->buffer >= AIRC_TESS_BUFFERS)
+        airc_fail("attribute %u: buffer %u", loc, a->buffer);
+    airc_fetch(g_b, a, loc, cbuf(IR_I64, AIRC_TESS_BUFFER(a->buffer)), idx, v);
 }
 
 // generic 0: the patch's draw position (vertex ids count from the first vertex drawn), its instance from 0 and the

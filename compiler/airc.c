@@ -94,6 +94,7 @@ static void finish(struct ir_func *f, struct airc_info *info, int print_ir, int 
     k->h.nconst_samplers = info->nconst_samplers;
     k->h.compare_samplers = info->compare_samplers;
     k->h.plain_samplers = info->plain_samplers;
+    k->h.nearest_samplers = info->nearest_samplers;
     k->h.face_textures = info->face_textures;
     k->h.level_textures = info->level_textures;
     memcpy(k->h.args, info->args, sizeof(k->h.args));
@@ -106,8 +107,8 @@ static void finish(struct ir_func *f, struct airc_info *info, int print_ir, int 
 // they can't take, too many registers live across a call) compiles again with every call inlined, and one that
 // runs out of registers with some of its values kept in memory.
 static int compile_once(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct airc_source *linked, unsigned nlinked,
-                         const struct airc_varyings *vertex, const struct airc_constant *fc, unsigned nfc, int print_ir,
-                         int remat, struct airc_kernel *k)
+                         const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
+                         const struct airc_constant *fc, unsigned nfc, int print_ir, int remat, struct airc_kernel *k)
 {
     int ret = -1, calls = 1, rounds = 0;
     airc_spill_reset();
@@ -118,7 +119,7 @@ static int compile_once(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct air
             const char *names[AIRC_MAX_LINKED];
             for (unsigned i = 0; i < nlinked; i++)
                 names[i] = linked[i].name;
-            airc_front(mod, (void **)lmod, names, nlinked, vertex, fc, nfc, calls, &f, &info);
+            airc_front(mod, (void **)lmod, names, nlinked, vertex, stage_in, fc, nfc, calls, &f, &info);
             finish(&f, &info, print_ir, remat, k);
             k->error[0] = 0;
             ret = 0;
@@ -136,13 +137,13 @@ static int compile_once(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct air
 
 // A shader the optional passes can't get through compiles without them: a pipeline that fails takes WindowServer down.
 static int compile_stage(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct airc_source *linked, unsigned nlinked,
-                         const struct airc_varyings *vertex, const struct airc_constant *fc, unsigned nfc, int print_ir,
-                         int remat, struct airc_kernel *k)
+                         const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
+                         const struct airc_constant *fc, unsigned nfc, int print_ir, int remat, struct airc_kernel *k)
 {
-    int ret = compile_once(mod, lmod, linked, nlinked, vertex, fc, nfc, print_ir, remat, k);
+    int ret = compile_once(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, remat, k);
     if (ret) {
         g_passes_off = 1;
-        ret = compile_once(mod, lmod, linked, nlinked, vertex, fc, nfc, print_ir, remat, k);
+        ret = compile_once(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, remat, k);
         g_passes_off = 0;
     }
     return ret;
@@ -158,12 +159,12 @@ static unsigned warps(unsigned regs)
 int airc_compile(const void *air, size_t len, const struct airc_constant *fc, unsigned nfc, int print_ir,
                  struct airc_kernel *k)
 {
-    return airc_compile_linked(air, len, NULL, 0, NULL, fc, nfc, print_ir, k);
+    return airc_compile_linked(air, len, NULL, 0, NULL, NULL, fc, nfc, print_ir, k);
 }
 
 int airc_compile_linked(const void *air, size_t len, const struct airc_source *linked, unsigned nlinked,
-                        const struct airc_varyings *vertex, const struct airc_constant *fc, unsigned nfc,
-                        int print_ir, struct airc_kernel *k)
+                        const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
+                        const struct airc_constant *fc, unsigned nfc, int print_ir, struct airc_kernel *k)
 {
     memset(k, 0, sizeof(*k));
     g_error = k->error;
@@ -186,7 +187,7 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
             LLVMDisposeMemoryBuffer(mb);
             return -1;
         }
-    int ret = compile_stage(mod, lmod, linked, nlinked, vertex, fc, nfc, print_ir, 0, k);
+    int ret = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, 0, k);
     // a shader that needs many registers runs few warps at a time, which leaves memory waits unhidden: compiled
     // again with values made where they are read, it is kept if that runs more warps (or as many in less code)
     if (ret || k->h.reg_count > 40) {
@@ -194,7 +195,7 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
         char *error = g_error;
         g_error = r->error;
         g_error_size = sizeof(r->error);
-        int again = compile_stage(mod, lmod, linked, nlinked, vertex, fc, nfc, 0, 1, r);
+        int again = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, 1, r);
         g_error = error;
         g_error_size = sizeof(k->error);
         if (!again && (ret || warps(r->h.reg_count) > warps(k->h.reg_count) ||

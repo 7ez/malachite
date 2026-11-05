@@ -106,6 +106,11 @@ static LLVMValueRef g_point_fn;
 static uint8_t g_point_loc[16];
 static unsigned g_npoint_loc;
 static struct ir_val *g_point_map;
+// a kernel's stage input: how its attributes are laid out, the params its region's address and each buffer it
+// reads are at (0 for none), and the region's words as read so far
+static const struct airc_stage_in *g_stage_in;
+static unsigned g_region_off, g_stage_in_buffer[31];
+static struct ir_val *g_region[6];
 
 // threadgroup variables, laid out one after another (16-byte aligned) from shared address 0
 static struct {
@@ -235,6 +240,19 @@ static unsigned layout(LLVMTypeRef t, unsigned *align)
     }
     *align = a;
     return size;
+}
+
+// byte offset of field k of struct type t
+static unsigned field_offset(LLVMTypeRef t, unsigned k)
+{
+    unsigned a, off = 0;
+    for (unsigned f = 0; f <= k; f++) {
+        unsigned fs = layout(LLVMStructGetTypeAtIndex(t, f), &a);
+        off = (off + a - 1) & ~(a - 1);
+        if (f < k)
+            off += fs;
+    }
+    return off;
 }
 
 // byte offset of flat lane `lane` within a value of type t in memory
@@ -469,6 +487,7 @@ static unsigned const_sampler(LLVMValueRef g)
 }
 
 static struct ptr ptr_of(LLVMValueRef v);
+static struct ir_val *int_extend(struct ir_val *v, unsigned bits, int is_signed);
 
 // signed when the index was sign-extended to the GEP's width
 static struct ir_val *index_value(LLVMValueRef idx, int *is_signed)
@@ -477,8 +496,10 @@ static struct ir_val *index_value(LLVMValueRef idx, int *is_signed)
     if (LLVMIsAInstruction(idx)) {
         LLVMOpcode op = LLVMGetInstructionOpcode(idx);
         if (op == LLVMZExt || op == LLVMSExt) {
+            // a narrower integer's bits above its own are junk (a truncation keeps them)
+            LLVMValueRef x = LLVMGetOperand(idx, 0);
             *is_signed = op == LLVMSExt;
-            return get(LLVMGetOperand(idx, 0), 0);
+            return int_extend(get(x, 0), 8 * scalar_bytes(LLVMTypeOf(x)), *is_signed);
         }
     }
     return get(idx, 0);
@@ -544,14 +565,8 @@ static struct ptr gep(LLVMValueRef g)
         if (LLVMGetTypeKind(t) == LLVMStructTypeKind) {
             if (!LLVMIsAConstantInt(idx))
                 airc_fail("struct field index is not a constant");
-            unsigned k = (unsigned)LLVMConstIntGetZExtValue(idx), off = 0;
-            for (unsigned f = 0; f <= k; f++) {
-                unsigned fs = layout(LLVMStructGetTypeAtIndex(t, f), &a);
-                off = (off + a - 1) & ~(a - 1);
-                if (f < k)
-                    off += fs;
-            }
-            p.off += off;
+            unsigned k = (unsigned)LLVMConstIntGetZExtValue(idx);
+            p.off += field_offset(t, k);
             t = LLVMStructGetTypeAtIndex(t, k);
         } else {
             unsigned count = LLVMGetTypeKind(t) == LLVMArrayTypeKind ? (unsigned)LLVMGetArrayLength2(t) : 0;
@@ -563,8 +578,9 @@ static struct ptr gep(LLVMValueRef g)
 }
 
 // Private memory goes to the thread's local memory (LDL/STL) rather than registers when it's indexed by a variable
-// (a SEL over every element at each access otherwise) or read in other sizes than it was written in (MPS moves its
-// reduction state through it as bytes, then reads it as words): through calls too, as they're inlined.
+// (a SEL over every element at each access otherwise) or read in other pieces than it was written in (MPS moves its
+// reduction state through it as bytes, then reads it as words): through calls too, as they're inlined. Fields of
+// different sizes side by side are fine (MPS's array structs hold a pointer, a 64-bit count and a 32-bit rank).
 static LLVMValueRef ptr_root(LLVMValueRef v)
 {
     while (LLVMIsAInstruction(v) && (LLVMGetInstructionOpcode(v) == LLVMGetElementPtr ||
@@ -574,42 +590,169 @@ static LLVMValueRef ptr_root(LLVMValueRef v)
     return v;
 }
 
-static unsigned access_sizes(LLVMTypeRef t)
+// v's byte offset from ptr_root(v); one with a variable index counts as 0, as scan_uses takes it as dynamic anyway
+static int64_t root_offset(LLVMValueRef v)
 {
-    unsigned m = 0;
-    for (unsigned l = 0; l < nlanes(t); l++) {
-        unsigned b = scalar_bytes(lane_type(t, l));
-        m |= b >= 8 ? 8 : b;
+    int64_t off = 0;
+    for (; v != ptr_root(v); v = LLVMGetOperand(v, 0)) {
+        if (LLVMGetInstructionOpcode(v) != LLVMGetElementPtr)
+            continue;
+        LLVMTypeRef t = LLVMGetGEPSourceElementType(v);
+        unsigned a;
+        for (int i = 1; i < LLVMGetNumOperands(v); i++) {
+            LLVMValueRef idx = LLVMGetOperand(v, i);
+            if (!LLVMIsAConstantInt(idx))
+                return 0;
+            unsigned shift = 64 - LLVMGetIntTypeWidth(LLVMTypeOf(idx));
+            int64_t k = (int64_t)(LLVMConstIntGetZExtValue(idx) << shift) >> shift;
+            if (i == 1) {
+                off += k * layout(t, &a);
+            } else if (LLVMGetTypeKind(t) == LLVMStructTypeKind) {
+                off += field_offset(t, (unsigned)k);
+                t = LLVMStructGetTypeAtIndex(t, (unsigned)k);
+            } else {
+                t = LLVMGetElementType(t);
+                off += k * layout(t, &a);
+            }
+        }
     }
-    return m;
+    return off;
+}
+
+// The pieces of private memory accessed, each as the variable it is: a lane, or a word of a 64-bit integer, which
+// values keep as two
+struct piece {
+    int64_t off;
+    unsigned bytes;
+};
+
+struct pieces {
+    struct piece *p;
+    unsigned n, cap;
+    unsigned sizes;  // of the lanes, a bit each
+    int dynamic;     // indexed by a variable, or moved as bytes by a memcpy
+    int escapes;     // its address goes where the scan doesn't follow it
+};
+
+static void add_pieces(struct pieces *s, LLVMTypeRef t, int64_t off)
+{
+    for (unsigned l = 0; l < nlanes(t); l++) {
+        LLVMTypeRef st = lane_type(t, l);
+        unsigned bytes = scalar_bytes(st);
+        s->sizes |= bytes >= 8 ? 8 : bytes;
+        unsigned step = LLVMGetTypeKind(st) == LLVMIntegerTypeKind && bytes > 4 ? 4 : bytes;
+        for (unsigned w = 0; w < bytes; w += step) {
+            struct piece q = { off + lane_offset(t, l) + w, step };
+            unsigned i = 0;
+            while (i < s->n && (s->p[i].off != q.off || s->p[i].bytes != q.bytes))
+                i++;
+            if (i < s->n)
+                continue;
+            if (s->n == s->cap) {
+                s->cap = s->cap ? 2 * s->cap : 32;
+                s->p = realloc(s->p, s->cap * sizeof(*s->p));
+            }
+            s->p[s->n++] = q;
+        }
+    }
+}
+
+// two pieces that overlap without being the same variable
+static int pieces_clash(const struct pieces *s)
+{
+    for (unsigned i = 0; i < s->n; i++)
+        for (unsigned j = i + 1; j < s->n; j++)
+            if (s->p[i].off < s->p[j].off + s->p[j].bytes && s->p[j].off < s->p[i].off + s->p[i].bytes)
+                return 1;
+    return 0;
 }
 
 static LLVMValueRef linked_function(const char *name);
 
-// what fn does through pointers rooted at root: the sizes it loads and stores (a bit each), and whether it indexes
-// them by a variable
-static void scan_uses(LLVMValueRef fn, LLVMValueRef root, unsigned *sizes, int *dynamic, unsigned depth)
+static int rooted_at(LLVMValueRef v, LLVMValueRef root)
 {
-    if (depth > 8 || !LLVMGetFirstBasicBlock(fn))
-        return;
+    return is_ptr(LLVMTypeOf(v)) && ptr_root(v) == root;
+}
+
+// whether alloca b is only loaded from and stored to in fn, at constant offsets: every load of what it holds is in
+// sight then
+static int stays_put(LLVMValueRef fn, LLVMValueRef b)
+{
     for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb))
         for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in)) {
             LLVMOpcode op = LLVMGetInstructionOpcode(in);
+            LLVMValueRef callee = op == LLVMCall ? LLVMGetCalledValue(in) : NULL;
+            const char *name = callee ? LLVMGetValueName(callee) : NULL;
+            for (int i = 0; i < LLVMGetNumOperands(in); i++) {
+                if (!rooted_at(LLVMGetOperand(in, i), b) || op == LLVMLoad || op == LLVMBitCast ||
+                    op == LLVMAddrSpaceCast || (op == LLVMStore && i == 1) ||
+                    (name && !strncmp(name, "llvm.lifetime.", 14)))
+                    continue;
+                if (op != LLVMGetElementPtr)
+                    return 0;
+                for (int k = 1; k < LLVMGetNumOperands(in); k++)
+                    if (!LLVMIsAConstantInt(LLVMGetOperand(in, k)))
+                        return 0;
+            }
+        }
+    return 1;
+}
+
+static void scan_uses(LLVMValueRef fn, LLVMValueRef root, int64_t base, struct pieces *s, unsigned depth);
+
+// A pointer at bytes into the alloca, stored into fn's memory at y (MPS's visible functions spill the struct pointer
+// they're given to the stack): what's done through each load of it back. 0 when not every load can be seen.
+static int follow_spill(LLVMValueRef fn, LLVMValueRef y, int64_t at, struct pieces *s, unsigned depth)
+{
+    LLVMValueRef b = ptr_root(y);
+    int64_t off = root_offset(y);
+    if (!LLVMIsAInstruction(b) || LLVMGetInstructionOpcode(b) != LLVMAlloca || !stays_put(fn, b))
+        return 0;
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb))
+        for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in)) {
+            if (LLVMGetInstructionOpcode(in) != LLVMLoad || ptr_root(LLVMGetOperand(in, 0)) != b)
+                continue;
+            unsigned a;
+            int64_t o = root_offset(LLVMGetOperand(in, 0));
+            if (o == off && is_ptr(LLVMTypeOf(in)))
+                scan_uses(fn, in, at, s, depth + 1);
+            else if (o < off + 8 && off < o + layout(LLVMTypeOf(in), &a))
+                return 0;  // the pointer read as something else
+        }
+    return 1;
+}
+
+// what fn does through pointers rooted at root, which is base bytes into the alloca: the pieces it loads and stores,
+// whether it indexes them by a variable, and whether the address goes somewhere else (stored where its loads can't
+// all be seen, returned, passed to an intrinsic or a call too deep)
+static void scan_uses(LLVMValueRef fn, LLVMValueRef root, int64_t base, struct pieces *s, unsigned depth)
+{
+    if (depth > 8) {
+        s->escapes = 1;
+        return;
+    }
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb))
+        for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in)) {
+            LLVMOpcode op = LLVMGetInstructionOpcode(in);
+            LLVMValueRef val = op == LLVMStore ? LLVMGetOperand(in, 0) : NULL;
+            if (val && rooted_at(val, root) &&
+                !follow_spill(fn, LLVMGetOperand(in, 1), base + root_offset(val), s, depth))
+                s->escapes = 1;
             if (op == LLVMLoad && ptr_root(LLVMGetOperand(in, 0)) == root) {
-                *sizes |= access_sizes(LLVMTypeOf(in));
+                add_pieces(s, LLVMTypeOf(in), base + root_offset(LLVMGetOperand(in, 0)));
             } else if (op == LLVMStore && ptr_root(LLVMGetOperand(in, 1)) == root) {
-                *sizes |= access_sizes(LLVMTypeOf(LLVMGetOperand(in, 0)));
+                add_pieces(s, LLVMTypeOf(LLVMGetOperand(in, 0)), base + root_offset(LLVMGetOperand(in, 1)));
             } else if (op == LLVMGetElementPtr && ptr_root(in) == root) {
                 for (int i = 1; i < LLVMGetNumOperands(in); i++)
                     if (!LLVMIsAConstantInt(LLVMGetOperand(in, i)))
-                        *dynamic = 1;
+                        s->dynamic = 1;
             } else if (op == LLVMPHI && is_ptr(LLVMTypeOf(in))) {  // a pointer walking it, picked when it runs
                 for (unsigned i = 0; i < LLVMCountIncoming(in); i++)
                     if (ptr_root(LLVMGetIncomingValue(in, i)) == root)
-                        *dynamic = 1;
+                        s->dynamic = 1;
             } else if (op == LLVMSelect && is_ptr(LLVMTypeOf(in))) {
                 if (ptr_root(LLVMGetOperand(in, 1)) == root || ptr_root(LLVMGetOperand(in, 2)) == root)
-                    *dynamic = 1;
+                    s->dynamic = 1;
             } else if (op == LLVMCall) {
                 LLVMValueRef callee = LLVMGetCalledValue(in);
                 const char *name = callee ? LLVMGetValueName(callee) : NULL;
@@ -619,10 +762,21 @@ static void scan_uses(LLVMValueRef fn, LLVMValueRef root, unsigned *sizes, int *
                 // a memcpy or memset moves bytes whatever the lanes around it are, which only memory keeps
                 if (name && !strncmp(name, "llvm.mem", 8) &&
                     (ptr_root(LLVMGetOperand(in, 0)) == root || ptr_root(LLVMGetOperand(in, 1)) == root))
-                    *dynamic = 1;
-                for (unsigned k = 0; callee && k < LLVMCountParams(callee); k++)
-                    if (ptr_root(LLVMGetOperand(in, k)) == root)
-                        scan_uses(callee, LLVMGetParam(callee, k), sizes, dynamic, depth + 1);
+                    s->dynamic = 1;
+                int lifetime = name && !strncmp(name, "llvm.lifetime.", 14);
+                for (int k = 0; k < LLVMGetNumOperands(in) - 1; k++) {
+                    LLVMValueRef arg = LLVMGetOperand(in, k);
+                    if (!rooted_at(arg, root) || lifetime)
+                        continue;
+                    if (callee && LLVMGetFirstBasicBlock(callee) && (unsigned)k < LLVMCountParams(callee))
+                        scan_uses(callee, LLVMGetParam(callee, k), base + root_offset(arg), s, depth + 1);
+                    else
+                        s->escapes = 1;
+                }
+            } else if (op != LLVMStore && op != LLVMBitCast && op != LLVMAddrSpaceCast) {
+                for (int i = 0; i < LLVMGetNumOperands(in); i++)
+                    if (rooted_at(LLVMGetOperand(in, i), root))
+                        s->escapes = 1;
             }
         }
 }
@@ -639,14 +793,15 @@ static int alloca_is_local(LLVMValueRef alloca, LLVMValueRef fn)
     while (c && c->alloca != alloca)
         c = c->next;
     if (!c) {
-        unsigned sizes = 0;
-        int dynamic = 0;
-        scan_uses(fn, alloca, &sizes, &dynamic, 0);
+        struct pieces s = { 0 };
+        scan_uses(fn, alloca, 0, &s, 0);
         c = ir_alloc(sizeof(*c));
         c->alloca = alloca;
-        c->local = dynamic || (sizes & (sizes - 1));
+        // what's done through an escaped address isn't seen: different sizes anywhere might overlap there
+        c->local = s.dynamic || pieces_clash(&s) || (s.escapes && (s.sizes & (s.sizes - 1)));
         c->next = g_local_choices;
         g_local_choices = c;
+        free(s.p);
     }
     return c->local;
 }
@@ -783,7 +938,10 @@ static struct ptr fit_offset(struct ptr p)
     return p;
 }
 
-// a pointer as one value, for a phi or select of pointers: a global one's 64-bit address, a shared one's offset
+static struct ir_val *handle_of_ptr(struct ptr p, enum space space);
+
+// a pointer as one value, for a phi or select of pointers: a global one's 64-bit address, a shared one's offset, a
+// texture's or sampler's handle
 static struct ir_val *ptr_value(struct ptr p)
 {
     if (p.space == SP_GLOBAL)
@@ -792,7 +950,9 @@ static struct ir_val *ptr_value(struct ptr p)
         struct ir_val *off = konst(IR_I32, p.off);
         return !p.base ? off : p.off ? op2(IR_ADD, IR_I32, p.base, off) : p.base;
     }
-    airc_fail("a phi or select of texture, sampler or private pointers");
+    if (p.space == SP_TEXTURE || p.space == SP_SAMPLER)
+        return handle_of_ptr(p, p.space);
+    airc_fail("a phi or select of private pointers");
 }
 
 static enum space ptr_space(LLVMTypeRef t)
@@ -815,6 +975,8 @@ static struct ptr phi_ptr(LLVMValueRef phi)
             q.space = SP_LOCAL;
             q.slot = p.slot > q.slot ? p.slot : q.slot;
         }
+        if (p.space == SP_TEXTURE || p.space == SP_SAMPLER)
+            q.space = p.space;
     }
     return q;
 }
@@ -1014,18 +1176,104 @@ static struct ir_val *flat_tid(void)
     return ir_op2(g_prologue, IR_ADD, IR_I32, ir_op2(g_prologue, IR_MUL, IR_I32, zy, cbuf(IR_I32, 0)), s2r(SR_TID_X));
 }
 
+// a thread's place in the dispatch along axis l, for the builtin kinds that are one: where it is in the grid
+// (origin + ctaid * ntid + tid, ntid from c[0x0][4 * l]) or its threadgroup, and the sizes
+static struct ir_val *thread_value(enum nvk_arg_kind kind, unsigned l)
+{
+    switch (kind) {
+    case NVK_ARG_TID: {
+        struct ir_val *v = ir_op2(g_prologue, IR_ADD, IR_I32,
+                                  ir_op2(g_prologue, IR_MUL, IR_I32, s2r(SR_CTAID_X + l), cbuf(IR_I32, 4 * l)),
+                                  s2r(SR_TID_X + l));
+        return ir_op2(g_prologue, IR_ADD, IR_I32, v, cbuf(IR_I32, NVK_CB_ORIGIN + 4 * l));
+    }
+    case NVK_ARG_TG_POS:
+        return ir_op2(g_prologue, IR_ADD, IR_I32, s2r(SR_CTAID_X + l), cbuf(IR_I32, NVK_CB_GROUP_ORIGIN + 4 * l));
+    case NVK_ARG_TG_TID:
+        return s2r(SR_TID_X + l);
+    case NVK_ARG_TG_SIZE:
+        return cbuf(IR_I32, 4 * l);
+    case NVK_ARG_GROUPS:
+        return cbuf(IR_I32, NVK_CB_GROUPS + 4 * l);
+    case NVK_ARG_GRID_SIZE:
+        return cbuf(IR_I32, NVK_CB_GRID + 4 * l);
+    default:
+        airc_fail("thread value of argument kind %d", kind);
+    }
+}
+
 static struct ir_val *udivmod(struct ir_val *n, struct ir_val *d, int rem);
+
+// MTLStepFunction's values for a kernel's stage input
+enum { STEP_CONSTANT = 0, STEP_X = 5, STEP_Y, STEP_X_INDEXED, STEP_Y_INDEXED };
+
+// word i of the stage-in region: its origin's x, y and z, then its size's
+static struct ir_val *stage_in_region(unsigned i)
+{
+    if (!g_region[i]) {
+        struct ir_val *at = cbuf(IR_I64, g_region_off);
+        g_region[i] = ir_add(g_prologue, IR_LDG, IR_I32, 1);
+        g_region[i]->src[0] = at;
+        g_region[i]->imm = 4 * i;
+        g_region[i]->aux = 4;
+    }
+    return g_region[i];
+}
+
+// The element of a's buffer the stage input reads at stage-in grid position (x, y), a step every rate positions:
+// the position along the step function's axis past the region's origin, or the index buffer's at that position
+// past the origin (which makes the origin a base vertex, as Metal's tessellation kernels have it)
+static struct ir_val *stage_in_element(const struct airc_tess_attr *a, unsigned loc, struct ir_val *x,
+                                       struct ir_val *y)
+{
+    if (a->step == STEP_CONSTANT)
+        return konst(IR_I32, 0);
+    if (a->step < STEP_X || a->step > STEP_Y_INDEXED)
+        airc_fail("stage input attribute %u: step function %u", loc, a->step);
+    int axis = a->step == STEP_Y || a->step == STEP_Y_INDEXED;
+    struct ir_val *pos = airc_udiv(g_cur, axis ? y : x, a->rate);
+    if (a->step >= STEP_X_INDEXED) {
+        unsigned bytes = g_stage_in->index_size;
+        if (bytes != 2 && bytes != 4)
+            airc_fail("stage input indices of %u bytes", bytes);
+        struct ir_val *at = op2(IR_ADDR, IR_I64, cbuf(IR_I64, g_stage_in_buffer[g_stage_in->index_buffer]), pos);
+        at->imm = bytes;
+        pos = ir_add(g_cur, IR_LDG, IR_I32, 1);
+        pos->src[0] = at;
+        pos->aux = (int)bytes;
+    }
+    return op2(IR_ADD, IR_I32, pos, stage_in_region(axis));
+}
+
+// attribute loc of the stage input at stage-in grid position (x, y); one the descriptor leaves out reads zeros, as
+// a vertex function's does
+static void stage_in_attr(unsigned loc, struct ir_val *x, struct ir_val *y, struct ir_val *v[4])
+{
+    const struct airc_tess_attr *a = g_stage_in ? &g_stage_in->attrs[loc] : NULL;
+    if (!a || !a->format) {
+        v[0] = v[1] = v[2] = v[3] = konst(IR_I32, 0);
+        return;
+    }
+    airc_fetch(g_cur, a, loc, cbuf(IR_I64, g_stage_in_buffer[a->buffer]), stage_in_element(a, loc, x, y), v);
+}
+
+// a fetched component as a lane of type t holds it, a half still as a float: its bits as a float's or an integer's
+static struct ir_val *stage_in_lane(struct ir_val *v, LLVMTypeRef t)
+{
+    enum ir_type want = ir_type_of(t) == IR_I32 ? IR_I32 : IR_F32;
+    return v->type == want ? v : op2(IR_OR, want, v, konst(want, 0));
+}
 
 // The entry function's arguments: builtins become values made in the prologue, buffers pointers whose base
 // the dispatcher puts in const bank 0, textures and samplers pool slots.
 static void entry_args(void)
 {
-    for (unsigned i = 0; i < g_info->nargs; i++) {
+    for (unsigned i = 0; i < LLVMCountParams(g_entry_fn); i++) {  // the stage input's hidden ones follow
         const struct nvk_arg *a = &g_info->args[i];
         LLVMValueRef p = LLVMGetParam(g_entry_fn, i);
         unsigned n = nlanes(LLVMTypeOf(p));
         struct ptr ptr = { 0 };
-        struct ir_val *texel = NULL, *uv[2] = { NULL, NULL };
+        struct ir_val *texel = NULL, *uv[2] = { NULL, NULL }, *fetched[4];
         if (a->kind == NVK_ARG_RENDER_TARGET) {  // fetch the attachment at the pixel's integer position
             struct ir_val *xy[2];
             for (int c = 0; c < 2; c++) {
@@ -1055,29 +1303,16 @@ static void entry_args(void)
             case NVK_ARG_TEXTURE:
             case NVK_ARG_SAMPLER:
                 ptr.space = a->kind == NVK_ARG_TEXTURE ? SP_TEXTURE : SP_SAMPLER;
-                ptr.slot = a->index;
+                ptr.slot = a->index < 16 ? a->index : a->cbuf_off;
                 ptr.count = g_info->array_count[i];
                 break;
-            case NVK_ARG_TID:  // origin + ctaid * ntid + tid, ntid from c[0x0][4 * d]
-                v = ir_op2(g_prologue, IR_ADD, IR_I32,
-                           ir_op2(g_prologue, IR_MUL, IR_I32, s2r(SR_CTAID_X + l), cbuf(IR_I32, 4 * l)),
-                           s2r(SR_TID_X + l));
-                v = ir_op2(g_prologue, IR_ADD, IR_I32, v, cbuf(IR_I32, NVK_CB_ORIGIN + 4 * l));
-                break;
+            case NVK_ARG_TID:
             case NVK_ARG_TG_POS:
-                v = ir_op2(g_prologue, IR_ADD, IR_I32, s2r(SR_CTAID_X + l), cbuf(IR_I32, NVK_CB_GROUP_ORIGIN + 4 * l));
-                break;
             case NVK_ARG_TG_TID:
-                v = s2r(SR_TID_X + l);
-                break;
             case NVK_ARG_TG_SIZE:
-                v = cbuf(IR_I32, 4 * l);
-                break;
             case NVK_ARG_GROUPS:
-                v = cbuf(IR_I32, NVK_CB_GROUPS + 4 * l);
-                break;
             case NVK_ARG_GRID_SIZE:
-                v = cbuf(IR_I32, NVK_CB_GRID + 4 * l);
+                v = thread_value((enum nvk_arg_kind)a->kind, l);
                 break;
             case NVK_ARG_TG_INDEX:
                 v = flat_tid();
@@ -1138,11 +1373,22 @@ static void entry_args(void)
                 v = cbuf(IR_I32, NVK_BASE_INSTANCE);
                 break;
             case NVK_ARG_VERTEX_INPUT:
+                if (g_info->stage == NVK_COMPUTE) {  // a kernel's [[stage_in]], fetched at the thread's position
+                    if (!l)
+                        stage_in_attr(a->index, thread_value(NVK_ARG_TID, 0), thread_value(NVK_ARG_TID, 1), fetched);
+                    v = stage_in_lane(fetched[l], lane_type(LLVMTypeOf(p), l));
+                    break;
+                }
                 v = attr(IR_ALD, 0x80 + 16 * a->index + 4 * l);
                 v->type = ir_type_of(lane_type(LLVMTypeOf(p), l)) == IR_I32 ? IR_I32 : IR_F32;
-                g_info->vertex_inputs |= 1u << a->index;
+                break;
+            case NVK_ARG_STAGE_IN_ORIGIN:
+            case NVK_ARG_STAGE_IN_SIZE:
+                v = stage_in_region(3 * (a->kind == NVK_ARG_STAGE_IN_SIZE) + l);
                 break;
             case NVK_ARG_CONTROL_POINTS: {  // bytes 0 and 2 of INVOCATION_INFO multiplied
+                if (g_info->stage == NVK_COMPUTE)  // a kernel's are its stage input, fetched where they're read
+                    break;
                 struct ir_val *info = s2r(SR_INVOCATION_INFO);
                 struct ir_val *lo = ir_op2(g_prologue, IR_AND, IR_I32, info, konst(IR_I32, 0xff));
                 struct ir_val *hi = ir_op2(g_prologue, IR_SHR, IR_I32, info, konst(IR_I32, 16));
@@ -1239,7 +1485,7 @@ static void entry_args(void)
 // intrinsic names look like air.<base>.<type>, air.fast_<base>.<type> or llvm.<base>.<type>
 static int is_fn(const char *name, const char *base)
 {
-    static const char *const prefixes[] = { "air.", "air.fast_", "llvm." };
+    static const char *const prefixes[] = { "air.", "air.fast_", "air.native_", "llvm." };
     size_t n = strlen(base);
     for (unsigned i = 0; i < sizeof prefixes / sizeof prefixes[0]; i++) {
         size_t p = strlen(prefixes[i]);
@@ -1944,7 +2190,7 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
 {
     if (is_fn(name, "nextafter"))
         return nextafter_ir(get(LLVMGetOperand(call, 0), lane), get(LLVMGetOperand(call, 1), lane), t);
-    int precise = strncmp(name, "air.fast_", 9) != 0;
+    int precise = strncmp(name, "air.fast_", 9) && strncmp(name, "air.native_", 11);  // OpenCL's native_ ones as fast
     struct ir_val *a = LLVMGetNumOperands(call) > 1 ? widen(get(LLVMGetOperand(call, 0), lane)) : NULL;
     struct ir_val *b = LLVMGetNumOperands(call) > 2 ? widen(get(LLVMGetOperand(call, 1), lane)) : NULL;
     struct ir_val *c = LLVMGetNumOperands(call) > 3 ? widen(get(LLVMGetOperand(call, 2), lane)) : NULL;
@@ -1998,8 +2244,12 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
         r = op1(IR_FABS, IR_F32, a);
     else if (is_fn(name, "saturate"))  // + 0 flushes a denormal, as Apple's does
         r = addf(clampf(a, fconst(0), fconst(1)), fconst(0));
-    else if (is_fn(name, "clamp") && t != IR_I32)
+    else if (is_fn(name, "clamp") && t != IR_I32) {
         r = clampf(a, b, c);
+        // fast maths flushes a denormal, so a clamp to [0, 1] is a saturate: one FADD.SAT
+        if (!precise && b->op == IR_CONST && b->imm == 0 && c->op == IR_CONST && c->imm == 0x3f800000)
+            r = addf(r, fconst(0));
+    }
     else if (is_fn(name, "sin"))
         sincos_ir(a, &r, NULL, TRIG_PRECISE);
     else if (is_fn(name, "cos"))
@@ -2738,7 +2988,7 @@ static struct ir_val *handle_of(LLVMValueRef v, enum space space)
     return handle_of_ptr(ptr_of(v), space);
 }
 
-enum { USE_PLAIN, USE_COMPARE, USE_FACES, USE_LEVELS };
+enum { USE_PLAIN, USE_COMPARE, USE_FACES, USE_LEVELS, USE_NEAREST };
 
 // A slot's use the plugin sets the sampler or texture up for: a subroutine's parameter keeps it for the slots its
 // calls pass.
@@ -3188,6 +3438,8 @@ static void texture_op(LLVMValueRef call, const char *name)
     struct ir_val *texture = cube && read ? faces_handle(LLVMGetOperand(call, 0))
                                           : handle_of(LLVMGetOperand(call, 0), SP_TEXTURE);
     struct ir_val *handle = read ? texture : op2(IR_OR, IR_I32, texture, sampler_handle(LLVMGetOperand(call, 1), compare));
+    if (!read && !gather && (strstr(name, ".u.") || strstr(name, ".s.") || strstr(name, ".i.")))
+        note_use(ptr_of(LLVMGetOperand(call, 1)), USE_NEAREST);
     unsigned i = (legacy || bare) && read ? 1 : depth ? 3 : 2;  // a legacy read has no sampler
     LLVMValueRef coord = LLVMGetOperand(call, i++);
     LLVMValueRef layer = array || (cube && read) ? LLVMGetOperand(call, i++) : NULL;
@@ -3347,6 +3599,8 @@ static void store_value(struct ptr p, LLVMTypeRef t, LLVMValueRef val, unsigned 
 static void inline_call(LLVMValueRef call, LLVMValueRef fn);
 static int call_sub(LLVMValueRef call, LLVMValueRef fn);
 static void control_point(LLVMValueRef call);
+static void picked_from(struct sub_param *param, struct ptr from);
+static void note_picked_uses(void);
 
 static LLVMValueRef first_node(LLVMModuleRef m, const char *name)
 {
@@ -3488,6 +3742,55 @@ static void simdgroup_matrix(LLVMValueRef in, int multiply)
 static struct ir_val *bfloat_to_float(struct ir_val *x);
 static struct ir_val *float_to_bfloat(struct ir_val *x);
 
+// OpenCL's work-item functions (air.get_global_id.i32 and the rest), which Apple's OpenCL compiles to these rather
+// than to kernel arguments. The dimension is an argument; from 3 on an id is 0 and a size 1, as OpenCL has it. There
+// is no global offset (the dispatch has none), and the work dimension is the last axis longer than 1. 0 for another
+// air.get_ name.
+static int workitem(LLVMValueRef in, const char *what)
+{
+    static const struct {
+        const char *name;
+        enum nvk_arg_kind kind;
+        int size;  // 1 for a size, which is 1 past the axes
+    } fn[] = {
+        { "global_id.", NVK_ARG_TID, 0 },       { "local_id.", NVK_ARG_TG_TID, 0 },
+        { "group_id.", NVK_ARG_TG_POS, 0 },     { "global_size.", NVK_ARG_GRID_SIZE, 1 },
+        { "local_size.", NVK_ARG_TG_SIZE, 1 },  { "num_groups.", NVK_ARG_GROUPS, 1 },
+    };
+    struct ir_val *v = NULL;
+    if (!strncmp(what, "global_offset.", 14)) {
+        v = konst(IR_I32, 0);
+    } else if (!strncmp(what, "work_dim", 8)) {
+        struct ir_val *y = op2(IR_CMP, IR_PRED, thread_value(NVK_ARG_GRID_SIZE, 1), konst(IR_I32, 1));
+        struct ir_val *z = op2(IR_CMP, IR_PRED, thread_value(NVK_ARG_GRID_SIZE, 2), konst(IR_I32, 1));
+        y->aux = z->aux = IR_GT;
+        v = sel(z, konst(IR_I32, 3), sel(y, konst(IR_I32, 2), konst(IR_I32, 1)));
+    } else {
+        unsigned i = 0;
+        while (i < sizeof(fn) / sizeof(fn[0]) && strncmp(what, fn[i].name, strlen(fn[i].name)))
+            i++;
+        if (i == sizeof(fn) / sizeof(fn[0]))
+            return 0;
+        LLVMValueRef dim = LLVMGetOperand(in, 0);
+        if (LLVMIsAConstantInt(dim)) {
+            uint64_t d = LLVMConstIntGetZExtValue(dim);
+            v = d < 3 ? thread_value(fn[i].kind, (unsigned)d) : konst(IR_I32, fn[i].size);
+        } else {
+            struct ir_val *d = get(dim, 0);
+            v = konst(IR_I32, fn[i].size);
+            for (int l = 2; l >= 0; l--) {
+                struct ir_val *is = op2(IR_CMP, IR_PRED, d, konst(IR_I32, l));
+                is->aux = IR_EQ;
+                v = sel(is, thread_value(fn[i].kind, (unsigned)l), v);
+            }
+        }
+    }
+    set(in, 0, v);
+    if (is_i64(LLVMTypeOf(in)))
+        set_high(in, 0, konst(IR_I32, 0));
+    return 1;
+}
+
 static void call(LLVMValueRef in)
 {
     LLVMValueRef fn = LLVMGetCalledValue(in);
@@ -3560,6 +3863,8 @@ static void call(LLVMValueRef in)
         set(in, 0, null);
         return;
     }
+    if (!strncmp(name, "air.get_", 8) && workitem(in, name + 8))
+        return;
     if (!strncmp(name, "air.get_null_texture", 20)) {  // the unbound texture's handle, 0, as an argument buffer's ID
         struct ptr p = { .space = SP_GLOBAL, .base = konst(IR_I64, 0) };
         insert(g_ptrs, in, 0, g_scope)->p = p;
@@ -3647,7 +3952,7 @@ static void call(LLVMValueRef in)
         for (unsigned l = 0; l < n; l++) {
             enum ir_type t = ir_type_of(lane_type(rt, l));
             struct ir_val *s, *c, *x = widen(get(LLVMGetOperand(in, 0), l));
-            int fast = !strncmp(name, "air.fast_", 9);
+            int fast = !strncmp(name, "air.fast_", 9) || !strncmp(name, "air.native_", 11);
             if (fast || t == IR_F16)
                 cheap_sincos(x, fast, &s, &c);
             else
@@ -4050,6 +4355,41 @@ static struct ir_val *load_lane(struct ptr p, unsigned off, LLVMTypeRef st)
     return v;
 }
 
+static unsigned low_bit(int64_t x, unsigned cap)
+{
+    uint64_t b = (uint64_t)x & -(uint64_t)x;
+    return !b || b > cap ? cap : (unsigned)b;
+}
+
+// What a global pointer's alignment is known to be: a buffer starts 16-byte aligned, and every index or offset on
+// the way keeps only what its step does. MPS indexes a float * and stores a float4 through it, declaring 16 bytes
+// of alignment Apple's GPUs don't need; a 128-bit STG on an address that isn't faults (Misaligned Address).
+static unsigned global_align(struct ptr p)
+{
+    unsigned a = low_bit(p.off, 16);
+    for (struct ir_val *v = p.base; v && a > 1;) {
+        if (v->op == IR_ADDR) {
+            struct ir_val *i = v->src[1];
+            int64_t step = v->imm;
+            if (i->op == IR_CONST)
+                step *= i->imm;
+            else if (i->op == IR_MUL && i->src[1]->op == IR_CONST)
+                step *= i->src[1]->imm;
+            else if (i->op == IR_SHL && i->src[1]->op == IR_CONST && i->src[1]->imm < 8)
+                step <<= i->src[1]->imm;
+            if (step)
+                a = a < low_bit(step, 16) ? a : low_bit(step, 16);
+            v = v->src[0];
+        } else if (v->op == IR_ADDI) {
+            a = a < low_bit(v->imm, 16) ? a : low_bit(v->imm, 16);
+            v = v->src[0];
+        } else {
+            break;
+        }
+    }
+    return a;
+}
+
 // 2 or 4 lanes of 32 bits one after another, which one 64- or 128-bit access moves when aligned to its size
 static int wide_lanes(LLVMTypeRef t, unsigned align)
 {
@@ -4062,6 +4402,33 @@ static int wide_lanes(LLVMTypeRef t, unsigned align)
             return 0;
     }
     return 1;
+}
+
+// A vector of bytes or halfwords filling 4, 8 or 16 bytes (a uchar4, a ushort2, a half4), which one access of that
+// size moves when aligned to it: its size, or 0. A 3-lane one's slot has a lane of padding, which a load may read.
+static unsigned packed_bytes(LLVMTypeRef t, unsigned align)
+{
+    if (LLVMGetTypeKind(t) != LLVMVectorTypeKind)
+        return 0;
+    LLVMTypeRef et = LLVMGetElementType(t);
+    unsigned a, size = layout(t, &a), b = scalar_bytes(et);
+    if ((b != 1 && b != 2) || ir_type_of(et) == IR_PRED || (size != 4 && size != 8 && size != 16) || align < size)
+        return 0;
+    return size;
+}
+
+// The 32-bit value lane x is bits at.. of, as a packed load leaves its lanes; NULL if it isn't one. Only x's low
+// bits get stored, so a mask on the way doesn't matter.
+static struct ir_val *word_of(struct ir_val *x, unsigned at, unsigned bits)
+{
+    if (x->op == IR_AND && x->src[1]->op == IR_CONST && x->src[1]->imm == (1u << bits) - 1)
+        x = x->src[0];
+    if (at) {
+        if (x->op != IR_SHR || x->src[1]->op != IR_CONST || x->src[1]->imm != at)
+            return NULL;
+        x = x->src[0];
+    }
+    return x->type == IR_I32 ? x : NULL;
 }
 
 static void load(LLVMValueRef in)
@@ -4113,7 +4480,7 @@ static void load(LLVMValueRef in)
         insert(g_ptrs, in, 0, g_scope)->p = q;
         return;
     }
-    if (p.space == SP_GLOBAL && wide_lanes(t, LLVMGetAlignment(in))) {
+    if (p.space == SP_GLOBAL && wide_lanes(t, LLVMGetAlignment(in)) && wide_lanes(t, global_align(p))) {
         struct ir_val *v = ir_add(g_cur, IR_LDG, IR_VOID, 1);
         v->src[0] = p.base;
         v->imm = p.off;
@@ -4122,6 +4489,30 @@ static void load(LLVMValueRef in)
             struct ir_val *lane = op1(IR_PROJ, ir_type_of(lane_type(t, l)), v);
             lane->imm = l;
             set(in, l, lane);
+        }
+        return;
+    }
+    unsigned packed = p.space == SP_GLOBAL ? packed_bytes(t, LLVMGetAlignment(in)) : 0;
+    if (packed && global_align(p) >= packed) {
+        // one load, its lanes shifted out of the words and cleared above their bits, as a U8 or U16 load leaves them
+        struct ir_val *v = ir_add(g_cur, IR_LDG, packed > 4 ? IR_VOID : IR_I32, 1), *words[4] = { v };
+        v->src[0] = p.base;
+        v->imm = p.off;
+        v->aux = (int)packed;
+        for (unsigned w = 0; packed > 4 && w < packed / 4; w++) {
+            words[w] = op1(IR_PROJ, IR_I32, v);
+            words[w]->imm = w;
+        }
+        unsigned bits = 8 * scalar_bytes(lane_type(t, 0));
+        enum ir_type lt = ir_type_of(lane_type(t, 0));
+        for (unsigned l = 0; l < nlanes(t); l++) {
+            unsigned at = l * bits % 32;
+            struct ir_val *x = words[l * bits / 32];
+            if (at)
+                x = op2(IR_SHR, lt, x, konst(IR_I32, at));
+            if (at + bits < 32)
+                x = op2(IR_AND, lt, x, konst(IR_I32, (1u << bits) - 1));
+            set(in, l, x);
         }
         return;
     }
@@ -4137,7 +4528,7 @@ static void load(LLVMValueRef in)
 static void store_value(struct ptr p, LLVMTypeRef t, LLVMValueRef val, unsigned align)
 {
     p = fit_offset(p);
-    if (p.space == SP_GLOBAL && wide_lanes(t, align)) {
+    if (p.space == SP_GLOBAL && wide_lanes(t, align) && wide_lanes(t, global_align(p))) {
         unsigned n = nlanes(t);
         struct ir_val *s = ir_add(g_cur, IR_STG, IR_VOID, 1 + n);
         s->src[0] = p.base;
@@ -4145,6 +4536,31 @@ static void store_value(struct ptr p, LLVMTypeRef t, LLVMValueRef val, unsigned 
             s->src[1 + l] = get(val, l);
         s->imm = p.off;
         s->aux = (int)(4 * n);
+        return;
+    }
+    unsigned packed = p.space == SP_GLOBAL ? packed_bytes(t, align) : 0;
+    unsigned bits = packed ? 8 * scalar_bytes(lane_type(t, 0)) : 0;
+    if (packed && nlanes(t) * bits == 8 * packed && global_align(p) >= packed) {
+        // the lanes packed into words and stored in one go; a 3-lane vector isn't, as that would write its padding.
+        // Masked, the lanes share no bit, so x * 2^at + word packs them as an IMAD each.
+        struct ir_val *words[4] = { NULL }, *whole[4] = { NULL };
+        for (unsigned l = 0; l < nlanes(t); l++) {
+            unsigned at = l * bits % 32;
+            struct ir_val *x = get(val, l), **w = &words[l * bits / 32], *from = word_of(x, at, bits);
+            whole[l * bits / 32] = !at || whole[l * bits / 32] == from ? from : NULL;
+            if (at + bits < 32)
+                x = op2(IR_AND, IR_I32, x, konst(IR_I32, (1u << bits) - 1));
+            *w = !*w ? x : op2(IR_ADD, IR_I32, op2(IR_MUL, IR_I32, x, konst(IR_I32, 1u << at)), *w);
+        }
+        for (unsigned w = 0; w < packed / 4; w++)  // the lanes of a word loaded the same way: the word itself
+            if (whole[w])
+                words[w] = whole[w];
+        struct ir_val *s = ir_add(g_cur, IR_STG, IR_VOID, 1 + packed / 4);
+        s->src[0] = p.base;
+        for (unsigned w = 0; w < packed / 4; w++)
+            s->src[1 + w] = words[w];
+        s->imm = p.off;
+        s->aux = (int)packed;
         return;
     }
     for (unsigned l = 0; l < nlanes(t); l++) {
@@ -4490,6 +4906,17 @@ static struct ir_val *udivmod(struct ir_val *n, struct ir_val *d, int rem)
     return sel(icmp(IR_EQ, d, zero), ones, q);
 }
 
+// n / d or n % d for a power of two d over 1 by shifts and masks; a signed one rounds towards zero, d - 1 added to a
+// negative n first
+static struct ir_val *divmod_pow2(struct ir_val *n, uint32_t d, int is_signed, int rem)
+{
+    int k = __builtin_ctz(d);
+    if (!is_signed)
+        return rem ? ibin(IR_AND, n, ik(d - 1)) : ibin(IR_SHR, n, ik(k));
+    struct ir_val *biased = ibin(IR_ADD, n, ibin(IR_SHR, ibin(IR_SAR, n, ik(31)), ik(32 - k)));
+    return rem ? ibin(IR_SUB, n, ibin(IR_AND, biased, ik(~(d - 1)))) : ibin(IR_SAR, biased, ik(k));
+}
+
 // LLVM's udiv, sdiv, urem and srem. Signed ones divide the magnitudes: the quotient is negated when the signs
 // differ, the remainder takes the dividend's sign. Narrower integers are widened first (their high bits are junk).
 static void idiv(LLVMValueRef in, LLVMOpcode op, unsigned n)
@@ -4507,6 +4934,11 @@ static void idiv(LLVMValueRef in, LLVMOpcode op, unsigned n)
         }
         if (bits > 32)
             airc_fail("%u-bit integer division", bits);
+        uint32_t d = (uint32_t)b->imm;
+        if (bits == 32 && b->op == IR_CONST && d > 1 && !(d & (d - 1)) && (!is_signed || (int32_t)d > 0)) {
+            set(in, l, divmod_pow2(a, d, is_signed, rem));
+            continue;
+        }
         a = int_extend(a, bits, is_signed);
         b = int_extend(b, bits, is_signed);
         if (!is_signed) {
@@ -4779,10 +5211,13 @@ static LLVMTypeRef member_type(LLVMTypeRef t, unsigned idx)
 }
 
 // control point i of a post-tessellation vertex function's patch, (i, patch): each member of the struct it
-// returns is the generic attribute of its location, of the patch's input vertex i
+// returns is the generic attribute of its location, of the patch's input vertex i. A kernel's (OpenGL's
+// tessellation control stage) is its stage input at stage-in grid position i, the thread's own y.
 static void control_point(LLVMValueRef call)
 {
-    struct ir_val *vtx = op1(IR_ISBERD, IR_I32, op2(IR_ADD, IR_I32, g_point_map, get(LLVMGetOperand(call, 0), 0)));
+    struct ir_val *i = get(LLVMGetOperand(call, 0), 0), *vtx = NULL;
+    if (g_info->stage != NVK_COMPUTE)
+        vtx = op1(IR_ISBERD, IR_I32, op2(IR_ADD, IR_I32, g_point_map, i));
     LLVMTypeRef t = LLVMTypeOf(call);
     int whole = LLVMGetTypeKind(t) != LLVMStructTypeKind;
     unsigned members = whole ? 1 : LLVMCountStructElementTypes(t);
@@ -4792,10 +5227,18 @@ static void control_point(LLVMValueRef call)
         unsigned first = whole ? 0 : member_lane(t, m), n = whole ? nlanes(t) : nlanes(member_type(t, m));
         if (n > 4)
             airc_fail("a control point member wider than 4 lanes");
+        struct ir_val *fetched[4];
+        if (!vtx)
+            stage_in_attr(g_point_loc[m], i, thread_value(NVK_ARG_TID, 1), fetched);
         for (unsigned l = 0; l < n; l++) {
             enum ir_type lt = ir_type_of(lane_type(t, first + l));
-            struct ir_val *v = tess_attr(g_cur, vtx, 0x80 + 16 * g_point_loc[m] + 4 * l, 0);
-            v->type = lt == IR_I32 ? IR_I32 : IR_F32;
+            struct ir_val *v;
+            if (vtx) {
+                v = tess_attr(g_cur, vtx, 0x80 + 16 * g_point_loc[m] + 4 * l, 0);
+                v->type = lt == IR_I32 ? IR_I32 : IR_F32;
+            } else {
+                v = stage_in_lane(fetched[l], lane_type(t, first + l));
+            }
             set(call, first + l, lt == IR_F16 ? op1(IR_F2H, IR_F16, v) : v);
         }
     }
@@ -4975,9 +5418,16 @@ static struct ir_block *body(LLVMValueRef fn)
                             p->lanes[l]->src = ir_alloc(b->npreds * sizeof(*p->lanes[l]->src));
                         }
                         LLVMValueRef in = LLVMGetIncomingValue(p->phi, i);
-                        if (p->pointer && (ptr_of(in).space == SP_LOCAL) !=
-                                              (find(g_ptrs, p->phi, 0, p->scope)->p.space == SP_LOCAL))
-                            airc_fail("a phi of pointers into local and other memory");
+                        if (p->pointer) {
+                            struct ptr from = ptr_of(in), to = find(g_ptrs, p->phi, 0, p->scope)->p;
+                            int handle = from.space == SP_TEXTURE || from.space == SP_SAMPLER;
+                            if ((from.space == SP_LOCAL) != (to.space == SP_LOCAL))
+                                airc_fail("a phi of pointers into local and other memory");
+                            if (handle != (to.space == SP_TEXTURE || to.space == SP_SAMPLER))
+                                airc_fail("a phi of textures or samplers and other pointers");
+                            if (handle)
+                                picked_from(to.param, from);
+                        }
                         p->lanes[l]->src[k] = p->pointer ? ptr_value(ptr_of(in)) : get(in, l);
                         if (!p->pointer && p->highs[l]) {
                             if (p->highs[l]->nsrc != b->npreds) {
@@ -4995,6 +5445,7 @@ static struct ir_block *body(LLVMValueRef fn)
         }
         g_scope = saved;
     }
+    note_picked_uses();  // a subroutine's calls take its parameters' uses as soon as its body is done
     g_phis = outer;
     free(seen);
     free(post);
@@ -5109,10 +5560,52 @@ static void note_use(struct ptr p, int use)
         p.param->uses |= 1u << use;
     else if (p.space == SP_SAMPLER && !p.base && p.slot < 32 && use <= USE_COMPARE)
         *(use == USE_COMPARE ? &g_info->compare_samplers : &g_info->plain_samplers) |= 1u << p.slot;
+    else if (p.space == SP_SAMPLER && !p.base && p.slot < 32 && use == USE_NEAREST)
+        g_info->nearest_samplers |= 1u << p.slot;
     else if (p.space == SP_TEXTURE && !p.base && p.slot < 32 && use == USE_FACES)
         g_info->face_textures |= 1u << p.slot;
     else if (p.space == SP_TEXTURE && !p.base && p.slot < 32 && use == USE_LEVELS)
         g_info->level_textures |= 1u << p.slot;
+}
+
+// A phi or select of textures or samplers picks a handle like a subroutine's parameter: what its uses need goes to
+// each texture or sampler it picks from, once they are all known.
+struct picked {
+    struct sub_param *param;
+    struct ptr from;
+    struct picked *next;
+};
+static struct picked *g_picked;
+
+static struct sub_param *picker(enum space space)
+{
+    struct sub_param *p = ir_alloc(sizeof(*p));
+    *p = (struct sub_param){ .how = PASS_HANDLE, .space = space };
+    return p;
+}
+
+static void picked_from(struct sub_param *param, struct ptr from)
+{
+    struct picked *p = ir_alloc(sizeof(*p));
+    p->param = param;
+    p->from = from;
+    p->next = g_picked;
+    g_picked = p;
+}
+
+// until nothing changes: one picked from another picks the uses up after it
+static void note_picked_uses(void)
+{
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (struct picked *p = g_picked; p; p = p->next) {
+            unsigned before = p->from.param ? p->from.param->uses : 0;
+            for (int use = USE_PLAIN; use <= USE_NEAREST; use++)
+                if (p->param->uses >> use & 1)
+                    note_use(p->from, use);
+            changed |= p->from.param && p->from.param->uses != before;
+        }
+    }
 }
 
 static int wants_sub(LLVMValueRef fn)
@@ -5127,6 +5620,16 @@ static int has_ptr_lane(LLVMTypeRef t)
 {
     for (unsigned l = 0; l < nlanes(t); l++)
         if (lane_is_ptr(t, l))
+            return 1;
+    return 0;
+}
+
+// a pointer, which private memory doesn't hold as a value, or a 64-bit integer, which it holds as two words: an
+// alloca with one can't go in and out of a subroutine a lane at a time
+static int has_wide_lane(LLVMTypeRef t)
+{
+    for (unsigned l = 0; l < nlanes(t); l++)
+        if (scalar_bytes(lane_type(t, l)) > 4)
             return 1;
     return 0;
 }
@@ -5160,7 +5663,7 @@ static int pass_of(LLVMValueRef p, LLVMValueRef a, struct sub_param *how)
             return 0;
         how->how = PASS_PRIVATE;
         how->type = LLVMGetAllocatedType(r);
-        return !has_ptr_lane(how->type);
+        return !has_wide_lane(how->type);
     default:
         return 0;
     }
@@ -5332,7 +5835,7 @@ static int call_sub(LLVMValueRef call, LLVMValueRef fn)
             args[n++] = ptr_value(ptr_of(a));
         } else if (sp->how == PASS_HANDLE) {
             struct ptr q = ptr_of(a);
-            for (int use = USE_PLAIN; use <= USE_LEVELS; use++)
+            for (int use = USE_PLAIN; use <= USE_NEAREST; use++)
                 if (sp->uses >> use & 1)
                     note_use(q, use);
             args[n++] = handle_of_ptr(q, sp->space);
@@ -5386,6 +5889,8 @@ static void instruction(LLVMValueRef in)
         p->scope = g_scope;
         if (is_ptr(t)) {
             struct ptr q = phi_ptr(in);
+            if (q.space == SP_TEXTURE || q.space == SP_SAMPLER)
+                q.param = picker(q.space);
             p->pointer = 1;
             p->lanes = ir_alloc(sizeof(*p->lanes));
             p->lanes[0] = q.base = ir_add(g_cur, IR_PHI, q.space == SP_GLOBAL ? IR_I64 : IR_I32, 0);
@@ -5475,6 +5980,11 @@ static void instruction(LLVMValueRef in)
                 airc_fail("a select of pointers into different memory");
             struct ptr q = { .space = a.space, .base = sel(get(c, 0), ptr_value(a), ptr_value(b)),
                              .slot = a.slot > b.slot ? a.slot : b.slot };  // local: the further alloca's end
+            if (a.space == SP_TEXTURE || a.space == SP_SAMPLER) {
+                q.param = picker(a.space);
+                picked_from(q.param, a);
+                picked_from(q.param, b);
+            }
             insert(g_ptrs, in, 0, g_scope)->p = q;
             break;
         }
@@ -5806,7 +6316,7 @@ static void fragment_outputs(LLVMValueRef list)
         int m = LLVMGetMDNodeNumOperands(o[i]);
         LLVMValueRef *all = calloc(m, sizeof(*all)), *f = all;
         LLVMGetMDNodeOperands(o[i], f);
-        unsigned len;
+        unsigned len = 0;
         const char *k = m ? LLVMGetMDString(f[0], &len) : NULL;
         if (is_fc_marker(k, len) && m > 3) {  // the function constant's predicate and the kind that follows
             if (!md_present(o[i])) {
@@ -5960,6 +6470,47 @@ static void control_points(LLVMValueRef node)
     free(o);
 }
 
+// the next 8-byte param of const bank 0, for a buffer's address or threadgroup memory's offset
+static unsigned param_slot(unsigned *off)
+{
+    if (*off == NVK_TEXTURE_HANDLE(0))  // past the 20th, after the handles (the plugin draws only 20)
+        *off = NVK_SAMPLER_HANDLE(16);
+    if (*off + 8 > 0x400)
+        airc_fail("more than %d buffer and threadgroup arguments", (0x400 - PARAM_BASE - 0x80) / 8);
+    *off += 8;
+    return *off - 8;
+}
+
+static unsigned stage_in_arg(enum nvk_arg_kind kind, unsigned index, unsigned *off)
+{
+    if (g_info->nargs == NVK_MAX_ARGS)
+        airc_fail("more than %d arguments with the stage input's", NVK_MAX_ARGS);
+    struct nvk_arg *a = &g_info->args[g_info->nargs++];
+    a->kind = (uint8_t)kind;
+    a->index = (uint8_t)index;
+    a->cbuf_off = (uint16_t)param_slot(off);
+    return a->cbuf_off;
+}
+
+// A kernel's stage input: its region's param, and one for each buffer its attributes are read from, and their
+// indices
+static void stage_in_args(unsigned *off)
+{
+    g_region_off = stage_in_arg(NVK_ARG_STAGE_IN_REGION, 0, off);
+    for (unsigned loc = 0; g_stage_in && loc < 32; loc++) {
+        const struct airc_tess_attr *a = &g_stage_in->attrs[loc];
+        if (!(g_info->vertex_inputs >> loc & 1) || !a->format)
+            continue;
+        unsigned buffers[2] = { a->buffer, g_stage_in->index_buffer };
+        for (unsigned i = 0; i < 1u + (a->step == STEP_X_INDEXED || a->step == STEP_Y_INDEXED); i++) {
+            if (buffers[i] >= 31)
+                airc_fail("stage input attribute %u: buffer %u", loc, buffers[i]);
+            if (!g_stage_in_buffer[buffers[i]])
+                g_stage_in_buffer[buffers[i]] = stage_in_arg(NVK_ARG_STAGE_IN_BUFFER, buffers[i], off);
+        }
+    }
+}
+
 static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
 {
     static const struct {
@@ -5968,6 +6519,9 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
     } kinds[] = {
         { "air.buffer", NVK_ARG_BUFFER },
         { "air.indirect_buffer", NVK_ARG_BUFFER },  // an argument buffer: its address like any buffer's
+        // an OpenCL kernel's argument passed by value: its bytes in the buffer bound at its index, which the
+        // function reads through a constant pointer
+        { "air.constant", NVK_ARG_BUFFER },
         { "air.threadgroup", NVK_ARG_THREADGROUP },
         { "air.thread_position_in_grid", NVK_ARG_TID },
         { "air.threadgroup_position_in_grid", NVK_ARG_TG_POS },
@@ -5983,6 +6537,7 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
         { "air.position", NVK_ARG_POSITION },
         { "air.fragment_input", NVK_ARG_VARYING },
         { "air.vertex_input", NVK_ARG_VERTEX_INPUT },
+        { "air.stage_in", NVK_ARG_VERTEX_INPUT },  // a kernel's [[stage_in]] member: its attribute's location
         { "air.render_target", NVK_ARG_RENDER_TARGET },
         { "air.point_coord", NVK_ARG_POINT_COORD },
         { "air.front_facing", NVK_ARG_FRONT_FACING },
@@ -6004,6 +6559,8 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
         { "air.sample_mask_in", NVK_ARG_SAMPLE_MASK },
         { "air.render_target_array_index", NVK_ARG_LAYER },
         { "air.viewport_array_index", NVK_ARG_VIEWPORT },
+        { "air.stage_in_grid_origin", NVK_ARG_STAGE_IN_ORIGIN },
+        { "air.stage_in_grid_size", NVK_ARG_STAGE_IN_SIZE },
     };
     int an = LLVMGetMDNodeNumOperands(arglist);
     if (an > NVK_MAX_ARGS || an != (int)LLVMCountParams(fn))
@@ -6011,12 +6568,13 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
     LLVMValueRef *nodes = calloc(an, sizeof(*nodes));
     LLVMGetMDNodeOperands(arglist, nodes);
     unsigned off = PARAM_BASE;
+    int stage_in = 0;
     for (int i = 0; i < an; i++) {
         int on = LLVMGetMDNodeNumOperands(nodes[i]);
         LLVMValueRef *o = calloc(on, sizeof(*o));
         LLVMGetMDNodeOperands(nodes[i], o);
         const char *kind = NULL;
-        unsigned kind_len = 0, index = 0, space = 0, value;
+        unsigned kind_len = 0, index = 0, space = 0, value, size = 0;
         for (int j = 0; j < on; j++) {
             unsigned len;
             const char *s = LLVMGetMDString(o[j], &len);
@@ -6033,6 +6591,8 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
                     g_info->array_count[g_info->nargs] = value;
             } else if (len == 17 && !memcmp(s, "air.address_space", 17) && j + 1 < on && LLVMIsAConstantInt(o[j + 1])) {
                 space = (unsigned)LLVMConstIntGetZExtValue(o[j + 1]);
+            } else if (len == 17 && !memcmp(s, "air.arg_type_size", 17) && j + 1 < on && md_int(o[j + 1], &value)) {
+                size = value;
             }
         }
         free(o);
@@ -6046,6 +6606,8 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
             k = NVK_ARG_THREADGROUP;
         if (k == NVK_ARG_CONTROL_POINTS)
             control_points(nodes[i]);
+        if (k == NVK_ARG_VERTEX_INPUT)
+            g_info->vertex_inputs |= 1u << index;
         if (k == NVK_ARG_PATCH_INPUT)
             g_info->patch_inputs |= 1u << index;
         if (k == NVK_ARG_SAMPLE_ID)
@@ -6081,12 +6643,50 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
         struct nvk_arg *a = &g_info->args[g_info->nargs++];
         a->kind = (uint8_t)k;
         a->index = (uint8_t)index;
-        if (k == NVK_ARG_BUFFER || k == NVK_ARG_THREADGROUP) {
-            a->cbuf_off = (uint16_t)off;
-            off += 8;
-        }
+        if (kind_len == 12 && !memcmp(kind, "air.constant", 12))
+            a->size = (uint16_t)size;
+        a->access = md_has(nodes[i], "air.read_write") ? 1 : md_has(nodes[i], "air.write") ? 2 : 0;
+        // Metal lets the same buffer be bound twice, so read-only alone isn't enough: the AIR must also say no
+        // other argument reaches it
+        if (k == NVK_ARG_BUFFER &&
+            (space == 2 || md_has(nodes[i], "air.read") ||
+             LLVMGetEnumAttributeAtIndex(fn, i + 1, LLVMGetEnumAttributeKindForName("readonly", 8))) &&
+            (LLVMGetEnumAttributeAtIndex(fn, i + 1, LLVMGetEnumAttributeKindForName("noalias", 7)) ||
+             LLVMGetStringAttributeAtIndex(fn, i + 1, "air-buffer-no-alias", 19)))
+            g_info->readonly_args |= 1ull << (g_info->nargs - 1);
+        if (k == NVK_ARG_BUFFER || k == NVK_ARG_THREADGROUP)
+            a->cbuf_off = (uint16_t)param_slot(&off);
+        if (k == NVK_ARG_STAGE_IN_ORIGIN || k == NVK_ARG_STAGE_IN_SIZE)
+            stage_in = 1;
     }
     free(nodes);
+    if (g_info->stage == NVK_COMPUTE && (stage_in || g_info->vertex_inputs))
+        stage_in_args(&off);
+    // Metal binds textures and samplers at indices up to 127, the pools have 16 slots: one past them (MPS binds its
+    // sources at 64) takes a free low slot, kept in its cbuf_off for the dispatcher, clear of the constant samplers'
+    // and render targets' slots at the top
+    for (int kind = NVK_ARG_TEXTURE; kind <= NVK_ARG_SAMPLER; kind++) {
+        uint32_t used = 0;
+        for (unsigned i = 0; i < g_info->nargs; i++) {
+            const struct nvk_arg *a = &g_info->args[i];
+            unsigned n = g_info->array_count[i] ? g_info->array_count[i] : 1;
+            if (a->kind == kind && a->index < 16)
+                used |= (n >= 16 ? 0xffffu : (1u << n) - 1) << a->index;
+        }
+        for (unsigned i = 0; i < g_info->nargs; i++) {
+            struct nvk_arg *a = &g_info->args[i];
+            unsigned n = g_info->array_count[i] ? g_info->array_count[i] : 1, slot = 0;
+            if (a->kind != kind || a->index < 16)
+                continue;
+            uint32_t run = (1u << n) - 1;
+            while (slot + n <= 16 - NVK_MAX_CONST_SAMPLERS && (used & run << slot))
+                slot++;
+            if (slot + n > 16 - NVK_MAX_CONST_SAMPLERS)
+                airc_fail("%s %u: no pool slot left", kind == NVK_ARG_TEXTURE ? "texture" : "sampler", a->index);
+            used |= run << slot;
+            a->cbuf_off = (uint16_t)slot;
+        }
+    }
 }
 
 // the static initialisers (C++ global constructors, one per source file a library was built from), which copy
@@ -6103,12 +6703,16 @@ static LLVMValueRef static_init(LLVMValueRef after)
 }
 
 void airc_front(void *module, void **linked, const char *const *linked_names, unsigned nlinked,
-                const struct airc_varyings *vertex, const struct airc_constant *fc, unsigned nfc, int calls,
-                struct ir_func *f, struct airc_info *info)
+                const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
+                const struct airc_constant *fc, unsigned nfc, int calls, struct ir_func *f, struct airc_info *info)
 {
     g_calls = calls;
     g_subs = g_sub = NULL;
     g_vertex = vertex;
+    g_stage_in = stage_in;
+    g_region_off = 0;
+    memset(g_stage_in_buffer, 0, sizeof(g_stage_in_buffer));
+    memset(g_region, 0, sizeof(g_region));
     g_linked = (LLVMModuleRef *)linked;
     g_linked_names = linked_names;
     g_nlinked = nlinked;
@@ -6137,6 +6741,7 @@ void airc_front(void *module, void **linked, const char *const *linked_names, un
     g_private_reads = NULL;
     g_private_ptrs = NULL;
     g_local_choices = NULL;
+    g_picked = NULL;
 
     LLVMValueRef arglist;
     g_entry_fn = stage_function(&arglist);

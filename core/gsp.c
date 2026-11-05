@@ -535,10 +535,13 @@ static int msgq_recv(struct gsp *s, int timeout_ms)
         log_msg("gsp: channel recovery: engine %u chid %u exception %u level %u scope %u, fault %#llx type %u\n",
                 rc->nv2080EngineType, rc->chid, rc->exceptType, rc->exceptLevel, rc->scope,
                 (unsigned long long)rc->mmuFaultAddrHi << 32 | rc->mmuFaultAddrLo, rc->mmuFaultType);
-        if (rc->exceptType == 69) {  // graphics class error: the method and data it trapped on, if still latched
-            uint32_t addr = rd32(s->g, 0x400704);
-            log_msg("gsp: class error code %#x subchannel %u method %#x data %#x %#x\n", rd32(s->g, 0x400110),
-                    (addr >> 16) & 7, addr & 0x3ffc, rd32(s->g, 0x400708), rd32(s->g, 0x40070c));
+        // GSP-RM keeps an MMU fault's details to itself; its journal may carry the registers it read, as for a class error
+        if (rc->exceptType == 69 || rc->exceptType == 31) {
+            if (rc->exceptType == 69) {  // the method and data it trapped on, if still latched
+                uint32_t addr = rd32(s->g, 0x400704);
+                log_msg("gsp: class error code %#x subchannel %u method %#x data %#x %#x\n", rd32(s->g, 0x400110),
+                        (addr >> 16) & 7, addr & 0x3ffc, rd32(s->g, 0x400708), rd32(s->g, 0x40070c));
+            }
             for (uint32_t i = 0; i < rc->rcJournalBufferSize && i < 512; i += 32) {
                 const uint32_t *w = (const uint32_t *)(rc->rcJournalBuffer + i);
                 log_msg("gsp: rc journal %03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", i, w[0], w[1], w[2], w[3],
@@ -556,7 +559,8 @@ static int msgq_recv(struct gsp *s, int timeout_ms)
         }
         for (int i = 0; i < 2; i++)
             if (s->rc[i].fn)
-                s->rc[i].fn(s->rc[i].ctx, rc->nv2080EngineType, rc->chid, rc->exceptType);
+                s->rc[i].fn(s->rc[i].ctx, rc->nv2080EngineType, rc->chid, rc->exceptType,
+                            (uint64_t)rc->mmuFaultAddrHi << 32 | rc->mmuFaultAddrLo);
         break;
     }
     case NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED: {
@@ -1135,8 +1139,6 @@ int gsp_boot(struct gsp *s)
         return -1;
     }
     intr_init(s);  // without it the platform keeps polling
-    if (pm_flags() & PM_BOOST_CLEAR)
-        pwr_boost_clear(s);
     return 0;
 }
 

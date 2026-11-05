@@ -32,7 +32,8 @@ public:
     uint64_t processCommandBuffer(unsigned int a, unsigned int b) override;
 
 private:
-    int async = -1;  // whether the task's completion follows the GPU (NVGPU_FN_ASYNC), asked at the first command buffer
+    int async = -1;  // whether completion follows the GPU: NVGPU_FN_ASYNC, unless a record says OpenGL. Asked at the first command buffer
+    bool app = false;  // not WindowServer's, as NVGPU_FN_ASYNC saysr
 };
 
 }  // namespace malachite::accel

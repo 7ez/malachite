@@ -19,6 +19,7 @@ static int is_float(const struct ir_val *v, uint32_t bits)
     return v && v->op == IR_CONST && (uint32_t)v->imm == bits;
 }
 static uint64_t umax(const struct ir_val *v, int depth);
+static struct ir_val *insert_before(struct ir_val *at, enum ir_op op, enum ir_type type, unsigned nsrc);
 
 static struct ir_val *live(struct ir_val *v)
 {
@@ -95,6 +96,51 @@ static void make_const(struct ir_val *v, int64_t imm)
     v->nsrc = 0;
 }
 
+static struct ir_val *new_const(struct ir_val *at, int64_t imm)
+{
+    struct ir_val *k = insert_before(at, IR_CONST, IR_I32, 0);
+    k->imm = imm;
+    return k;
+}
+
+// Integer sums and products gather their constants in the last term, where a shared-memory access takes it as its
+// offset: (x + c1) * c2 is x * c2 + c1 * c2, a + (b + c) is (a + b) + c, and a constant in the first place moves
+// to the second.
+static int reassociate(struct ir_val *v)
+{
+    if ((v->op != IR_ADD && v->op != IR_MUL) || v->type != IR_I32)
+        return 0;
+    struct ir_val *x = v->src[0], *y = v->src[1];
+    if (x->op == IR_CONST && y->op != IR_CONST) {
+        v->src[0] = y;
+        v->src[1] = x;
+        return 1;
+    }
+    if (y->op != IR_CONST && v->op == IR_ADD && y->op == IR_ADD && y->type == IR_I32 && y->src[1]->op == IR_CONST) {
+        struct ir_val *s = insert_before(v, IR_ADD, IR_I32, 2);
+        s->src[0] = x;
+        s->src[1] = y->src[0];
+        v->src[0] = s;
+        v->src[1] = y->src[1];
+        return 1;
+    }
+    if (y->op != IR_CONST || (x->op != v->op && x->op != IR_ADD) || x->type != IR_I32 || x->src[1]->op != IR_CONST)
+        return 0;
+    uint32_t c1 = (uint32_t)x->src[1]->imm, c2 = (uint32_t)y->imm;
+    if (x->op == v->op) {  // (a + c1) + c2, (a * c1) * c2
+        v->src[0] = x->src[0];
+        v->src[1] = new_const(v, v->op == IR_ADD ? c1 + c2 : c1 * c2);
+    } else {  // (a + c1) * c2
+        struct ir_val *m = insert_before(v, IR_MUL, IR_I32, 2);
+        m->src[0] = x->src[0];
+        m->src[1] = y;
+        v->op = IR_ADD;
+        v->src[0] = m;
+        v->src[1] = new_const(v, c1 * c2);
+    }
+    return 1;
+}
+
 // fold v if its operands allow; 1 when something changed
 static int fold(struct ir_func *f, struct ir_val *v)
 {
@@ -103,6 +149,16 @@ static int fold(struct ir_func *f, struct ir_val *v)
     struct ir_val *x = v->nsrc > 0 ? v->src[0] : NULL, *y = v->nsrc > 1 ? v->src[1] : NULL;
     if ((v->nsrc > 0 && !x) || (v->nsrc > 1 && !y))  // a shared or local access at a fixed offset
         return 0;
+    if (reassociate(v))
+        return 1;
+    if ((v->op == IR_LDS || v->op == IR_STS) && x && x->op == IR_ADD && x->src[1]->op == IR_CONST) {
+        int64_t imm = v->imm + (int32_t)x->src[1]->imm;
+        if (imm >= 0 && imm < 1 << 20) {
+            v->src[0] = x->src[0];
+            v->imm = imm;
+            return 1;
+        }
+    }
     if (v->op == IR_SEL && x->op == IR_CONST) {
         replace_all(f, v, x->imm ? v->src[1] : v->src[2]);
         return 1;
@@ -210,6 +266,12 @@ static int fold(struct ir_func *f, struct ir_val *v)
     // an unsigned min that can't bite: the clamp on a local array's index after the index was clamped already
     if (!g_no_range && v->op == IR_MIN && !v->aux && v->type == IR_I32 && y->op == IR_CONST &&
         umax(x, 0) <= (uint32_t)y->imm) {
+        replace_all(f, v, x);
+        return 1;
+    }
+    // a mask of low bits that clears none the value can have: a conversion saturated to 255 packed as a byte
+    if (!g_no_range && v->op == IR_AND && v->type == IR_I32 && y->op == IR_CONST &&
+        !((uint32_t)y->imm & ((uint32_t)y->imm + 1)) && umax(x, 0) <= (uint32_t)y->imm) {
         replace_all(f, v, x);
         return 1;
     }
@@ -769,6 +831,36 @@ static int cse(struct ir_func *f)
     return changed;
 }
 
+// The most a float value can be, INFINITY when nothing is known: a clamp's top, scaled. A value with a bound is
+// never a NaN, which the min's needs (a min with a NaN is its other side). Rounding is monotonic, so x <= a gives
+// x * k <= a * k for k > 0; not for k = 0, as -inf * 0 is a NaN.
+static float fmax_of(const struct ir_val *v, int depth)
+{
+    if (!v || v->type != IR_F32 || depth > 8)
+        return INFINITY;
+    float a, b;
+    switch (v->op) {
+    case IR_CONST:
+        a = as_float(v->imm);
+        return a == a ? a : INFINITY;
+    case IR_FMIN:
+        a = fmax_of(v->src[0], depth + 1);
+        b = fmax_of(v->src[1], depth + 1);
+        return a < b ? a : b;
+    case IR_FADD:
+        return v->aux & IR_FADD_SAT ? 1.0f : INFINITY;
+    case IR_FMUL:
+        for (int i = 0; i < 2; i++) {
+            const struct ir_val *k = v->src[i];
+            if (k->op == IR_CONST && as_float(k->imm) > 0 && as_float(k->imm) < INFINITY)
+                return fmax_of(v->src[!i], depth + 1) * as_float(k->imm);
+        }
+        return INFINITY;
+    default:
+        return INFINITY;
+    }
+}
+
 // The most a 32-bit integer value can be, unsigned; UINT32_MAX when nothing is known.
 static uint64_t umax(const struct ir_val *v, int depth)
 {
@@ -792,6 +884,18 @@ static uint64_t umax(const struct ir_val *v, int depth)
     case IR_ADD:
         a = umax(v->src[0], depth + 1) + umax(v->src[1], depth + 1);
         return a > UINT32_MAX ? UINT32_MAX : a;
+    case IR_SHR:
+        return v->src[1]->op == IR_CONST ? umax(v->src[0], depth + 1) >> (v->src[1]->imm & 31) : UINT32_MAX;
+    case IR_LDG:
+    case IR_LDS:
+    case IR_LDL:  // a byte or halfword is loaded zero-extended (LDG.U8, .U16)
+        return v->aux == 1 ? 0xff : v->aux == 2 ? 0xffff : UINT32_MAX;
+    case IR_F2I: {  // F2I.U32.TRUNC: a NaN or anything below 0 is 0
+        float f = fmax_of(v->src[0], depth + 1);
+        if (v->aux || !(f < 4294967296.0f))
+            return UINT32_MAX;
+        return f < 0 ? 0 : (uint64_t)f;
+    }
     default:
         return UINT32_MAX;
     }
@@ -909,6 +1013,153 @@ int airc_const_locals(struct ir_func *f, struct airc_info *info)
         }
     info->local_size = 0;
     return 1;
+}
+
+// What a 32-bit value is known to be a multiple of, as a power of two up to 16 (4). The kernel's threadgroup
+// variables are laid out 16-byte aligned from 0, and the dispatcher puts each [[threadgroup(n)]] buffer after them
+// aligned as much.
+static int known_align(const struct ir_val *v, const struct airc_info *info, int depth)
+{
+    if (!v)  // a shared access at a fixed address
+        return 4;
+    if (depth > 8 || v->type != IR_I32)
+        return 0;
+    int a, b;
+    switch (v->op) {
+    case IR_CONST:
+        return v->imm & 15 ? __builtin_ctz((uint32_t)v->imm) : 4;
+    case IR_CBUF:
+        if (v->nsrc)
+            return 0;
+        for (unsigned i = 0; i < info->nargs; i++)
+            if (info->args[i].kind == NVK_ARG_THREADGROUP && info->args[i].cbuf_off == v->imm)
+                return 4;
+        return 0;
+    case IR_ADD:
+    case IR_SUB:
+    case IR_OR:
+    case IR_XOR:
+        a = known_align(v->src[0], info, depth + 1);
+        b = known_align(v->src[1], info, depth + 1);
+        return a < b ? a : b;
+    case IR_AND:
+        a = known_align(v->src[0], info, depth + 1);
+        b = known_align(v->src[1], info, depth + 1);
+        return a > b ? a : b;
+    case IR_MUL:
+        a = known_align(v->src[0], info, depth + 1) + known_align(v->src[1], info, depth + 1);
+        return a < 4 ? a : 4;
+    case IR_SHL:
+        if (v->src[1]->op != IR_CONST)
+            return 0;
+        a = known_align(v->src[0], info, depth + 1) + (int)(v->src[1]->imm & 31);
+        return a < 4 ? a : 4;
+    case IR_SEL:
+        a = known_align(v->src[1], info, depth + 1);
+        b = known_align(v->src[2], info, depth + 1);
+        return a < b ? a : b;
+    default:
+        return 0;
+    }
+}
+
+static struct ir_val *shared_base(const struct ir_val *v)
+{
+    return v->op == IR_LDS && !v->nsrc ? NULL : v->src[0];
+}
+
+static int shared_word(const struct ir_val *v, enum ir_op op)
+{
+    if (v->op != op || v->aux != 4)
+        return 0;
+    const struct ir_val *w = op == IR_LDS ? v : v->src[1];
+    return w->type == IR_I32 || w->type == IR_F32;
+}
+
+// what the lanes of a shared load (op IR_LDS) or store may not be moved across
+static int fence(const struct ir_val *x, enum ir_op op)
+{
+    if (op == IR_STS)
+        return x->op == IR_LDS || (has_effect(x) && x->op != IR_STS);
+    return has_effect(x);
+}
+
+// v and the words after it, n of them in all, as one access if they're there: 1 if they were
+static int widen(struct ir_val *v, int n, const struct airc_info *info)
+{
+    enum ir_op op = v->op;
+    struct ir_val *base = shared_base(v), *lane[4] = { NULL }, *first = NULL, *last = NULL, *start = v;
+    int at = v->imm & 15 ? __builtin_ctz((uint32_t)v->imm) : 4, align = known_align(base, info, 0);
+    if ((at < align ? at : align) < (n == 4 ? 4 : 3))
+        return 0;
+    while (start->prev && !fence(start->prev, op))
+        start = start->prev;
+    for (struct ir_val *x = start; x && !fence(x, op); x = x->next) {
+        int64_t k = x->imm - v->imm;
+        if (!shared_word(x, op) || shared_base(x) != base || k < 0 || k >= 4 * n || (k & 3) || lane[k / 4])
+            continue;
+        lane[k / 4] = x;
+        if (!first)
+            first = x;
+        last = x;
+    }
+    for (int k = 0; k < n; k++)
+        if (!lane[k])
+            return 0;
+    // The lanes meet at the first load or the last store, passing other accesses of the kind only where those are
+    // to other words off the same base: shared atomics are plain LDS and STS, and two on one word keep their order.
+    for (struct ir_val *x = first; x != last; x = x->next) {
+        int member = 0;
+        for (int k = 0; k < n; k++)
+            member |= x == lane[k];
+        if (x->op == op && !member &&
+            (shared_base(x) != base || (x->imm + x->aux > v->imm && x->imm < v->imm + 4 * n)))
+            return 0;
+    }
+    if (op == IR_LDS) {
+        struct ir_val *w = insert_before(first, IR_LDS, IR_VOID, base ? 1 : 0);
+        if (base)
+            w->src[0] = base;
+        w->imm = v->imm;
+        w->aux = 4 * n;
+        for (int k = 0; k < n; k++) {
+            struct ir_val *x = lane[k];
+            if (!x->nsrc)
+                x->src = ir_alloc(sizeof(*x->src));
+            x->op = IR_PROJ;
+            x->nsrc = 1;
+            x->src[0] = w;
+            x->imm = k;
+            x->aux = 0;
+        }
+        return 1;
+    }
+    struct ir_val *w = insert_before(last, IR_STS, IR_VOID, 1 + n);
+    w->src[0] = base;
+    for (int k = 0; k < n; k++)
+        w->src[1 + k] = lane[k]->src[1];
+    w->imm = v->imm;
+    w->aux = 4 * n;
+    for (int k = 0; k < n; k++)
+        ir_remove(lane[k]);
+    return 1;
+}
+
+// Words of threadgroup memory read or written one at a time side by side become one LDS or STS .64 or .128 (MPS's
+// convolutions read their filters a float4 at a time as four floats). Sound because the lanes are one base value
+// plus constant offsets a word apart, so they're the very words the wide access moves; its address is proven a
+// multiple of its size, as a misaligned one faults; and the lanes move past no other access of their kind but to
+// other words off the same base, nothing else with an effect (a store, atomic, barrier, fence, call or discard)
+// and, for stores, no shared load, so gathering them changes nothing another access sees. Quads go first, so a
+// pair doesn't take half of one.
+// Device memory stays as it is: a buffer is only bound aligned to its element type, so nothing proves an address
+// that a scalar access uses aligned to more.
+void airc_widen_shared(struct ir_func *f, const struct airc_info *info)
+{
+    for (int n = 4; n >= 2; n -= 2)
+        for (struct ir_block *b = f->entry; b; b = b->next)
+            for (struct ir_val *v = b->first; v;)
+                v = (shared_word(v, IR_LDS) || shared_word(v, IR_STS)) && widen(v, n, info) ? b->first : v->next;
 }
 
 void airc_opt(struct ir_func *f)

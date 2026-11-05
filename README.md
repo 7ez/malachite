@@ -16,8 +16,24 @@ Still experimental. RTX 30 series only for now, support for other cards is plann
 | GPUs | RTX 30 series (GA10x), developed on an RTX 3060 |
 | Metal | Metal 3, used by WindowServer and apps |
 | OpenGL | Through Apple's GL-on-Metal |
-| Video | H.264 decode through VideoToolbox |
+| OpenCL | Through Apple's OpenCL-on-Metal |
+| Video | H.264, H.265, AV1, VP9 and VP8 decode through VideoToolbox |
 | Displays | Up to four, HDMI and DisplayPort, high refresh rates |
+
+## Benchmarks
+
+Geekbench on an RTX 3060 in a macOS 26.7.1 VM (GPU passed through), both drivers in the same VM on the same day,
+November 2026.
+
+| | Malachite | NullMoth 2.7.1 |
+|---|---|---|
+| Geekbench 7 Metal | [72351](https://browser.geekbench.com/v7/gpu/364417) | [80868](https://browser.geekbench.com/v7/gpu/364005) |
+| Geekbench 7 OpenCL | [48106](https://browser.geekbench.com/v7/gpu/364423) | [8835](https://browser.geekbench.com/v7/gpu/364012), one kernel fails to build |
+| Geekbench 6 Metal | [65772](https://browser.geekbench.com/v6/compute/6963086) | [21544](https://browser.geekbench.com/v6/compute/6962922), Face Detection fails validation |
+| Geekbench 6 OpenCL | [54125](https://browser.geekbench.com/v6/compute/6963087) | [43308](https://browser.geekbench.com/v6/compute/6962923) |
+
+NullMoth's compiler still beats ours in Geekbench 7 Metal overall, most of all in Feature Matching and Super Resolution.
+That's being worked on.
 
 ## Install
 

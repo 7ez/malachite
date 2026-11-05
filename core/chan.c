@@ -146,13 +146,14 @@ int chan_create(struct gsp *s, const struct rm_client *c, struct vmm *vm, uint32
     ch->buf = gsp_dma(s, CHAN_BUF, 0);
     ch->va = vmm_alloc(vm, CHAN_BUF, PAGE);
     // the GPFIFO and push buffer only the channel reads: not something a user channel's shaders may write
-    if (!userd_page || !ch->buf || !ch->va || vmm_map_sys(vm, ch->va, ch->buf, 0, CHAN_BUF, privileged ? 0 : VMM_RO)) {
+    if (!userd_page || !ch->buf || !ch->va ||
+        vmm_map_sys(vm, ch->va, ch->buf, 0, CHAN_BUF, privileged == CHAN_KERNEL ? 0 : VMM_RO)) {
         chan_free(ch);
         return -1;
     }
     vram_zero(g, userd_page, PAGE);
 
-    struct chan_params cp = { .gpfifo_va = ch->va, .entries = GPFIFO_ENTRIES, .privileged = privileged, .vaspace = vm->handle,
+    struct chan_params cp = { .gpfifo_va = ch->va, .entries = GPFIFO_ENTRIES, .privileged = privileged != 0, .vaspace = vm->handle,
                               .engine = engine, .chid = chid, .userd = ch->userd };
     if (chan_alloc(s, c, c->device, handle, &cp, &ch->res)) {
         chan_free(ch);
@@ -180,20 +181,33 @@ int chan_half(const struct chan *ch, uint32_t bytes)
     return (end - 1) / (PUSH_SIZE / 2);
 }
 
-void chan_push(struct chan *ch, const uint32_t *push, uint32_t n)
+uint32_t *chan_reserve(struct chan *ch, uint32_t n)
 {
-    uint8_t *cpu = ch->buf->cpu;
     // the pushbuffer starts over at its end: whoever submits unwaited work waits for it before that (chan_half)
     if (ch->push_off + n * 4 > PUSH_SIZE)
         ch->push_off = 0;
-    memcpy(cpu + GPFIFO_BYTES + ch->push_off, push, n * 4);
+    return (uint32_t *)((uint8_t *)ch->buf->cpu + GPFIFO_BYTES + ch->push_off);
+}
+
+void chan_entry(struct chan *ch, uint64_t va, uint32_t words)
+{
+    uint32_t *gp = (uint32_t *)ch->buf->cpu + ch->gp_put * 2;
+    gp[0] = (uint32_t)va & ~3u;
+    gp[1] = (uint32_t)(va >> 32) | (words << 10);
+    ch->gp_put = (ch->gp_put + 1) % GPFIFO_ENTRIES;
+}
+
+void chan_commit(struct chan *ch, uint32_t n)
+{
     uint64_t pbva = ch->va + GPFIFO_BYTES + ch->push_off;
     ch->push_off += (n * 4 + 0xff) & ~0xffu;
+    chan_entry(ch, pbva, n);
+}
 
-    uint32_t *gp = (uint32_t *)cpu + ch->gp_put * 2;
-    gp[0] = (uint32_t)pbva & ~3u;
-    gp[1] = (uint32_t)(pbva >> 32) | (n << 10);
-    ch->gp_put = (ch->gp_put + 1) % GPFIFO_ENTRIES;
+void chan_push(struct chan *ch, const uint32_t *push, uint32_t n)
+{
+    memcpy(chan_reserve(ch, n), push, n * 4);
+    chan_commit(ch, n);
 }
 
 void chan_kick(struct chan *ch)
@@ -220,6 +234,9 @@ uint32_t chan_save(const struct chan *ch, uint32_t gp, uint32_t *out)
         const uint32_t *e = (const uint32_t *)cpu + gp * 2;
         uint64_t va = e[0] | (uint64_t)(e[1] & 0xff) << 32;
         uint32_t len = e[1] >> 10;
+        // user memory (chan_entry) holds only changes against this channel's earlier state, which a new one lacks
+        if (va < ch->va || va >= ch->va + CHAN_BUF)
+            continue;
         out[n++] = len;
         memcpy(out + n, cpu + (va - ch->va), len * 4);
         n += len;
@@ -347,6 +364,33 @@ void chan_release_queue(struct chan *ch, uint64_t semva, uint32_t payload)
         MTHD(4, 0x000, 1), gsp_gpu(ch->s)->chip->copy,
         MTHD(4, 0x240, 3), (uint32_t)(semva >> 32), (uint32_t)semva, payload,
         MTHD(4, 0x300, 1), 1 << 2 | 1 << 3,  // no transfer; flush, then release one word
+    };
+    chan_submit(ch, push, sizeof(push) / 4);
+}
+
+// the host's MEM_OP_A..D (clc56f.h) as UVM's uvm_hal_ampere_host_l2_invalidate does them, a system membar either
+// side of the L2 operations; an admin channel's alone
+#define MEM_OP_A 0x28
+#define MEM_OP_MEMBAR (0x5u << 27)
+#define MEM_OP_L2_SYSMEM_INVALIDATE (0xeu << 27)
+#define MEM_OP_L2_FLUSH_DIRTY (0x10u << 27)
+
+void chan_l2_sysmem(struct chan *ch, int invalidate)
+{
+    uint32_t push[] = {
+        MTHD(0, MEM_OP_A, 4), 0, 0, 0, MEM_OP_MEMBAR,
+        MTHD(0, MEM_OP_A, 4), 0, 0, 0, MEM_OP_L2_FLUSH_DIRTY,
+        MTHD(0, MEM_OP_A, 4), 0, 0, 0, MEM_OP_MEMBAR,
+        MTHD(0, MEM_OP_A, 4), 0, 0, 0, MEM_OP_L2_SYSMEM_INVALIDATE,
+        MTHD(0, MEM_OP_A, 4), 0, 0, 0, MEM_OP_MEMBAR,
+    };
+    chan_push(ch, push, invalidate ? sizeof(push) / 4 : 15);
+}
+
+void chan_acquire_queue_switch(struct chan *ch, uint64_t semva, uint32_t payload)
+{
+    uint32_t push[] = {
+        MTHD(0, 0x5c, 5), (uint32_t)semva, (uint32_t)(semva >> 32), payload, 0, 3 | 1u << 12,
     };
     chan_submit(ch, push, sizeof(push) / 4);
 }

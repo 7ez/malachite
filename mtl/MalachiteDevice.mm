@@ -19,13 +19,18 @@
 #import <os/lock.h>
 #import <os/log.h>
 #import <sys/stat.h>
+#import <sys/sysctl.h>
 #import <unistd.h>
 #import <mach/vm_page_size.h>
 #import <mach-o/dyld.h>
+#import <mach/mach.h>
 #import <mach-o/loader.h>
+#import <mach-o/nlist.h>
 #import <string.h>
+#include <map>
 #import "../accel/commands.h"
 #import "../compiler/airc.h"
+#import "../core/drawbuild.h"
 #import "../core/texdesc.h"
 #import "../gpu_bridge.h"
 
@@ -56,7 +61,33 @@
 - (void)beginSegment:(void *)ptr;
 - (void)endCurrentSegment;
 - (void)commit;
+- (void)commitAndWaitUntilSubmitted;
+- (void)presentDrawable:(id<MTLDrawable>)drawable;
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time;
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration;
 - (void)getCurrentKernelCommandBufferPointer:(void **)cur end:(void **)end;
+@end
+
+@interface MalachiteCommandBuffer : MTLIOAccelCommandBuffer <MTLCommandBuffer> {
+  @public
+    bool _in_segment;  // draws go on adding to the segment open
+    // a run of draws written here, not in the kernel: methods in one block, their constants in another
+    uint32_t *_run_cpu;
+    uint64_t _run_va;
+    uint32_t _run_start, _run_used, _run_cap, _run_draws;  // in words but the last
+    uint8_t *_bank_cpu;
+    uint64_t _bank_va;
+    uint32_t _bank_used, _bank_cap;
+    bool _bank_new;  // memory used before: the constant cache may hold it
+    uint64_t _records;     // counts what the kernel was sent, for telling whether a draw's state is still the channel's
+    const void *_state_of;  // the encoder whose last draw the channel holds
+    // members, not associated objects: those retain and autorelease on every look, several times a draw
+    NSMutableArray *_kept;
+    const void *_kept_recent[4];  // kept already, so a draw of the same few resources doesn't grow the array
+    unsigned _kept_next;
+    id _uploads, _heap_blocks;
+    NSMutableSet *_writeback;  // mirrored buffers its OpenCL kernels may write, copied back to system memory at commit
+}
 @end
 
 // Buffer base (private, shared cache). MTLIOAccelBuffer : MTLIOAccelResource : _MTLResource. Its designated init
@@ -74,6 +105,7 @@
                       argsSize:(unsigned int)argsSize
                    deallocator:(id)dealloc;
 - (uint64_t)gpuAddress;  // inherited from MTLIOAccelResource (_res+0x48); the buffer's GPU virtual address
+- (void *)contents;
 - (void)didModifyRange:(NSRange)range;
 @end
 
@@ -93,6 +125,7 @@
 - (id)buffer;
 - (NSUInteger)bufferOffset;
 - (NSUInteger)bufferBytesPerRow;
+- (NSUInteger)allocatedSize;
 - (NSUInteger)height;
 - (NSUInteger)width;
 - (MTLPixelFormat)pixelFormat;
@@ -106,6 +139,8 @@
 // GOBs wide and its height rounded to 8 rows (a 3D level's slices one after another), the layers _layer_stride
 // apart, as NIL lays them out. It's made as a plain texture over its bytes, so the getters answer from the
 // fields below.
+@class MalachiteHeapBuffer;
+
 @interface MalachiteTexture : MTLIOAccelTexture <MTLTexture> {
 @public
     __unsafe_unretained id _backing;  // the MTLBuffer holding the pixels
@@ -113,6 +148,7 @@
     MTLTextureUsage _usage;  // as made (the base reports none: CoreImage then won't write to it)
     uint32_t _pitch;  // an image's: level 0's row of GOBs
     id _owned;  // the backing buffer, when the device made it for the texture
+    MalachiteHeapBuffer *_placed;  // its range of the MTLHeap it was made in, which keeps the heap's memory
     MTLTextureType _type;
     IOSurfaceRef _surface;  // retained, for a texture over an IOSurface's memory
     NSUInteger _plane;
@@ -137,6 +173,9 @@
     uint32_t _layers;
     uint32_t _levels, _image_levels, _view_min;
     uint64_t _layer_stride;
+    // the storage mode asked for, when the device put the texture somewhere else (see malachite_storage)
+    MTLStorageMode _asked;
+    bool _moved;
 }
 - (void)copyRegion:(MTLRegion)region level:(NSUInteger)level slice:(NSUInteger)slice bytes:(uint8_t *)bytes
             stride:(NSUInteger)stride image:(NSUInteger)image in:(bool)in;
@@ -163,8 +202,12 @@ static bool malachite_snap_gate;  // "+snapgate": and only while /var/tmp/malach
 // rect alone
 static uint32_t malachite_snap_rect[4];
 // "+record=A|B": each draw whose label has A or B in it (in +snaprect's rect if one's given, while +snapgate's file
-// exists if that's given) recorded whole into /tmp/malachite-rec-<pid>-<n>/, for tools/mtl/mtlplay to replay on any GPU
+// exists if that's given) recorded whole into /tmp/malachite-rec-<pid>-<n>/, for tools/mtl/mtlplay to replay on any GPU;
+// and the first dispatch of each kernel whose name has A or B in it, its buffers only ("+recskip=N": the one after
+// its first N instead)
 static NSArray<NSString *> *malachite_rec_only;
+static int malachite_rec_skip;
+static bool malachite_rec_bytes(id cb, NSString *path, uint64_t src, uint32_t size);
 static bool malachite_rec_shut;    // the gate's shut
 static bool malachite_rec_full;    // the process has written the recorder's budget
 static bool malachite_snap_gated;  // the gate opens the snapshots too, not only the recorder
@@ -358,10 +401,27 @@ static size_t malachite_gob_offset(uint32_t pitch, size_t x, size_t y)
 
 // a region of one surface (in blocks) to or from rows of bytes on the CPU; block-linear ones 16 bytes (a sector's
 // run) at a time
-static void malachite_copy_sub(MalachiteTexture *t, const struct malachite_sub *s, size_t x0, size_t y0, size_t w, size_t h,
+// one buffer's bytes over another's, by the GPU, waited for: how the CPU reaches a texture kept in VRAM
+static bool malachite_gpu_copy(id<MTLBuffer> from, id<MTLBuffer> to)
+{
+    static id<MTLCommandQueue> queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = [from.device newCommandQueue];
+    });
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    [blit copyFromBuffer:from sourceOffset:0 toBuffer:to destinationOffset:0 size:MIN(from.length, to.length)];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    return cb.status == MTLCommandBufferStatusCompleted;
+}
+
+static void malachite_copy_sub(uint8_t *pixels, const struct malachite_sub *s, size_t x0, size_t y0, size_t w, size_t h,
                            uint8_t *bytes, NSUInteger stride, bool in)
 {
-    uint8_t *base = (uint8_t *)((id<MTLBuffer>)t->_backing).contents + s->offset;
+    uint8_t *base = pixels + s->offset;
     for (size_t y = 0; y < h; y++) {
         uint8_t *row = bytes + y * stride;
         if (!s->rows) {
@@ -392,6 +452,13 @@ static void malachite_copy_sub(MalachiteTexture *t, const struct malachite_sub *
     bool _pending;                    // on malachite_pending
     bool _one_image;                  // made for a single image, so nothing else lies in it
     bool _compress_asked;             // its colour surface has had a MALACHITE_CMD_COMPRESS
+    // a no-copy one over an app's memory (CL_MEM_USE_HOST_PTR): OpenCL's renderer makes it Managed and the app
+    // reads it with no synchronizeResource (AMD's driver kept such buffers in system memory), so a kernel's writes
+    // are copied back for it. OpenCL's own buffers it reads through copies on the GPU.
+    bool _writeback;
+    // a no-copy buffer's pointer into its page: the base maps from the page's start, and contents and the GPU
+    // address are the pointer's
+    NSUInteger _page_off;
 }
 - (uint64_t)systemAddress;
 - (instancetype)initWithDevice:(id)device
@@ -399,6 +466,40 @@ static void malachite_copy_sub(MalachiteTexture *t, const struct malachite_sub *
                    withOptions:(MTLResourceOptions)options
                    withPointer:(void *)ptr
                withDeallocator:(void (^)(void))dealloc;
+@end
+
+// A heap is one block of memory its resources are placed in, as Metal has it: MPS makes its temporaries there and
+// marks them aliasable when done, counting on the next to reuse the same memory. Each with its own VRAM, a graph's
+// temporaries add up to more than the GPU has before it runs any of them. An automatic heap finds each resource a
+// range of the block in its holes; a placement heap puts it where the app says and keeps no track, as the app lays
+// its resources out, over each other where it wants them to alias.
+@class MalachiteHeap;
+
+@interface MalachiteHeapBuffer : NSObject <MTLBuffer> {
+@public
+    MalachiteHeap *_heap;  // keeps the block, and so the memory, while this lives
+    NSUInteger _offset, _length, _size;
+    MTLResourceOptions _options;
+    bool _aliasable;
+}
+@property (copy) NSString *label;
+@end
+
+@interface MalachiteHeap : NSObject <MTLHeap> {
+@public
+    __weak id _device;
+    MTLHeapDescriptor *_desc;
+    id<MTLBuffer> _block;
+    os_unfair_lock _lock;
+    std::map<NSUInteger, NSUInteger> _holes;  // offset to length, of what's free in the block
+    NSUInteger _free;
+}
+@property (copy) NSString *label;
+- (MalachiteHeapBuffer *)place:(NSUInteger)length
+                          size:(MTLSizeAndAlign)range
+                       options:(MTLResourceOptions)options
+                            at:(NSUInteger)offset;
+- (void)giveBack:(NSUInteger)offset size:(NSUInteger)size;
 @end
 
 static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizzleChannels swizzle);
@@ -426,6 +527,21 @@ static void malachite_mark_dirty(MalachiteBuffer *b, NSUInteger lo, NSUInteger h
             b->_pending = true;
         }
     }
+}
+
+static uint64_t malachite_vram(void);
+
+// memory OpenCL's runtime allocated for itself, which it tags so
+static bool malachite_opencl_memory(void *ptr)
+{
+    vm_address_t at = (vm_address_t)ptr;
+    vm_size_t size = 0;
+    natural_t depth = 0;
+    vm_region_submap_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+    return vm_region_recurse_64(mach_task_self(), &at, &size, &depth, (vm_region_recurse_info_t)&info, &count) ==
+               KERN_SUCCESS &&
+           at <= (vm_address_t)ptr && info.user_tag == VM_MEMORY_OPENCL;
 }
 
 @implementation MalachiteBuffer
@@ -463,15 +579,20 @@ static void malachite_mark_dirty(MalachiteBuffer *b, NSUInteger lo, NSUInteger h
                      deallocator:dealloc];
     if (!self)
         return nil;
+    _page_off = off;
     __atomic_add_fetch(&malachite_allocated, length, __ATOMIC_RELAXED);
-    // one over 256 MB stays in system memory: a change to it would copy more than the GPU saves reading it
-    if (!ptr && (options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged && length >= 4096 &&
-        length <= (256u << 20)) {
+    // every Managed buffer up to a quarter of VRAM gets its copy: only the ranges the CPU changes are copied across, and
+    // one the GPU writes gains outright (Feature Matching's 300 MB cube took 2.4 ms a pass written over the bus). A small
+    // one too: Path Tracer's 4-byte ray counters took 2M atomics a bounce over the bus. OpenCL's buffers read from
+    // system memory ran its kernels 10-100 times slower.
+    if ((options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged && length &&
+        length <= malachite_vram() / 4) {
         _mirror = [[MalachiteBuffer alloc] initWithDevice:device
                                                withLength:length
                                               withOptions:MTLResourceStorageModePrivate
                                               withPointer:NULL
                                           withDeallocator:nil];
+        _writeback = ptr && !malachite_opencl_memory(ptr);
         malachite_mark_dirty(self, 0, length);
     }
     return self;
@@ -484,12 +605,20 @@ static void malachite_mark_dirty(MalachiteBuffer *b, NSUInteger lo, NSUInteger h
 
 - (uint64_t)gpuAddress
 {
-    return _mirror ? [_mirror gpuAddress] : [super gpuAddress];
+    return _mirror ? [_mirror gpuAddress] : [super gpuAddress] + _page_off;
 }
 
 - (uint64_t)systemAddress
 {
-    return [super gpuAddress];
+    return [super gpuAddress] + _page_off;
+}
+
+// a pointer that wasn't on a page answers with itself, not its page: OpenCL copies a buffer's data in when contents
+// isn't its own pointer, and from the page's start that went over the caller's stack
+- (void *)contents
+{
+    uint8_t *c = (uint8_t *)[super contents];
+    return c ? c + _page_off : NULL;
 }
 
 - (void)didModifyRange:(NSRange)range
@@ -525,37 +654,172 @@ static void malachite_mark_dirty(MalachiteBuffer *b, NSUInteger lo, NSUInteger h
 @end
 
 // Append one kernel command (header + payload) to the command buffer, in a segment of its own.
+static bool opengl_renderer;
+
+// Apple's GL renderer takes what a GPU can do from a table it picks by the device's name, and NVIDIA's says it has no
+// last-vertex provoking, GL's default, which NVIDIA's hardware does have. So every draw has a compute pass rewrite its
+// indices first, ten times the cost of the draw. Bit 3 of the table's first byte says otherwise, in this process only.
+static void malachite_gl_provoking(const struct mach_header_64 *mh, intptr_t slide)
+{
+    const struct symtab_command *tab = NULL;
+    const struct segment_command_64 *linkedit = NULL;
+    const struct load_command *lc = (const struct load_command *)(mh + 1);
+    for (uint32_t i = 0; i < mh->ncmds; i++, lc = (const struct load_command *)((const char *)lc + lc->cmdsize)) {
+        if (lc->cmd == LC_SYMTAB)
+            tab = (const struct symtab_command *)lc;
+        else if (lc->cmd == LC_SEGMENT_64 && !strcmp(((const struct segment_command_64 *)lc)->segname, SEG_LINKEDIT))
+            linkedit = (const struct segment_command_64 *)lc;
+    }
+    if (!tab || !linkedit)
+        return;
+    const char *base = (const char *)(linkedit->vmaddr + slide - linkedit->fileoff);
+    const struct nlist_64 *syms = (const struct nlist_64 *)(base + tab->symoff);
+    const char *names = base + tab->stroff;
+    for (uint32_t i = 0; i < tab->nsyms; i++) {
+        if (strcmp(names + syms[i].n_un.n_strx, "__ZZN12GLDDeviceRec19initWithDisplayMaskEjE6nvidia"))
+            continue;
+        uint8_t *caps = (uint8_t *)(syms[i].n_value + slide);
+        vm_address_t page = (vm_address_t)caps & ~(vm_address_t)vm_page_mask;
+        // read-only and maybe not ours to change in this app: it then draws as it did
+        if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) ==
+            KERN_SUCCESS) {
+            *caps |= 8;
+            vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ);
+        }
+        return;
+    }
+    os_log(OS_LOG_DEFAULT, "Malachite: no capability table in Apple's GL renderer");
+}
+
+// WindowServer starts its updates with no timestamp, so the vblank times Core Animation gives an image queue are 60 Hz
+// ones on every screen, and AppKit sleeps to the next of them at each swap the compositor is behind on: 90 swaps a
+// second at 240 Hz. So the swap waits for what it's after, WindowServer taking the last frame, and not at all when the
+// app turned vsync off, which AppKit doesn't look at. The time limit is for a window nothing composites.
+static long (*gl_unconsumed)(void *, void *, void *);
+static void *(*gl_context)(void);
+static int (*gl_get)(void *, int, int *);
+static ptrdiff_t gl_queue_offset;
+
+static void gl_synchronize(id self, SEL)
+{
+    enum { kCGLCPSwapInterval = 222 };  // not linked against OpenGL: WindowServer loads this plugin too
+    int interval = 1;
+    gl_get(gl_context(), kCGLCPSwapInterval, &interval);
+    if (!interval)
+        return;
+    void *queue = *(void **)((char *)(__bridge void *)self + gl_queue_offset);
+    const uint64_t limit = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 16666667;
+    while (gl_unconsumed(queue, NULL, NULL) && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < limit)
+        usleep(100);
+}
+
+static void malachite_gl_swaps(void)
+{
+    Class surface = objc_getClass("NSCGLSurface");
+    Ivar queue = class_getInstanceVariable(surface, "_imageQueue");
+    Method wait = class_getInstanceMethod(surface, sel_registerName("synchronize"));
+    gl_unconsumed = (long (*)(void *, void *, void *))dlsym(RTLD_DEFAULT, "CAImageQueueGetUnconsumedImageCount");
+    gl_context = (void *(*)(void))dlsym(RTLD_DEFAULT, "CGLGetCurrentContext");
+    gl_get = (int (*)(void *, int, int *))dlsym(RTLD_DEFAULT, "CGLGetParameter");
+    if (!queue || !wait || !gl_unconsumed || !gl_context || !gl_get)
+        return;
+    gl_queue_offset = ivar_getOffset(queue);
+    method_setImplementation(wait, (IMP)gl_synchronize);
+}
+
+static void malachite_hook_function_reflection(void);
+
+static void note_image(const struct mach_header *mh, intptr_t slide)
+{
+    Dl_info info;
+    if (dladdr(mh, &info) && strstr(info.dli_fname, "AppleMetalOpenGLRenderer.bundle/Contents/MacOS")) {
+        opengl_renderer = true;
+        malachite_gl_provoking((const struct mach_header_64 *)mh, slide);
+        malachite_hook_function_reflection();  // OpenCL runs on this renderer too
+    }
+}
+
+__attribute__((constructor)) static void watch_images(void)
+{
+    _dyld_register_func_for_add_image(note_image);
+}
+
+static void malachite_end_segment(MalachiteCommandBuffer *cb)
+{
+    if (cb->_in_segment) {
+        cb->_in_segment = false;
+        [cb endCurrentSegment];
+    }
+}
+
+static void malachite_run_flush(MalachiteCommandBuffer *cb);
+
 static void malachite_record(id commandBuffer, uint32_t opcode, const void *payload, uint32_t size)
 {
-    MTLIOAccelCommandBuffer *cb = (MTLIOAccelCommandBuffer *)commandBuffer;
+    MalachiteCommandBuffer *cb = (MalachiteCommandBuffer *)commandBuffer;
+    if (cb->_run_draws && opcode != MALACHITE_CMD_PUSH)  // in the order they were encoded
+        malachite_run_flush(cb);
+    if (opcode != MALACHITE_CMD_PUSH)
+        cb->_records++;
     const uint32_t total = (uint32_t)(sizeof(struct malachite_cmd_hdr) + size);
     void *cur = nullptr, *end = nullptr;
     [cb getCurrentKernelCommandBufferPointer:&cur end:&end];
-    [cb beginSegment:cur];
+    if (opcode != MALACHITE_CMD_DRAW || (char *)end - (char *)cur < total)
+        malachite_end_segment(cb);
+    if (!cb->_in_segment) {
+        [cb getCurrentKernelCommandBufferPointer:&cur end:&end];
+        [cb beginSegment:cur];
+        cb->_in_segment = true;
+    }
     uint8_t *rec = (uint8_t *)[cb _reserveKernelCommandBufferSpace:total];
     if (rec) {
         struct malachite_cmd_hdr *h = (struct malachite_cmd_hdr *)rec;
-        h->opcode = opcode;
+        h->opcode = opcode | (opengl_renderer ? MALACHITE_CMD_OPENGL : 0);
         h->len = total;
         memcpy(rec + sizeof(*h), payload, size);
     }
-    [cb endCurrentSegment];
+    if (opcode != MALACHITE_CMD_DRAW)  // the base class has work to do per segment, so draws share one
+        malachite_end_segment(cb);
+}
+
+static void malachite_run_flush(MalachiteCommandBuffer *cb)
+{
+    if (!cb->_run_draws)
+        return;
+    struct malachite_push p = { cb->_run_va + cb->_run_start * 4, cb->_run_used - cb->_run_start, cb->_run_draws };
+    cb->_run_start = cb->_run_used;
+    cb->_run_draws = 0;
+    malachite_record(cb, MALACHITE_CMD_PUSH, &p, sizeof(p));
 }
 
 // Keep a resource the command buffer's commands use alive as long as the command buffer: the commands carry raw
 // GPU addresses, and freeing a resource unmaps it, so one released after encoding (an MPS temporary image, say)
 // would leave the GPU reading unmapped memory.
-static void malachite_keep(id commandBuffer, id resource)
+static void malachite_keep(__unsafe_unretained id commandBuffer, __unsafe_unretained id resource)
 {
-    static char key;
     if (!resource)
         return;
-    NSMutableArray *kept = objc_getAssociatedObject(commandBuffer, &key);
-    if (!kept) {
-        kept = [NSMutableArray array];
-        objc_setAssociatedObject(commandBuffer, &key, kept, OBJC_ASSOCIATION_RETAIN);
-    }
-    [kept addObject:resource];
+    __unsafe_unretained MalachiteCommandBuffer *cb = commandBuffer;
+    const void *p = (__bridge const void *)resource;
+    for (const void *recent : cb->_kept_recent)
+        if (recent == p)
+            return;
+    cb->_kept_recent[cb->_kept_next++ % 4] = p;
+    if (!cb->_kept)
+        cb->_kept = [NSMutableArray array];
+    [cb->_kept addObject:resource];
+}
+
+// a buffer the GPU writes in the command buffer: one OpenCL reads back without a synchronize is copied back at commit
+static void malachite_written(__unsafe_unretained id commandBuffer, __unsafe_unretained id buffer)
+{
+    MalachiteCommandBuffer *cb = commandBuffer;
+    MalachiteBuffer *b = buffer;
+    if (![b isKindOfClass:[MalachiteBuffer class]] || !b->_writeback)
+        return;
+    if (!cb->_writeback)
+        cb->_writeback = [NSMutableSet set];
+    [cb->_writeback addObject:b];
 }
 
 // one side of a copy-engine copy: a buffer's rows or a texture's surface, and where the copy starts in it (x in
@@ -609,7 +873,7 @@ static id<MTLBuffer> malachite_upload(id commandBuffer, const void *bytes, NSUIn
 static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, const uint64_t buffers[31],
                            __unsafe_unretained const id *textures, __unsafe_unretained const id *samplers,
                            MTLSize groups, MTLSize threads, uint64_t indirect = 0,
-                           const uint32_t *threadgroup = NULL, const uint32_t *part = NULL);
+                           const uint32_t *threadgroup = NULL, const uint32_t *part = NULL, uint64_t region = 0);
 static id<MTLComputePipelineState> malachite_mip_pipeline(id<MTLDevice> device, bool volume);
 
 // An app with Chromium inside (Electron's: Bitwarden, Slack, Discord, Code) carries its ANGLE in its framework's
@@ -670,27 +934,42 @@ __attribute__((constructor)) static void malachite_angle_metal(void)
 
 // VideoToolbox looks in /Library/Video/Plug-Ins with a FigRegistry option its own folders don't get, and never
 // offers NVVideo.bundle from there; registered through its call, the decoder is VideoToolbox's first choice for
-// H.264. So it is, in each process this plugin loads into once VideoToolbox is there too. WindowServer never
-// decodes.
+// H.264, H.265 and AV1. So it is, in each process this plugin loads into once VideoToolbox is there too. WindowServer
+// never decodes.
 static void malachite_register_video(void)
 {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         void *lib = dlopen("/Library/Video/Plug-Ins/NVVideo.bundle/Contents/MacOS/NVVideo", RTLD_NOW | RTLD_LOCAL);
-        void *factory = lib ? dlsym(lib, "NVDecH264_CreateInstance") : NULL;
         auto reg = (OSStatus (*)(FourCharCode, CFDictionaryRef, void *))dlsym(RTLD_DEFAULT,
                                                                              "VTRegisterVideoDecoderWithInfo");
-        if (!factory || !reg)
-            return;
-        // the id VideoToolbox names it by gets "." and the codec type on the end
-        NSDictionary *info = @{
-            @"CMClassImplementationID" : @"pl.aochi.videodecoder.avc.nvdec",
-            @"CMClassImplementationName" : @"NVIDIA H.264 (NVDEC)",
-            @"VTRating" : @1000,
-            @"VTIsHardwareAccelerated" : @YES,
+        static const struct {
+            FourCharCode codec;
+            const char *factory;
+            NSString *impl, *name, *label;
+        } decoders[] = {
+            { 'avc1', "NVDecH264_CreateInstance", @"pl.aochi.videodecoder.avc.nvdec", @"NVIDIA H.264 (NVDEC)", @"H.264" },
+            { 'hvc1', "NVDecHEVC_CreateInstance", @"pl.aochi.videodecoder.hevc.nvdec", @"NVIDIA H.265 (NVDEC)", @"H.265" },
+            { 'av01', "NVDecAV1_CreateInstance", @"pl.aochi.videodecoder.av1.nvdec", @"NVIDIA AV1 (NVDEC)", @"AV1" },
+            { 'vp09', "NVDecVP9_CreateInstance", @"pl.aochi.videodecoder.vp9.nvdec", @"NVIDIA VP9 (NVDEC)", @"VP9" },
+            // no CoreMedia codec type, but VideoToolbox takes any: what VP8 in an ISO media file is
+            { 'vp08', "NVDecVP8_CreateInstance", @"pl.aochi.videodecoder.vp8.nvdec", @"NVIDIA VP8 (NVDEC)", @"VP8" },
         };
-        OSStatus st = reg('avc1', (__bridge CFDictionaryRef)info, factory);
-        os_log(OS_LOG_DEFAULT, "Malachite: H.264 decoder registered with VideoToolbox: %d", (int)st);
+        for (const auto &decoder : decoders) {
+            void *factory = lib ? dlsym(lib, decoder.factory) : NULL;
+            if (!factory || !reg)
+                continue;
+            // the id VideoToolbox names it by gets "." and the codec type on the end
+            NSDictionary *info = @{
+                @"CMClassImplementationID" : decoder.impl,
+                @"CMClassImplementationName" : decoder.name,
+                @"VTRating" : @1000,
+                @"VTIsHardwareAccelerated" : @YES,
+            };
+            OSStatus st = reg(decoder.codec, (__bridge CFDictionaryRef)info, factory);
+            os_log(OS_LOG_DEFAULT, "Malachite: %{public}@ decoder registered with VideoToolbox: %d", decoder.label,
+                   (int)st);
+        }
     });
 }
 
@@ -814,6 +1093,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     p.size = size;
     malachite_keep(_cb, src);
     malachite_keep(_cb, dst);
+    malachite_written(_cb, dst);
     malachite_record(_cb, MALACHITE_CMD_COPY_BUF2BUF, &p, sizeof(p));
 }
 
@@ -824,6 +1104,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     p.size = range.length;
     p.pattern = (uint32_t)value * 0x01010101u;
     malachite_keep(_cb, buffer);
+    malachite_written(_cb, buffer);
     malachite_record(_cb, MALACHITE_CMD_FILL_BUFFER, &p, sizeof(p));
 }
 
@@ -1002,6 +1283,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     int aspect = malachite_aspect(src, options);
     malachite_keep(_cb, src);
     malachite_keep(_cb, dst);
+    malachite_written(_cb, dst);
     malachite_depth_kind(_cb, src);
     for (NSUInteger z = 0; z < size.depth; z++) {
         struct malachite_sub a;
@@ -1021,7 +1303,9 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
 - (void)synchronizeResource:(id)resource
 {
     MalachiteBuffer *b = [resource isKindOfClass:[MalachiteTexture class]] ? ((MalachiteTexture *)resource)->_backing
-                                                                           : resource;
+                         : [resource isKindOfClass:[MalachiteHeapBuffer class]]
+                             ? ((MalachiteHeapBuffer *)resource)->_heap->_block
+                             : resource;
     if (![b isKindOfClass:[MalachiteBuffer class]] || !b->_mirror)
         return;
     struct malachite_copy_buf2buf p = {};
@@ -1112,8 +1396,11 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     id<MTLBuffer> _code;  // the SASS, GPU-mapped like any buffer so its gpuAddress is the program VA
     NSString *_label;     // the kernel's name, for the trace
     NSUInteger _asked;    // the descriptor's maxTotalThreadsPerThreadgroup, 0 for none
+    bool _cl;             // an OpenCL kernel: its arguments are bound MALACHITE_CL_FIRST further on
 }
 @end
+
+enum { MALACHITE_CL_FIRST = 3 };  // the buffer index OpenCL's renderer binds a kernel's first argument at
 
 @implementation MalachiteComputePipelineState
 // as many as the SM's registers hold: they're four partitions of 16K, a threadgroup's warps dealt out among them
@@ -1192,15 +1479,16 @@ static id<MTLBuffer> malachite_tess_stage(id<MTLDevice> device, const struct air
 @end
 
 // a texture over an image's buffer: a plain one over all of it (64 KB rows of RGBA32Float, the buffer made a
-// whole number of them), whose getters the image's fields replace
+// whole number of them; a heap's block under 64 KB one row), whose getters the image's fields replace
 static MalachiteTexture *malachite_image_over(MalachiteBuffer *buf, MTLTextureUsage usage)
 {
+    NSUInteger length = ((id<MTLBuffer>)buf).length, row = MIN(length, (NSUInteger)65536);
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
-                                                                                 width:4096
-                                                                                height:((id<MTLBuffer>)buf).length >> 16
+                                                                                 width:row / 16
+                                                                                height:length / row
                                                                              mipmapped:NO];
     d.usage = usage;
-    MalachiteTexture *t = [buf newTextureWithDescriptor:d offset:0 bytesPerRow:65536];
+    MalachiteTexture *t = [buf newTextureWithDescriptor:d offset:0 bytesPerRow:row];
     if (t)
         t->_image = true;
     return t;
@@ -1373,9 +1661,41 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
     return _surface;
 }
 
+- (MTLStorageMode)storageMode
+{
+    if (_moved)
+        return _asked;
+    return _backing ? ((id<MTLBuffer>)_backing).storageMode : MTLStorageModeShared;
+}
+
 - (NSUInteger)iosurfacePlane
 {
     return _plane;
+}
+
+- (id<MTLHeap>)heap
+{
+    return _placed.heap;
+}
+
+- (NSUInteger)heapOffset
+{
+    return _placed.heapOffset;
+}
+
+- (NSUInteger)allocatedSize
+{
+    return _placed ? _placed.allocatedSize : [super allocatedSize];
+}
+
+- (void)makeAliasable
+{
+    [_placed makeAliasable];
+}
+
+- (BOOL)isAliasable
+{
+    return _placed.isAliasable;
 }
 
 - (void)dealloc
@@ -1412,14 +1732,25 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
 - (void)copyRegion:(MTLRegion)region level:(NSUInteger)level slice:(NSUInteger)slice bytes:(uint8_t *)bytes
             stride:(NSUInteger)stride image:(NSUInteger)image in:(bool)in
 {
+    // a texture in VRAM: through a copy of its memory the GPU makes, and puts back after a write
+    id<MTLBuffer> backing = _backing, staging = nil;
+    uint8_t *pixels = (uint8_t *)backing.contents;
+    if (!pixels) {
+        staging = [backing.device newBufferWithLength:backing.length options:MTLResourceStorageModeShared];
+        if (!staging || !malachite_gpu_copy(backing, staging))
+            return;
+        pixels = (uint8_t *)staging.contents;
+    }
     for (NSUInteger z = 0; z < region.size.depth; z++) {
         struct malachite_sub s;
         if (!malachite_sub(self, level, slice, region.origin.z + z, &s))
-            return;
-        malachite_copy_sub(self, &s, region.origin.x / s.block, region.origin.y / s.block,
+            break;
+        malachite_copy_sub(pixels, &s, region.origin.x / s.block, region.origin.y / s.block,
                        (region.size.width + s.block - 1) / s.block, (region.size.height + s.block - 1) / s.block,
                        bytes + z * image, stride, in);
     }
+    if (staging && in)
+        malachite_gpu_copy(staging, backing);
 }
 
 - (void)replaceRegion:(MTLRegion)region
@@ -1805,15 +2136,18 @@ static int malachite_fill_texture_header(uint32_t out[8], id texture, id cb)
 }
 
 // A function's buffer arguments go to const bank 0 at the offsets airc gave them: params + (cbuf_off - 0x160).
-static uint32_t malachite_fill_params(const struct nvk_header *h, const uint64_t buffers[31], uint8_t *params)
+// The size can come out past capacity bytes (a draw's 20 buffers), which aren't written: the caller refuses it.
+static uint32_t malachite_fill_params(const struct nvk_header *h, const uint64_t buffers[31], uint8_t *params,
+                                  uint32_t capacity)
 {
     uint32_t size = 0;
     for (uint32_t i = 0; i < h->nargs; i++) {
         const struct nvk_arg *a = &h->args[i];
-        if (a->kind != NVK_ARG_BUFFER)
+        if (a->kind != NVK_ARG_BUFFER && a->kind != NVK_ARG_STAGE_IN_BUFFER)
             continue;
         uint32_t at = a->cbuf_off - 0x160;
-        memcpy(params + at, &buffers[a->index], 8);
+        if (at + 8 <= capacity)
+            memcpy(params + at, &buffers[a->index], 8);
         if (at + 8 > size)
             size = at + 8;
     }
@@ -1836,14 +2170,14 @@ static uint32_t malachite_fill_params(const struct nvk_header *h, const uint64_t
 static const NSUInteger MALACHITE_UPLOAD_BLOCK = 256 << 10;
 static NSMutableArray<id<MTLBuffer>> *malachite_upload_free;
 
-static id<MTLBuffer> malachite_upload(id commandBuffer, const void *bytes, NSUInteger length, uint64_t *va)
+static id<MTLBuffer> malachite_reserve(__unsafe_unretained id commandBuffer, NSUInteger length, uint64_t *va, void **cpu)
 {
-    static char key;
-    MalachiteUploads *u = objc_getAssociatedObject(commandBuffer, &key);
+    __unsafe_unretained MalachiteUploads *u = ((MalachiteCommandBuffer *)commandBuffer)->_uploads;
     if (!u) {
-        u = [MalachiteUploads new];
-        u->_blocks = [NSMutableArray array];
-        objc_setAssociatedObject(commandBuffer, &key, u, OBJC_ASSOCIATION_RETAIN);
+        MalachiteUploads *made = [MalachiteUploads new];
+        made->_blocks = [NSMutableArray array];
+        ((MalachiteCommandBuffer *)commandBuffer)->_uploads = made;
+        u = made;
         NSMutableArray<id<MTLBuffer>> *blocks = u->_blocks;
         [(id<MTLCommandBuffer>)commandBuffer addCompletedHandler:^(id<MTLCommandBuffer>) {
             @synchronized([MalachiteUploads class]) {
@@ -1871,9 +2205,17 @@ static id<MTLBuffer> malachite_upload(id commandBuffer, const void *bytes, NSUIn
         [u->_blocks addObject:buf];
         at = 0;
     }
-    memcpy((uint8_t *)buf.contents + at, bytes, length);
+    *cpu = (uint8_t *)buf.contents + at;
     u->_used = at + length;
     *va = [(MTLIOAccelBuffer *)buf gpuAddress] + at;
+    return buf;
+}
+
+static id<MTLBuffer> malachite_upload(id commandBuffer, const void *bytes, NSUInteger length, uint64_t *va)
+{
+    void *cpu;
+    id<MTLBuffer> buf = malachite_reserve(commandBuffer, length, va, &cpu);
+    memcpy(cpu, bytes, length);
     return buf;
 }
 
@@ -1933,6 +2275,12 @@ static struct samp_desc malachite_compare_as_used(const struct nvk_header *h, un
             s.compare = MTLCompareFunctionNever + 1;
     } else if (h->plain_samplers >> slot & 1) {
         s.compare = 0;
+    }
+    if (h->nearest_samplers >> slot & 1) {
+        s.mag_linear = s.min_linear = 0;
+        s.max_anisotropy = 1;
+        if (s.mip == TEX_MIP_LINEAR)
+            s.mip = TEX_MIP_NEAREST;
     }
     return s;
 }
@@ -2005,11 +2353,32 @@ static void malachite_depth_kind(id cb, MalachiteTexture *t)
     malachite_record(cb, MALACHITE_CMD_DRAW, &d, sizeof(d));
 }
 
-static int malachite_fill_pools(id cb, const struct nvk_header *h, __unsafe_unretained const id *textures,
+// A stage's textures and samplers in the pools' 16 slots, from its bindings by Metal index: one bound past them (MPS
+// binds its sources at 64) is in the slot the compiler gave it, its cbuf_off. Only an app's encoder's tables go
+// past 16.
+static void malachite_slots(const struct nvk_header *h, __unsafe_unretained const id *textures,
+                            __unsafe_unretained const id *samplers, __unsafe_unretained id *slot_tex,
+                            __unsafe_unretained id *slot_samp)
+{
+    for (int i = 0; i < NVGPU_MAX_TEXTURES; i++) {
+        slot_tex[i] = textures[i];
+        slot_samp[i] = samplers[i];
+    }
+    for (uint32_t i = 0; i < h->nargs; i++) {
+        const struct nvk_arg *a = &h->args[i];
+        if (a->index < NVGPU_MAX_TEXTURES || a->cbuf_off >= NVGPU_MAX_TEXTURES)
+            continue;
+        if (a->kind == NVK_ARG_TEXTURE)
+            slot_tex[a->cbuf_off] = textures[a->index];
+        else if (a->kind == NVK_ARG_SAMPLER)
+            slot_samp[a->cbuf_off] = samplers[a->index];
+    }
+}
+
+static int malachite_fill_pools(__unsafe_unretained id cb, const struct nvk_header *h, __unsafe_unretained const id *textures,
                             __unsafe_unretained const id *samplers, unsigned int headers[][8],
                             unsigned int samps[][8], unsigned int *nheaders, unsigned int *nsamplers)
 {
-    id<MTLDevice> device = ((id<MTLCommandBuffer>)cb).device;
     for (uint32_t i = 0; i < h->nargs; i++) {  // every slot the shader reads gets a valid header and sampler
         unsigned slot = h->args[i].index;
         if (slot >= NVGPU_MAX_TEXTURES)
@@ -2151,17 +2520,17 @@ static uint32_t malachite_heap_sampler(const uint32_t samp[8])
 @end
 
 // n consecutive header entries for one launch of cb's; 0 when the heap has none left
-static uint32_t malachite_heap_take(id cb, uint32_t n)
+static uint32_t malachite_heap_take(__unsafe_unretained id cb, uint32_t n)
 {
-    static char key;
-    MalachiteHeapBlocks *b = objc_getAssociatedObject(cb, &key);
+    __unsafe_unretained MalachiteHeapBlocks *b = ((MalachiteCommandBuffer *)cb)->_heap_blocks;
     if (!b) {
-        b = [MalachiteHeapBlocks new];
-        objc_setAssociatedObject(cb, &key, b, OBJC_ASSOCIATION_RETAIN);
+        MalachiteHeapBlocks *made = [MalachiteHeapBlocks new];
+        ((MalachiteCommandBuffer *)cb)->_heap_blocks = made;
+        b = made;
         [(id<MTLCommandBuffer>)cb addCompletedHandler:^(id<MTLCommandBuffer>) {
             os_unfair_lock_lock(&malachite_heap.lock);
-            for (uint32_t i = 0; i < b->_n; i++)
-                malachite_heap.free_blocks[malachite_heap.nfree++] = b->_blocks[i];
+            for (uint32_t i = 0; i < made->_n; i++)
+                malachite_heap.free_blocks[malachite_heap.nfree++] = made->_blocks[i];
             os_unfair_lock_unlock(&malachite_heap.lock);
         }];
     }
@@ -2237,14 +2606,18 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
 - (instancetype)initWithCommandBuffer:(id)cb;
 @end
 
+#define MALACHITE_BINDINGS 128  // the texture and sampler indices a Metal stage binds
+
 @interface MalachiteComputeCommandEncoder : MTLIOAccelComputeCommandEncoder <MTLComputeCommandEncoder> {
     __unsafe_unretained id _cb;
     MalachiteComputePipelineState *_pipeline;
     uint64_t _buffers[31];  // GPU VA (+offset) bound at each [[buffer(n)]] slot
     __unsafe_unretained id _bound[31];  // and the buffer, for setBufferOffset
-    __unsafe_unretained id _textures[NVGPU_MAX_TEXTURES];
-    __unsafe_unretained id _samplers[NVGPU_MAX_TEXTURES];
+    // by Metal index, which goes to 127; malachite_dispatch puts them in the pools' 16 slots
+    __unsafe_unretained id _textures[MALACHITE_BINDINGS];
+    __unsafe_unretained id _samplers[MALACHITE_BINDINGS];
     uint32_t _threadgroup[31];  // each [[threadgroup(n)]] argument's bytes
+    uint64_t _region;  // the stage-in region's GPU VA, laid out as MTLStageInRegionIndirectArguments; 0 for none set
 }
 @end
 
@@ -2340,7 +2713,7 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
     [self setSamplerStates:samplers withRange:range];
 }
 
-// [[threadgroup(n)]] memory, laid out at dispatch; Apple-GPU imageblocks and stage-in regions have nothing to set
+// [[threadgroup(n)]] memory, laid out at dispatch; Apple-GPU imageblocks have nothing to set
 - (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index
 {
     if (index < 31)
@@ -2351,12 +2724,97 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
 {
 }
 
+// a kernel's stage input reads its region from memory, so the indirect one is the same to it
 - (void)setStageInRegion:(MTLRegion)region
 {
+    uint32_t r[6] = { (uint32_t)region.origin.x, (uint32_t)region.origin.y, (uint32_t)region.origin.z,
+                      (uint32_t)region.size.width, (uint32_t)region.size.height, (uint32_t)region.size.depth };
+    malachite_upload(_cb, r, sizeof(r), &_region);
 }
 
 - (void)setStageInRegionWithIndirectBuffer:(id)buffer indirectBufferOffset:(NSUInteger)offset
 {
+    _region = [(MTLIOAccelBuffer *)buffer gpuAddress] + offset;
+    malachite_keep(_cb, buffer);
+}
+
+// The recorder's dispatch: the first one (or the one after +recskip's count) of each kernel +record names, its
+// buffers (from their offsets, 256 MB at most) as they are before it and after it, into
+// /tmp/malachite-rec-<pid>-c<n>/ with a manifest.txt of
+// kernel=, grid= (threads, or groups when groups=1), threads= (a threadgroup's) and buffer.<n>=, buffer.<n>.after=
+// lines. Textures aren't recorded.
+- (NSString *)recordBuffers:(NSString *)dir manifest:(NSMutableString *)m after:(bool)after
+{
+    for (uint32_t i = 0; i < _pipeline->_kernel.nargs; i++) {
+        const struct nvk_arg *a = &_pipeline->_kernel.args[i];
+        if (a->kind != NVK_ARG_BUFFER || a->index >= 31 || !_bound[a->index])
+            continue;
+        id<MTLBuffer> b = _bound[a->index];
+        uint64_t off = _buffers[a->index] - [(MTLIOAccelBuffer *)b gpuAddress];
+        uint32_t size = b.length > off ? (uint32_t)MIN(b.length - off, 256ull << 20) : 0;
+        NSString *file = [NSString stringWithFormat:@"buffer%u%s.bin", a->index, after ? "-after" : ""];
+        if (malachite_rec_bytes(_cb, [dir stringByAppendingPathComponent:file], _buffers[a->index], size))
+            [m appendFormat:@"buffer.%u%s=%@\n", a->index, after ? ".after" : "", file];
+        // where the dispatch read it from: the storage asked for, and whether a managed one's VRAM copy
+        if (!after)
+            [m appendFormat:@"buffer.%u.storage=%lu%s\n", a->index, (unsigned long)b.storageMode,
+                            [b isKindOfClass:[MalachiteBuffer class]] && ((MalachiteBuffer *)b)->_mirror ? ",vram" : ""];
+    }
+    return dir;
+}
+
+- (NSString *)recordStart:(NSMutableString *)m grid:(MTLSize)grid threads:(MTLSize)threads groups:(bool)groups
+{
+    static NSCountedSet<NSString *> *seen;
+    bool named = false;
+    for (NSString *s in malachite_rec_only)
+        named |= [_pipeline->_label containsString:s];
+    if (!named || malachite_rec_full)
+        return nil;
+    if (!seen)
+        seen = [NSCountedSet set];
+    [seen addObject:_pipeline->_label];
+    if ([seen countForObject:_pipeline->_label] != malachite_rec_skip + 1)
+        return nil;
+    static int recordings;
+    NSString *dir = [NSString stringWithFormat:@"/tmp/malachite-rec-%d-c%d", getpid(), recordings++];
+    mkdir(dir.fileSystemRepresentation, 0755);
+    [m appendFormat:@"version=1\nprocess=%s\npid=%d\nkernel=%@\ngrid=%lu,%lu,%lu\nthreads=%lu,%lu,%lu\ngroups=%d\n",
+                    getprogname(), getpid(), _pipeline->_label, (unsigned long)grid.width,
+                    (unsigned long)grid.height, (unsigned long)grid.depth, (unsigned long)threads.width,
+                    (unsigned long)threads.height, (unsigned long)threads.depth, groups];
+    return [self recordBuffers:dir manifest:m after:false];
+}
+
+- (void)recordEnd:(NSString *)dir manifest:(NSMutableString *)m
+{
+    [self recordBuffers:dir manifest:m after:true];
+    NSString *path = [dir stringByAppendingPathComponent:@"manifest.txt"];
+    [(id<MTLCommandBuffer>)_cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+        [m writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+    }];
+}
+
+// The address each [[buffer(n)]] param gets: the bound buffers', or for an OpenCL kernel the ones 3 further on.
+// AppleMetalOpenGLRenderer binds buffer i at 3 + i (GLDQueueRec::executeKernel: setBuffer:offset:atIndex: for a
+// buffer, setBytes:length:atIndex: for one passed by value, counting buffers alone), where the AIR names it i.
+- (const uint64_t *)argumentAddresses:(uint64_t *)out
+{
+    if (!_pipeline || !_pipeline->_cl)
+        return _buffers;
+    memset(out, 0, sizeof(_buffers));
+    for (uint32_t i = 0; i < _pipeline->_kernel.nargs; i++) {
+        const struct nvk_arg *a = &_pipeline->_kernel.args[i];
+        if (a->kind == NVK_ARG_TEXTURE && a->access && a->index < MALACHITE_BINDINGS &&
+            [_textures[a->index] isKindOfClass:[MalachiteTexture class]])  // an image over one of OpenCL's buffers
+            malachite_written(_cb, ((MalachiteTexture *)_textures[a->index])->_backing);
+        if (a->kind != NVK_ARG_BUFFER || a->index + MALACHITE_CL_FIRST >= 31)
+            continue;
+        out[a->index] = _buffers[a->index + MALACHITE_CL_FIRST];
+        if (a->access)
+            malachite_written(_cb, _bound[a->index + MALACHITE_CL_FIRST]);
+    }
+    return out;
 }
 
 // the kernel reads the grid when it runs the dispatch, after the work before it, which may write it
@@ -2365,13 +2823,14 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
                          threadsPerThreadgroup:(MTLSize)threads
 {
     malachite_keep(_cb, buffer);
-    malachite_dispatch(_cb, _pipeline, _buffers, _textures, _samplers, MTLSizeMake(1, 1, 1), threads,
-                   [(MTLIOAccelBuffer *)buffer gpuAddress] + offset, _threadgroup);
+    uint64_t cl[31];
+    malachite_dispatch(_cb, _pipeline, [self argumentAddresses:cl], _textures, _samplers, MTLSizeMake(1, 1, 1), threads,
+                   [(MTLIOAccelBuffer *)buffer gpuAddress] + offset, _threadgroup, NULL, _region);
 }
 
 - (void)setTexture:(id)texture atIndex:(NSUInteger)index
 {
-    if (index >= NVGPU_MAX_TEXTURES)
+    if (index >= MALACHITE_BINDINGS)
         return;
     _textures[index] = texture;
     malachite_keep(_cb, texture);
@@ -2379,13 +2838,19 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
 
 - (void)setSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
-    if (index < NVGPU_MAX_TEXTURES)
+    if (index < MALACHITE_BINDINGS)
         _samplers[index] = sampler;
 }
 
 - (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)threads
 {
-    malachite_dispatch(_cb, _pipeline, _buffers, _textures, _samplers, groups, threads, 0, _threadgroup);
+    NSMutableString *m = malachite_rec_only && _pipeline ? [NSMutableString string] : nil;
+    NSString *rec = m ? [self recordStart:m grid:groups threads:threads groups:true] : nil;
+    uint64_t cl[31];
+    malachite_dispatch(_cb, _pipeline, [self argumentAddresses:cl], _textures, _samplers, groups, threads, 0,
+                   _threadgroup, NULL, _region);
+    if (rec)
+        [self recordEnd:rec manifest:m];
 }
 
 // A grid that isn't whole threadgroups (Metal's non-uniform threadgroups) runs as up to 8 uniform launches: the
@@ -2404,6 +2869,10 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
         part[6 + i] = (uint32_t)(whole[i] + (rest[i] != 0));  // the dispatch's threadgroups
         part[9 + i] = (uint32_t)g[i];                          // and threads
     }
+    NSMutableString *m = malachite_rec_only && _pipeline ? [NSMutableString string] : nil;
+    NSString *rec = m ? [self recordStart:m grid:grid threads:threads groups:false] : nil;
+    uint64_t cl[31];
+    const uint64_t *buffers = [self argumentAddresses:cl];
     for (int k = 0; k < 8; k++) {  // bit i of k: the partial threadgroups along axis i rather than the whole ones
         NSUInteger n[3], b[3];
         bool empty = false;
@@ -2416,16 +2885,18 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
             empty |= !n[i];
         }
         if (!empty)
-            malachite_dispatch(_cb, _pipeline, _buffers, _textures, _samplers, MTLSizeMake(n[0], n[1], n[2]),
-                           MTLSizeMake(b[0], b[1], b[2]), 0, _threadgroup, part);
+            malachite_dispatch(_cb, _pipeline, buffers, _textures, _samplers, MTLSizeMake(n[0], n[1], n[2]),
+                           MTLSizeMake(b[0], b[1], b[2]), 0, _threadgroup, part, _region);
     }
+    if (rec)
+        [self recordEnd:rec manifest:m];
 }
 @end
 
 static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, const uint64_t buffers[31],
                            __unsafe_unretained const id *textures, __unsafe_unretained const id *samplers,
                            MTLSize groups, MTLSize threads, uint64_t indirect, const uint32_t *threadgroup,
-                           const uint32_t *part)
+                           const uint32_t *part, uint64_t region)
 {
     // the QMD holds at most 65535 threadgroups along y and z: a larger grid runs in pieces, each knowing where it lies
     if (!indirect && (groups.height > 65535 || groups.depth > 65535)) {
@@ -2449,7 +2920,7 @@ static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, c
                 p[5] += (uint32_t)z;
                 malachite_dispatch(cb, pipeline, buffers, textures, samplers,
                                MTLSizeMake(groups.width, MIN(65535u, groups.height - y), MIN(65535u, groups.depth - z)),
-                               threads, 0, threadgroup, p);
+                               threads, 0, threadgroup, p, region);
             }
         return;
     }
@@ -2476,7 +2947,7 @@ static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, c
     d.shared_size = pipeline->_kernel.shared_size;
     d.local_size = pipeline->_kernel.local_size;
     d.barriers = pipeline->_kernel.barriers;
-    d.params_size = malachite_fill_params(&pipeline->_kernel, buffers, d.params);
+    d.params_size = malachite_fill_params(&pipeline->_kernel, buffers, d.params, sizeof(d.params));
     // [[threadgroup(n)]] memory after the kernel's own threadgroup variables, each at the offset its param says
     for (uint32_t i = 0; i < pipeline->_kernel.nargs; i++) {
         const struct nvk_arg *a = &pipeline->_kernel.args[i];
@@ -2487,15 +2958,43 @@ static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, c
         d.params_size = MAX(d.params_size, a->cbuf_off - 0x160 + 8u);
         d.shared_size = at + ((len + 15) & ~15u);
     }
-    if (malachite_fill_pools(cb, &pipeline->_kernel, textures, samplers, d.headers,
+    for (uint32_t i = 0; i < pipeline->_kernel.nargs; i++) {
+        const struct nvk_arg *a = &pipeline->_kernel.args[i];
+        if (a->kind != NVK_ARG_STAGE_IN_REGION)
+            continue;
+        // a region never set reads as empty rather than through a null pointer, which faults the channel
+        if (!region) {
+            static const uint32_t empty[6] = {};
+            malachite_upload(cb, empty, sizeof(empty), &region);
+        }
+        memcpy(d.params + a->cbuf_off - 0x160, &region, 8);
+        d.params_size = MAX(d.params_size, a->cbuf_off - 0x160 + 8u);
+    }
+    __unsafe_unretained id slot_tex[NVGPU_MAX_TEXTURES], slot_samp[NVGPU_MAX_TEXTURES];
+    malachite_slots(&pipeline->_kernel, textures, samplers, slot_tex, slot_samp);
+    if (malachite_fill_pools(cb, &pipeline->_kernel, slot_tex, slot_samp, d.headers,
                          d.samplers, &d.nheaders, &d.nsamplers) ||
         malachite_heap_commit(cb, d.headers, d.nheaders, d.samplers, d.nsamplers, &d.heap))
         return;
-    malachite_level_headers(cb, &pipeline->_kernel, textures, &d.heap);
-    if (malachite_trace)
+    malachite_level_headers(cb, &pipeline->_kernel, slot_tex, &d.heap);
+    if (malachite_trace) {
         os_log(OS_LOG_DEFAULT, "Malachite trace: dispatch %{public}@: %ux%ux%u groups of %lux%lux%lu", pipeline->_label,
                d.grid_x, d.grid_y, d.grid_z, (unsigned long)threads.width, (unsigned long)threads.height,
                (unsigned long)threads.depth);
+        for (uint32_t i = 0; i < pipeline->_kernel.nargs; i++) {
+            const struct nvk_arg *a = &pipeline->_kernel.args[i];
+            if (a->kind == NVK_ARG_BUFFER && a->index < 31) {
+                os_log(OS_LOG_DEFAULT, "Malachite trace:   buffer %u: %#llx", a->index, buffers[a->index]);
+            } else if (a->kind == NVK_ARG_TEXTURE && a->index < NVGPU_MAX_TEXTURES && textures[a->index]) {
+                MalachiteTexture *t = (MalachiteTexture *)textures[a->index];
+                id<MTLTexture> mt = (id<MTLTexture>)textures[a->index];
+                os_log(OS_LOG_DEFAULT, "Malachite trace:   texture %u: %#llx %lux%lu format %lu plane %lu%s", a->index,
+                       [(MTLIOAccelBuffer *)t->_backing gpuAddress] + t->_offset, (unsigned long)mt.width,
+                       (unsigned long)mt.height, (unsigned long)mt.pixelFormat, (unsigned long)mt.iosurfacePlane,
+                       t->_surface ? " iosurface" : "");
+            }
+        }
+    }
     malachite_record(cb, MALACHITE_CMD_DISPATCH, &d, sizeof(d));
 }
 
@@ -2759,10 +3258,10 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     uint32_t _fsizes[31];  // and fragment buffer's, for the recorder
     __unsafe_unretained id _vbound[31], _fbound[31];  // the buffers, for set*BufferOffset (kept by the command buffer)
     MTLRenderPassDescriptor *_rpd;  // the recorder's: the pass as asked for
-    __unsafe_unretained id _textures[NVGPU_MAX_TEXTURES];  // the fragment stage's
-    __unsafe_unretained id _samplers[NVGPU_MAX_TEXTURES];
-    __unsafe_unretained id _vtextures[NVGPU_MAX_TEXTURES];  // the vertex stage's
-    __unsafe_unretained id _vsamplers[NVGPU_MAX_TEXTURES];
+    __unsafe_unretained id _textures[MALACHITE_BINDINGS];  // the fragment stage's, by Metal index
+    __unsafe_unretained id _samplers[MALACHITE_BINDINGS];
+    __unsafe_unretained id _vtextures[MALACHITE_BINDINGS];  // the vertex stage's
+    __unsafe_unretained id _vsamplers[MALACHITE_BINDINGS];
     int _formats[8];  // each colour attachment's enum tex_format, -1 for none; [[color(n)]] inputs read attachment n
     __unsafe_unretained MalachiteTexture *_attached[8];  // the attachments themselves, for the trace's dumps
     uint32_t _attached_level[8];                     // the image level each draws into
@@ -2780,6 +3279,16 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     uint64_t _counted;        // the result the last draw counting samples counted into
     id _resolve[8];           // where each multisampled attachment resolves to, nil for none
     bool _barrier;            // a texture or memory barrier since the last draw
+    bool _fast;               // later draws of the pass are written here as what changed, as a run
+    __unsafe_unretained id _pools_pipeline;  // what the last draw's heap entries are of, nil for nothing to reuse
+    const void *_pools_bound[4][MALACHITE_BINDINGS];
+    struct nvgpu_heap _pools_heap;
+    unsigned int _pools_nheaders, _pools_nsamplers, _pools_vs_textured;
+    unsigned int _pools_vs_handles[NVGPU_HANDLES];
+    uint64_t _last_records;   // the command buffer's count just after _last went out, 0 for none
+    uint64_t _seen_code[16][2];  // shader pairs run in this pass
+    unsigned _seen_next;
+    struct nvgpu_draw _last;  // what the channel holds, but for what a draw always sends
     struct malachite_zresolve _zresolve[2];  // and the depth and stencil attachment, apart or together
     MalachiteDepthStencilState *_ds;
     bool _drawn;
@@ -2799,6 +3308,13 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     if (!self)
         return nil;
     _cb = cb;
+    if (opengl_renderer) {
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            malachite_gl_swaps();
+        });
+    }
+    _fast = !malachite_trace && !malachite_snap && !malachite_rec_only;
     _factor_scale = 1.0f;
     for (unsigned i = 0; i < 8; i++)
         _formats[i] = -1;
@@ -3054,7 +3570,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 
 - (void)setVertexTexture:(id)texture atIndex:(NSUInteger)index
 {
-    if (index >= NVGPU_MAX_TEXTURES)
+    if (index >= MALACHITE_BINDINGS)
         return;
     _vtextures[index] = texture;
     malachite_keep(_cb, texture);
@@ -3062,7 +3578,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 
 - (void)setVertexSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
-    if (index < NVGPU_MAX_TEXTURES)
+    if (index < MALACHITE_BINDINGS)
         _vsamplers[index] = sampler;
 }
 
@@ -3285,7 +3801,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 
 - (void)setFragmentTexture:(id)texture atIndex:(NSUInteger)index
 {
-    if (index >= NVGPU_MAX_TEXTURES)
+    if (index >= MALACHITE_BINDINGS)
         return;
     _textures[index] = texture;
     malachite_keep(_cb, texture);
@@ -3301,7 +3817,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 
 - (void)setFragmentSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
-    if (index < NVGPU_MAX_TEXTURES)
+    if (index < MALACHITE_BINDINGS)
         _samplers[index] = sampler;
 }
 
@@ -3613,6 +4129,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     }
     struct nvgpu_draw d = _pass;
     d.pass_first = !_drawn;
+    d.opengl = opengl_renderer;
     if (_drawn) {  // the load actions clear once, before the first draw
         d.clear = 0;
         d.clear_zs = 0;
@@ -3632,66 +4149,24 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     d.ps = [(MTLIOAccelBuffer *)_pipeline->_fcode gpuAddress];
     d.vs_regs = _pipeline->_vertex.reg_count;
     d.ps_regs = _pipeline->_fragment.reg_count;
-    d.vs_params_size = malachite_fill_params(&_pipeline->_vertex, _vbuffers, d.vs_params);
+    d.vs_params_size = malachite_fill_params(&_pipeline->_vertex, _vbuffers, d.vs_params, sizeof(d.vs_params));
     if (malachite_trace)
         for (uint32_t i = 0; i < _pipeline->_vertex.nargs; i++)
             os_log(OS_LOG_DEFAULT, "Malachite trace:   vertex argument %u: kind %u index %u at %#x", i,
                    _pipeline->_vertex.args[i].kind, _pipeline->_vertex.args[i].index,
                    _pipeline->_vertex.args[i].cbuf_off);
-    d.ps_params_size = malachite_fill_params(&_pipeline->_fragment, _fbuffers, d.ps_params);
-    __unsafe_unretained id textures[NVGPU_MAX_TEXTURES];
-    memcpy(textures, _textures, sizeof(textures));
-    const struct nvk_header *fh = &_pipeline->_fragment;
-    if (malachite_fill_pools(_cb, fh, textures, _samplers, d.headers, d.samplers, &d.nheaders, &d.nsamplers))
+    d.ps_params_size = malachite_fill_params(&_pipeline->_fragment, _fbuffers, d.ps_params, sizeof(d.ps_params));
+    if (_pipeline == _pools_pipeline && !memcmp(_pools_bound[0], _textures, sizeof(_textures)) &&
+        !memcmp(_pools_bound[1], _samplers, sizeof(_samplers)) && !memcmp(_pools_bound[2], _vtextures, sizeof(_vtextures)) &&
+        !memcmp(_pools_bound[3], _vsamplers, sizeof(_vsamplers))) {
+        d.heap = _pools_heap;
+        d.nheaders = _pools_nheaders;
+        d.nsamplers = _pools_nsamplers;
+        d.vs_textured = _pools_vs_textured;
+        if (d.vs_textured)
+            memcpy(d.vs_handles, _pools_vs_handles, sizeof(d.vs_handles));
+    } else if (![self fillPools:d]) {
         return;
-    // [[color(n)]] inputs read the attachment where it's drawn: the shadow, if it has one. CoreAnimation's glass
-    // needs them (zeros leave its material garbage); a read of an attachment the pass hasn't gets zeros
-    for (uint32_t i = 0; i < fh->nargs; i++) {
-        unsigned n = fh->args[i].index, slot = NVK_RENDER_TARGET_SLOT(n);
-        if (fh->args[i].kind != NVK_ARG_RENDER_TARGET)
-            continue;
-        if (n >= 8 || _formats[n] < 0) {
-            memset(d.headers[slot], 0, sizeof(d.headers[slot]));  // the unbound texture's: reads give 0
-        } else {
-            [self attachment:n header:d.headers[slot] of:d];
-            d.serialize = 1;  // it sees everything drawn before it once that's done
-        }
-        if (slot + 1 > d.nheaders)
-            d.nheaders = slot + 1;
-    }
-    // an attachment sampled, through its own texture or another over the same memory and only its level: a
-    // downsample that draws level n of an image while sampling level n - 1, through a view of either or of all its
-    // levels, isn't one (Metal lets a pass read the levels it doesn't draw)
-    for (unsigned slot = 0; slot < d.nheaders; slot++) {
-        MalachiteTexture *t = textures[slot];
-        if (![t isKindOfClass:[MalachiteTexture class]] || !t->_backing)
-            continue;
-        uint64_t at = [(MTLIOAccelBuffer *)t->_backing gpuAddress] + t->_offset;
-        for (unsigned n = 0; n < 8; n++)
-            if (_attached[n] && _attached[n]->_backing &&
-                at == [(MTLIOAccelBuffer *)_attached[n]->_backing gpuAddress] + _attached[n]->_offset &&
-                (!t->_image || (t->_levels == 1 && _attached_level[n] == t->_view_min)))
-                [self attachment:n copy:d.headers[slot] of:d];
-    }
-    if (!d.nsamplers && d.nheaders) {  // as malachite_fill_pools gives a pool with headers a sampler 0
-        struct samp_desc def = malachite_default_sampler();
-        tex_fill_sampler(d.samplers[0], &def);
-        d.nsamplers = 1;
-    }
-    if (malachite_heap_commit(_cb, d.headers, d.nheaders, d.samplers, d.nsamplers, &d.heap))
-        return;
-    // the vertex stage's textures: headers of their own in the heap, and a handle table of their own
-    unsigned int vheaders[NVGPU_MAX_TEXTURES][8] = {}, vsamplers[NVGPU_MAX_TEXTURES][8] = {}, nvh = 0, nvs = 0;
-    if (malachite_fill_pools(_cb, &_pipeline->_vertex, _vtextures, _vsamplers, vheaders, vsamplers, &nvh, &nvs))
-        return;
-    if (nvh) {
-        struct nvgpu_heap vh;
-        if (malachite_heap_commit(_cb, vheaders, nvh, vsamplers, nvs, &vh))
-            return;
-        if (!d.heap.headers)
-            d.heap = (struct nvgpu_heap){ vh.headers, vh.samplers, vh.nheaders, vh.nsamplers };
-        d.vs_textured = 1;
-        memcpy(d.vs_handles, vh.handles, sizeof(d.vs_handles));
     }
     d.write_mask = _pipeline->_write_mask[0];
     memcpy(d.blend, _pipeline->_blend[0], sizeof(d.blend));
@@ -3866,7 +4341,19 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     d.serialize |= _barrier;
     _barrier = false;
     d.local_size = MAX(_pipeline->_vertex.local_size, _pipeline->_fragment.local_size);
-    malachite_record(_cb, MALACHITE_CMD_DRAW, &d, sizeof(d));
+    if (![self fastDraw:d]) {
+        malachite_record(_cb, MALACHITE_CMD_DRAW, &d, sizeof(d));
+        _last_records = 0;
+        if (_fast && d.count && d.instances) {  // the kernel sends no state for a draw of nothing
+            MalachiteCommandBuffer *cb = (MalachiteCommandBuffer *)_cb;
+            _last = d;
+            _last_records = cb->_records;
+            cb->_state_of = (__bridge const void *)self;
+            _seen_code[_seen_next][0] = d.vs;
+            _seen_code[_seen_next][1] = d.ps;
+            _seen_next = (_seen_next + 1) % 16;
+        }
+    }
     _drawn = true;
     if (rec)
         [self record:rec manifest:manifest after:d];
@@ -4044,6 +4531,420 @@ static MalachiteRenderPipelineState *malachite_copy_pipeline(id<MTLDevice> devic
     }
 }
 
+// The GPU methods a fast draw uses, from core/render.c
+#define FAST_MTHD(m, n) (0x20000000u | (uint32_t)(n) << 16 | (uint32_t)(m) >> 2)
+enum {
+    FAST_INDEX_SIZE = 0x0238,
+    FAST_DRAW_CONTROL = 0x0260,
+    FAST_DRAW_INDEXED = 0x0268,
+    FAST_DRAW_ARRAYS = 0x0270,
+    FAST_STREAM_SIZE = 0x0600,
+    FAST_INVALIDATE_SHADER = 0x0da4,
+    FAST_VERTEX_ID_BASE = 0x1118,
+    FAST_INVALIDATE_TEX_DATA = 0x1288,
+    FAST_INVALIDATE_SAMPLER = 0x1424,
+    FAST_INVALIDATE_HEADER = 0x1428,
+    FAST_BASE_VERTEX = 0x1434,
+    FAST_SAMPLER_POOL = 0x155c,
+    FAST_HEADER_POOL = 0x1574,
+    FAST_INDEX_ADDRESS = 0x17c8,
+    FAST_STREAM_INSTANCE = 0x1880,
+    FAST_STREAM_FORMAT = 0x1c00,
+    FAST_CONSTANT_SELECTOR = 0x2380,
+    FAST_CONSTANT_BIND = 0x2410,
+    FAST_BANK_BYTES = 0x1000,  // as bound; it reads no further than FAST_BANK_USED
+    FAST_BANK_USED = 0x280,
+    FAST_BANK_STEP = 0x300,
+    FAST_RUN_WORDS = 0x4000,
+    FAST_DRAW_WORDS = 1024,    // more than one draw can take
+    FAST_RUN_DRAWS = 256,      // the GPU gets on with them
+};
+
+// Room for one more draw in the run's memory, which lives until the command buffer completes.
+static bool malachite_run_room(MalachiteCommandBuffer *cb)
+{
+    if (!cb->_run_cpu || cb->_run_cap - cb->_run_used < FAST_DRAW_WORDS) {
+        malachite_run_flush(cb);
+        void *cpu;
+        uint64_t va;
+        if (!malachite_reserve(cb, FAST_RUN_WORDS * 4, &va, &cpu))
+            return false;
+        cb->_run_cpu = (uint32_t *)cpu;
+        cb->_run_va = va;
+        cb->_run_start = cb->_run_used = 0;
+        cb->_run_cap = FAST_RUN_WORDS;
+    }
+    if (!cb->_bank_cpu || cb->_bank_cap - cb->_bank_used < FAST_BANK_STEP * 2 + FAST_BANK_BYTES) {
+        void *cpu;
+        uint64_t va;
+        if (!malachite_reserve(cb, MALACHITE_UPLOAD_BLOCK, &va, &cpu))
+            return false;
+        cb->_bank_cpu = (uint8_t *)cpu;
+        cb->_bank_va = va;
+        cb->_bank_used = 0;
+        cb->_bank_cap = MALACHITE_UPLOAD_BLOCK;
+        cb->_bank_new = true;
+    }
+    return true;
+}
+
+// The textures and samplers of a draw, as heap entries. A draw with the same pipeline and bindings as the last uses the
+// same ones, unless it reads an attachment, which takes a copy of its own.
+- (bool)fillPools:(struct nvgpu_draw &)d
+{
+    bool cacheable = true;
+    const struct nvk_header *fh = &_pipeline->_fragment;
+    __unsafe_unretained id textures[NVGPU_MAX_TEXTURES], samplers[NVGPU_MAX_TEXTURES];
+    malachite_slots(fh, _textures, _samplers, textures, samplers);
+    if (malachite_fill_pools(_cb, fh, textures, samplers, d.headers, d.samplers, &d.nheaders, &d.nsamplers))
+        return false;
+    // [[color(n)]] inputs read the attachment where it's drawn: the shadow, if it has one. CoreAnimation's glass
+    // needs them (zeros leave its material garbage); a read of an attachment the pass hasn't gets zeros
+    for (uint32_t i = 0; i < fh->nargs; i++) {
+        unsigned n = fh->args[i].index, slot = NVK_RENDER_TARGET_SLOT(n);
+        if (fh->args[i].kind != NVK_ARG_RENDER_TARGET)
+            continue;
+        if (n >= 8 || _formats[n] < 0) {
+            memset(d.headers[slot], 0, sizeof(d.headers[slot]));  // the unbound texture's: reads give 0
+        } else {
+            [self attachment:n header:d.headers[slot] of:d];
+            d.serialize = 1;  // it sees everything drawn before it once that's done
+            cacheable = false;
+        }
+        if (slot + 1 > d.nheaders)
+            d.nheaders = slot + 1;
+    }
+    // an attachment sampled, through its own texture or another over the same memory and only its level: a
+    // downsample that draws level n of an image while sampling level n - 1, through a view of either or of all its
+    // levels, isn't one (Metal lets a pass read the levels it doesn't draw)
+    for (unsigned slot = 0; slot < d.nheaders; slot++) {
+        MalachiteTexture *t = textures[slot];
+        if (![t isKindOfClass:[MalachiteTexture class]] || !t->_backing)
+            continue;
+        uint64_t at = [(MTLIOAccelBuffer *)t->_backing gpuAddress] + t->_offset;
+        for (unsigned n = 0; n < 8; n++)
+            if (_attached[n] && _attached[n]->_backing &&
+                at == [(MTLIOAccelBuffer *)_attached[n]->_backing gpuAddress] + _attached[n]->_offset &&
+                (!t->_image || (t->_levels == 1 && _attached_level[n] == t->_view_min))) {
+                [self attachment:n copy:d.headers[slot] of:d];
+                cacheable = false;
+            }
+    }
+    if (!d.nsamplers && d.nheaders) {  // as malachite_fill_pools gives a pool with headers a sampler 0
+        struct samp_desc def = malachite_default_sampler();
+        tex_fill_sampler(d.samplers[0], &def);
+        d.nsamplers = 1;
+    }
+    if (malachite_heap_commit(_cb, d.headers, d.nheaders, d.samplers, d.nsamplers, &d.heap))
+        return false;
+    // the vertex stage's textures: headers of their own in the heap, and a handle table of their own
+    unsigned int vheaders[NVGPU_MAX_TEXTURES][8] = {}, vsamplers[NVGPU_MAX_TEXTURES][8] = {}, nvh = 0, nvs = 0;
+    __unsafe_unretained id vtextures[NVGPU_MAX_TEXTURES], vsamplers_bound[NVGPU_MAX_TEXTURES];
+    malachite_slots(&_pipeline->_vertex, _vtextures, _vsamplers, vtextures, vsamplers_bound);
+    if (malachite_fill_pools(_cb, &_pipeline->_vertex, vtextures, vsamplers_bound, vheaders, vsamplers, &nvh, &nvs))
+        return false;
+    if (nvh) {
+        struct nvgpu_heap vh;
+        if (malachite_heap_commit(_cb, vheaders, nvh, vsamplers, nvs, &vh))
+            return false;
+        if (!d.heap.headers)
+            d.heap = (struct nvgpu_heap){ vh.headers, vh.samplers, vh.nheaders, vh.nsamplers };
+        d.vs_textured = 1;
+        memcpy(d.vs_handles, vh.handles, sizeof(d.vs_handles));
+    }
+    _pools_pipeline = cacheable ? _pipeline : nil;
+    if (cacheable) {
+        memcpy(_pools_bound[0], _textures, sizeof(_textures));
+        memcpy(_pools_bound[1], _samplers, sizeof(_samplers));
+        memcpy(_pools_bound[2], _vtextures, sizeof(_vtextures));
+        memcpy(_pools_bound[3], _vsamplers, sizeof(_vsamplers));
+        _pools_heap = d.heap;
+        _pools_nheaders = d.nheaders;
+        _pools_nsamplers = d.nsamplers;
+        _pools_vs_textured = d.vs_textured;
+        memcpy(_pools_vs_handles, d.vs_handles, sizeof(d.vs_handles));
+    }
+    return true;
+}
+
+// What a pipeline or the encoder's state changed since the last draw, through the kernel's own code (core/drawbuild.c).
+// Re-sending a group is harmless, as the kernel sends them all every draw.
+- (uint32_t)fastState:(const struct nvgpu_draw &)d into:(uint32_t *)push
+{
+    struct nvgpu_draw &l = _last;
+#define DIFFERS(f) (memcmp(&d.f, &l.f, sizeof(d.f)) != 0)
+    bool shaders = d.vs != l.vs || d.ps != l.ps || d.vs_regs != l.vs_regs || d.ps_regs != l.ps_regs;
+    bool depth = d.depth_test != l.depth_test || d.depth_write != l.depth_write || d.depth_func != l.depth_func ||
+                 d.stencil_test != l.stencil_test || d.stencil_ref != l.stencil_ref || DIFFERS(stencil) ||
+                 DIFFERS(stencil_read_mask) || DIFFERS(stencil_write_mask);
+    bool cull = d.cull_face != l.cull_face || d.front_ccw != l.front_ccw;
+    bool view = DIFFERS(viewport) || DIFFERS(scissor);
+    bool bias = DIFFERS(depth_bias), bconst = DIFFERS(blend_const), attrs = DIFFERS(attributes);
+    bool blend = d.write_mask != l.write_mask || DIFFERS(blend);
+    for (unsigned j = 0; j < 7; j++)
+        blend |= d.more[j].write_mask != l.more[j].write_mask || DIFFERS(more[j].blend);
+    if (!(shaders || depth || cull || view || bias || bconst || attrs || blend))
+        return 0;
+
+    struct render_draw r = {};
+    uint32_t n = 0;
+    if (blend) {
+        r.target = d.target;
+        r.pitch = d.pitch;
+        r.width = d.width;
+        r.height = d.height;
+        r.samples = d.samples;
+        r.format = d.format;
+        r.target_blocklinear = d.target_blocklinear;
+        r.alpha_control = d.alpha_control;
+        r.per_sample = d.per_sample;
+        r.layers = d.layers;
+        memcpy(r.layer_pitch, d.layer_pitch, sizeof(r.layer_pitch));
+        r.write_mask = d.write_mask;
+        memcpy(r.blend, d.blend, sizeof(r.blend));
+        for (int j = 0; j < 7; j++) {
+            r.more[j].addr = d.more[j].addr;
+            r.more[j].pitch = d.more[j].pitch;
+            r.more[j].format = d.more[j].format;
+            r.more[j].blocklinear = d.more[j].blocklinear;
+            r.more[j].write_mask = d.more[j].write_mask;
+            memcpy(r.more[j].blend, d.more[j].blend, sizeof(d.more[j].blend));
+            l.more[j].write_mask = d.more[j].write_mask;
+            memcpy(l.more[j].blend, d.more[j].blend, sizeof(d.more[j].blend));
+        }
+        n += draw_target_words(push + n, &r);
+        l.write_mask = d.write_mask;
+        memcpy(l.blend, d.blend, sizeof(l.blend));
+    }
+    if (depth) {
+        r.zt = d.zt;
+        r.depth_test = d.depth_test;
+        r.depth_write = d.depth_write;
+        r.depth_func = d.depth_func;
+        r.stencil_test = d.stencil_test;
+        memcpy(r.stencil, d.stencil, sizeof(r.stencil));
+        r.stencil_ref = d.stencil_ref;
+        memcpy(r.stencil_read_mask, d.stencil_read_mask, sizeof(r.stencil_read_mask));
+        memcpy(r.stencil_write_mask, d.stencil_write_mask, sizeof(r.stencil_write_mask));
+        n += draw_depth_stencil_words(push + n, &r);
+        l.depth_test = d.depth_test;
+        l.depth_write = d.depth_write;
+        l.depth_func = d.depth_func;
+        l.stencil_test = d.stencil_test;
+        l.stencil_ref = d.stencil_ref;
+        memcpy(l.stencil, d.stencil, sizeof(l.stencil));
+        memcpy(l.stencil_read_mask, d.stencil_read_mask, sizeof(l.stencil_read_mask));
+        memcpy(l.stencil_write_mask, d.stencil_write_mask, sizeof(l.stencil_write_mask));
+    }
+    if (cull) {
+        r.cull_face = d.cull_face;
+        r.front_ccw = d.front_ccw;
+        n += draw_cull_words(push + n, &r);
+        l.cull_face = d.cull_face;
+        l.front_ccw = d.front_ccw;
+    }
+    if (view) {
+        memcpy(r.viewport, d.viewport, sizeof(r.viewport));
+        memcpy(r.scissor, d.scissor, sizeof(r.scissor));
+        r.window_coords = d.window_coords;
+        r.shader_layer = d.shader_layer;
+        r.depth_clamp = d.depth_clamp;
+        n += draw_viewport_words(push + n, &r);
+        memcpy(l.viewport, d.viewport, sizeof(l.viewport));
+        memcpy(l.scissor, d.scissor, sizeof(l.scissor));
+    }
+    if (bias) {
+        memcpy(r.depth_bias, d.depth_bias, sizeof(r.depth_bias));
+        n += draw_bias_words(push + n, &r);
+        memcpy(l.depth_bias, d.depth_bias, sizeof(l.depth_bias));
+    }
+    if (bconst) {
+        memcpy(r.blend_const, d.blend_const, sizeof(r.blend_const));
+        n += draw_blend_const_words(push + n, &r);
+        memcpy(l.blend_const, d.blend_const, sizeof(l.blend_const));
+    }
+    if (shaders) {
+        r.vs = d.vs;
+        r.ps = d.ps;
+        r.vs_regs = d.vs_regs;
+        r.ps_regs = d.ps_regs;
+        n += draw_shader_words(push + n, &r);
+        // code this pass has run needs no flush, and the flush is most of what a change of pipeline costs the GPU
+        bool seen = false;
+        for (unsigned i = 0; i < 16; i++)
+            seen |= _seen_code[i][0] == d.vs && _seen_code[i][1] == d.ps;
+        if (!seen) {
+            _seen_code[_seen_next][0] = d.vs;
+            _seen_code[_seen_next][1] = d.ps;
+            _seen_next = (_seen_next + 1) % 16;
+            push[n++] = FAST_MTHD(FAST_INVALIDATE_SHADER, 1);
+            push[n++] = 1 | 1 << 4 | 1 << 12;
+        }
+        l.vs = d.vs;
+        l.ps = d.ps;
+        l.vs_regs = d.vs_regs;
+        l.ps_regs = d.ps_regs;
+    }
+    if (attrs) {
+        memcpy(r.attributes, d.attributes, sizeof(r.attributes));
+        n += draw_attribute_words(push + n, &r);
+        memcpy(l.attributes, d.attributes, sizeof(l.attributes));
+    }
+#undef DIFFERS
+    return n;
+}
+
+// A later draw of a pass written here as what differs from the one before, with no record for the kernel: a run of
+// them is one record. The targets and what the kernel decides from them must match; anything rarer goes the kernel's
+// way, which sends the lot.
+- (bool)fastDraw:(const struct nvgpu_draw &)d
+{
+    MalachiteCommandBuffer *cb = (MalachiteCommandBuffer *)_cb;
+    // anything sent since, such as a backdrop copy, or another encoder of a parallel pass, left other state behind
+    if (!_fast || !_last_records || _last_records != cb->_records || cb->_state_of != (__bridge const void *)self)
+        return false;
+    const struct nvgpu_draw &l = _last;
+    if (d.clear || d.clear_zs || d.serialize || d.indirect || l.indirect || d.tess || l.tess || d.visibility || l.visibility ||
+        d.nviewports > 1 || d.vs_params_size > NVGPU_PARAM_BYTES || d.ps_params_size > NVGPU_PARAM_BYTES ||
+        (d.heap.headers && !d.heap.nheaders) || !d.vs || !d.ps ||
+        d.layers > 1 || !d.count || !d.instances || (d.nheaders && !d.heap.headers) || !d.index != !l.index ||
+        d.index_format != l.index_format)
+        return false;
+    static const struct {
+        size_t from, to;
+    } same[] = {
+        { 0, offsetof(struct nvgpu_draw, clear) },
+        { offsetof(struct nvgpu_draw, zt), offsetof(struct nvgpu_draw, pass_first) },
+        { offsetof(struct nvgpu_draw, zt_format), offsetof(struct nvgpu_draw, clear_zs) },
+        { offsetof(struct nvgpu_draw, point_size), offsetof(struct nvgpu_draw, depth_bias) },
+        { offsetof(struct nvgpu_draw, local_size), offsetof(struct nvgpu_draw, indirect) },
+        { offsetof(struct nvgpu_draw, alpha_control), offsetof(struct nvgpu_draw, viewports) },
+    };
+    for (const auto &s : same)
+        if (memcmp((const char *)&d + s.from, (const char *)&l + s.from, s.to - s.from))
+            return false;
+    for (unsigned j = 0; j < 7; j++)
+        if (d.more[j].clear || d.more[j].addr != l.more[j].addr || d.more[j].pitch != l.more[j].pitch ||
+            d.more[j].format != l.more[j].format || d.more[j].blocklinear != l.more[j].blocklinear)
+            return false;
+    for (unsigned s = 0; s < 16; s++)
+        if (d.streams[s].stride != l.streams[s].stride || d.streams[s].divisor != l.streams[s].divisor)
+            return false;
+    if (!malachite_run_room(cb))
+        return false;
+
+    uint8_t *vb = cb->_bank_cpu + cb->_bank_used, *pb = vb + FAST_BANK_STEP;
+    uint64_t vva = cb->_bank_va + cb->_bank_used, pva = vva + FAST_BANK_STEP;
+    cb->_bank_used += FAST_BANK_STEP * 2;
+    memset(vb, 0, FAST_BANK_USED);
+    memset(pb, 0, FAST_BANK_USED);
+    memcpy(vb + 0x160, d.vs_params, d.vs_params_size);
+    int shader_base_vertex = d.index ? d.base_vertex : (int)d.first;
+    memcpy(vb + 0x100, &shader_base_vertex, 4);
+    memcpy(vb + 0x104, &d.base_instance, 4);
+    memcpy(pb + 0x160, d.ps_params, d.ps_params_size);
+    if (d.heap.headers) {
+        memcpy(vb + 0x200, d.vs_textured ? d.vs_handles : d.heap.handles, sizeof(d.heap.handles));
+        memcpy(pb + 0x200, d.heap.handles, sizeof(d.heap.handles));
+    }
+
+    uint32_t *w = cb->_run_cpu + cb->_run_used;
+    const uint32_t *start = w;
+    w += [self fastState:d into:w];
+    *w++ = FAST_MTHD(FAST_CONSTANT_SELECTOR, 3);
+    *w++ = FAST_BANK_BYTES;
+    *w++ = (uint32_t)(vva >> 32);
+    *w++ = (uint32_t)vva;
+    *w++ = FAST_MTHD(FAST_CONSTANT_BIND, 1);
+    *w++ = 1;
+    *w++ = FAST_MTHD(FAST_CONSTANT_SELECTOR, 3);
+    *w++ = FAST_BANK_BYTES;
+    *w++ = (uint32_t)(pva >> 32);
+    *w++ = (uint32_t)pva;
+    *w++ = FAST_MTHD(FAST_CONSTANT_BIND + 4 * 32, 1);
+    *w++ = 1;
+    if (d.heap.headers && (d.heap.headers != l.heap.headers || d.heap.samplers != l.heap.samplers ||
+                           d.heap.nheaders != l.heap.nheaders || d.heap.nsamplers != l.heap.nsamplers)) {
+        *w++ = FAST_MTHD(FAST_HEADER_POOL, 3);
+        *w++ = (uint32_t)(d.heap.headers >> 32);
+        *w++ = (uint32_t)d.heap.headers;
+        *w++ = d.heap.nheaders - 1;
+        *w++ = FAST_MTHD(FAST_SAMPLER_POOL, 3);
+        *w++ = (uint32_t)(d.heap.samplers >> 32);
+        *w++ = (uint32_t)d.heap.samplers;
+        *w++ = (d.heap.nsamplers ? d.heap.nsamplers : d.heap.nheaders) - 1;
+    }
+    if (cb->_bank_new) {
+        cb->_bank_new = false;
+        *w++ = FAST_MTHD(FAST_INVALIDATE_SHADER, 1);
+        *w++ = 1 | 1 << 4 | 1 << 12;
+    }
+    // new heap entries were written for this draw, and need the caches to forget the slots. No texture data flush: a
+    // fast draw follows nothing that wrote a texture, or it would have gone the kernel's way
+    if (d.heap.headers && memcmp(&d.heap, &l.heap, sizeof(d.heap))) {
+        *w++ = FAST_MTHD(FAST_INVALIDATE_HEADER, 1);
+        *w++ = 0;
+        *w++ = FAST_MTHD(FAST_INVALIDATE_SAMPLER, 1);
+        *w++ = 0;
+    }
+    for (unsigned s = 0; s < 16; s++) {
+        const auto &v = d.streams[s];
+        if (v.addr == l.streams[s].addr && v.size == l.streams[s].size)
+            continue;
+        if (!v.addr) {
+            *w++ = FAST_MTHD(FAST_STREAM_FORMAT + s * 16, 1);
+            *w++ = 0;
+            continue;
+        }
+        *w++ = FAST_MTHD(FAST_STREAM_FORMAT + s * 16, 4);
+        *w++ = v.stride | 1 << 12;
+        *w++ = (uint32_t)(v.addr >> 32);
+        *w++ = (uint32_t)v.addr;
+        *w++ = v.divisor;
+        *w++ = FAST_MTHD(FAST_STREAM_SIZE + s * 8, 2);
+        *w++ = 0;
+        *w++ = v.size;
+        *w++ = FAST_MTHD(FAST_STREAM_INSTANCE + s * 4, 1);
+        *w++ = v.divisor != 0;
+    }
+    if (d.base_vertex != l.base_vertex || d.base_instance != l.base_instance) {
+        *w++ = FAST_MTHD(FAST_BASE_VERTEX, 2);
+        *w++ = (uint32_t)d.base_vertex;
+        *w++ = d.base_instance;
+        *w++ = FAST_MTHD(FAST_VERTEX_ID_BASE, 1);
+        *w++ = (uint32_t)d.base_vertex;
+    }
+    *w++ = FAST_MTHD(FAST_DRAW_CONTROL, 2);
+    *w++ = d.primitive | 1 << 9;
+    *w++ = d.instances;
+    if (d.index) {
+        if (d.index != l.index || d.index_size != l.index_size) {
+            *w++ = FAST_MTHD(FAST_INDEX_ADDRESS, 2);
+            *w++ = (uint32_t)(d.index >> 32);
+            *w++ = (uint32_t)d.index;
+            *w++ = FAST_MTHD(FAST_INDEX_SIZE, 2);
+            *w++ = 0;
+            *w++ = d.index_size;
+        }
+        *w++ = FAST_MTHD(FAST_DRAW_INDEXED, 2);
+    } else {
+        *w++ = FAST_MTHD(FAST_DRAW_ARRAYS, 2);
+    }
+    *w++ = d.first;
+    *w++ = d.count;
+    cb->_run_used += (uint32_t)(w - start);
+    if (++cb->_run_draws == FAST_RUN_DRAWS)
+        malachite_run_flush(cb);
+
+    memcpy(_last.streams, d.streams, sizeof(d.streams));
+    _last.heap = d.heap;
+    _last.index = d.index;
+    _last.index_size = d.index_size;
+    _last.base_vertex = d.base_vertex;
+    _last.base_instance = d.base_instance;
+    return true;
+}
+
 // Attachment n sampled as a texture by a draw that draws to it (CoreAnimation reads the backdrop so): the draw
 // samples a copy of it as it was before the draw. Otherwise a pixel reads neighbours the same draw has already
 // covered, and a quad's second triangle samples what its first drew, a streak along the diagonal. A refraction
@@ -4168,13 +5069,13 @@ static MalachiteRenderPipelineState *malachite_copy_pipeline(id<MTLDevice> devic
 
 // The recorder. A recording is a directory of raw files and a manifest.txt of key=value lines naming them, written
 // last; tools/mtl/mtlplay.m describes the keys. A buffer is recorded from its offset to its end (16 MB at most),
-// and a process stops recording once it has written 256 MB.
+// and a process stops recording once it has written 2 GB (a dispatch's buffers are whole, 256 MB each at most).
 enum { MALACHITE_REC_BUFFER = 16 << 20 };
 
 static bool malachite_rec_reserve(uint64_t bytes)
 {
     static uint64_t written;
-    if (__sync_add_and_fetch(&written, bytes) <= 256ull << 20)
+    if (__sync_add_and_fetch(&written, bytes) <= 2ull << 30)
         return true;
     malachite_rec_full = true;
     return false;
@@ -4605,6 +5506,7 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
 // a pass with a clear load action and no draws still clears
 - (void)endEncoding
 {
+    malachite_run_flush((MalachiteCommandBuffer *)_cb);
     bool clears = _pass.clear || _pass.clear_zs;
     for (const struct nvgpu_target &t : _pass.more)
         clears |= t.addr && t.clear;
@@ -4826,8 +5728,6 @@ static uint32_t malachite_vertex_format(MTLVertexFormat f)
 }
 @end
 
-@interface MalachiteCommandBuffer : MTLIOAccelCommandBuffer <MTLCommandBuffer>
-@end
 
 // What the CPU changed in Managed buffers goes to their VRAM copies in a command buffer committed just before cb on
 // its queue: WindowServer's vertices are Managed, so this is on the way of every frame and doesn't wait. That can't
@@ -4835,14 +5735,26 @@ static uint32_t malachite_vertex_format(MTLVertexFormat f)
 // blocks if the app holds them all; those go through a queue of ours, waited for. The caller holds a lock across
 // this, so the copy is in its queue before another thread's commit, and a commit on another queue lets it finish: it
 // has to see the data, and a copy arriving later would overwrite what the GPU has written there since.
+//
+// The wait is for the copy alone, which the last copy of each batch reports by writing its number into a word here. A
+// command buffer's completion can't say that: it comes in order, behind whatever draws were queued before it.
+static uint32_t malachite_upload_sent;
+static id<MTLBuffer> malachite_upload_ack;
+
+static void malachite_upload_wait(void)
+{
+    volatile uint32_t *done = (volatile uint32_t *)malachite_upload_ack.contents;
+    // bounded: a command buffer ahead of the copy can be waiting for an event this commit is to signal
+    for (int i = 0; i < 5000 && (int32_t)(*done - malachite_upload_sent) < 0; i++)
+        usleep(20);
+}
+
 static void malachite_upload_managed(MalachiteCommandBuffer *cb)
 {
-    static id<MTLCommandBuffer> last;
+    static id<MTLCommandQueue> last;
     id<MTLCommandQueue> queue = ((id<MTLCommandBuffer>)cb).commandQueue;
-    if (last && last.commandQueue != queue) {
-        // bounded: a command buffer ahead of the copy can be waiting for an event this commit is to signal
-        for (int i = 0; i < 5000 && last.status < MTLCommandBufferStatusCompleted; i++)
-            usleep(20);
+    if (last && last != queue) {
+        malachite_upload_wait();
         last = nil;
     }
     NSArray<MalachiteBuffer *> *work;
@@ -4863,6 +5775,8 @@ static void malachite_upload_managed(MalachiteCommandBuffer *cb)
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         own = [((id<MTLCommandBuffer>)cb).device newCommandQueue];
+        malachite_upload_ack = [((id<MTLCommandBuffer>)cb).device newBufferWithLength:64
+                                                                              options:MTLResourceStorageModeShared];
     });
     bool direct = ((id<MTLCommandBuffer>)cb).status < MTLCommandBufferStatusEnqueued &&
                   [(MTLIOAccelCommandQueue *)queue maxCommandBufferCount] >= 32;
@@ -4878,19 +5792,42 @@ static void malachite_upload_managed(MalachiteCommandBuffer *cb)
         p.size = hi - lo;
         malachite_keep(u, b);
         malachite_keep(u, b->_mirror);
-        malachite_record(u, MALACHITE_CMD_COPY_BUF2BUF, &p, sizeof(p));
+        malachite_record(u, MALACHITE_CMD_UPLOAD, &p, sizeof(p));
     }
+    ((uint32_t *)malachite_upload_ack.contents)[1] = ++malachite_upload_sent;
+    struct malachite_copy_buf2buf ack = {};
+    ack.srcAddr = malachite_upload_ack.gpuAddress + 4;
+    ack.dstAddr = malachite_upload_ack.gpuAddress;
+    ack.size = 4;
+    malachite_keep(u, malachite_upload_ack);
+    malachite_record(u, MALACHITE_CMD_UPLOAD, &ack, sizeof(ack));
     [u commit];
     if (direct)
-        last = u;
+        last = queue;
     else
-        [u waitUntilCompleted];
+        malachite_upload_wait();
+}
+
+// the copies back of what the command buffer's OpenCL kernels wrote (MalachiteBuffer _writeback), after them
+static void malachite_write_back(MalachiteCommandBuffer *cb)
+{
+    for (MalachiteBuffer *b in cb->_writeback) {
+        struct malachite_copy_buf2buf p = {};
+        p.srcAddr = [b->_mirror gpuAddress];
+        p.dstAddr = [b systemAddress];
+        p.size = b.length;
+        malachite_keep(cb, b);
+        malachite_keep(cb, b->_mirror);
+        malachite_record(cb, MALACHITE_CMD_COPY_BUF2BUF, &p, sizeof(p));
+    }
+    cb->_writeback = nil;
 }
 
 @implementation MalachiteCommandBuffer
 // the trace: a command buffer whose completion comes late, from commit to its completed handlers
 - (void)commit
 {
+    malachite_write_back(self);
     if (malachite_trace) {
         uint64_t start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         [self addCompletedHandler:^(id<MTLCommandBuffer>) {
@@ -4899,10 +5836,60 @@ static void malachite_upload_managed(MalachiteCommandBuffer *cb)
                 os_log(OS_LOG_DEFAULT, "Malachite trace: command buffer completed %llu ms after commit", ms);
         }];
     }
+    malachite_run_flush(self);
+    malachite_end_segment(self);
     @synchronized([MalachiteCommandBuffer class]) {
         malachite_upload_managed(self);
     }
     [super commit];
+}
+
+// WindowServer's every frame. The base enqueues before it commits, which would send the upload to the queue that's
+// waited for: until the GPU has finished what other processes queued, a game's next frames among them.
+- (void)commitAndWaitUntilSubmitted
+{
+    malachite_write_back(self);
+    malachite_run_flush(self);
+    malachite_end_segment(self);
+    @synchronized([MalachiteCommandBuffer class]) {
+        malachite_upload_managed(self);
+    }
+    [super commitAndWaitUntilSubmitted];
+}
+
+// A drawable goes to WindowServer once its draws are done, not once they're scheduled. WindowServer reads it with no
+// wait of its own, so one sent early would show half drawn, and the frame after it would replace it on screen.
+- (void)presentDrawable:(id<MTLDrawable>)drawable
+{
+    if (opengl_renderer) {
+        [super presentDrawable:drawable];
+        return;
+    }
+    [self addCompletedHandler:^(id<MTLCommandBuffer>) {
+        [drawable present];
+    }];
+}
+
+- (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time
+{
+    if (opengl_renderer) {
+        [super presentDrawable:drawable atTime:time];
+        return;
+    }
+    [self addCompletedHandler:^(id<MTLCommandBuffer>) {
+        [drawable presentAtTime:time];
+    }];
+}
+
+- (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration
+{
+    if (opengl_renderer) {
+        [super presentDrawable:drawable afterMinimumDuration:duration];
+        return;
+    }
+    [self addCompletedHandler:^(id<MTLCommandBuffer>) {
+        [drawable presentAfterMinimumDuration:duration];
+    }];
 }
 
 - (id)blitCommandEncoder
@@ -4964,15 +5951,122 @@ static void malachite_upload_managed(MalachiteCommandBuffer *cb)
 @protocol MTLDeviceSPI <MTLDevice>
 @end
 
-// A heap without suballocation: each resource is allocated from the device on its own, and the heap only keeps
-// the accounting a client reads back.
-@interface MalachiteHeap : NSObject <MTLHeap> {
-@public
-    __weak id _device;
-    MTLHeapDescriptor *_desc;
-    NSUInteger _used;
+@interface MalachiteDevice : MTLIOAccelDevice <MTLDeviceSPI>
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor heap:(MalachiteHeap *)heap offset:(NSUInteger)offset;
+@end
+
+// a resource's range of a heap: whole pages. An image needs its GOBs on 512 bytes, as its layers and levels are
+// already, and nothing in a heap's memory takes a PTE kind (see newImage:layout:placed:).
+static MTLSizeAndAlign malachite_range_in_heap(uint64_t bytes)
+{
+    NSUInteger page = vm_page_size;
+    return (MTLSizeAndAlign){ (MAX(bytes, 1ull) + page - 1) & ~(NSUInteger)(page - 1), page };
 }
-@property (copy) NSString *label;
+
+@implementation MalachiteHeapBuffer
+- (id)device
+{
+    return _heap->_device;
+}
+
+- (NSUInteger)length
+{
+    return _length;
+}
+
+- (NSUInteger)allocatedSize
+{
+    return _size;
+}
+
+- (void *)contents
+{
+    uint8_t *base = (uint8_t *)_heap->_block.contents;
+    return base ? base + _offset : NULL;
+}
+
+- (uint64_t)gpuAddress
+{
+    return [(MTLIOAccelBuffer *)_heap->_block gpuAddress] + _offset;
+}
+
+- (id<MTLHeap>)heap
+{
+    return _heap;
+}
+
+- (NSUInteger)heapOffset
+{
+    return _offset;
+}
+
+- (MTLStorageMode)storageMode
+{
+    return (MTLStorageMode)((_options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift);
+}
+
+- (MTLCPUCacheMode)cpuCacheMode
+{
+    return (MTLCPUCacheMode)(_options & MTLResourceCPUCacheModeMask);
+}
+
+- (MTLHazardTrackingMode)hazardTrackingMode
+{
+    return _heap->_desc.hazardTrackingMode;
+}
+
+- (MTLResourceOptions)resourceOptions
+{
+    return _options;
+}
+
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
+{
+    return MTLPurgeableStateNonVolatile;
+}
+
+- (void)makeAliasable
+{
+    if (_aliasable)
+        return;
+    _aliasable = true;
+    [_heap giveBack:_offset size:_size];
+}
+
+- (BOOL)isAliasable
+{
+    return _aliasable;
+}
+
+- (void)didModifyRange:(NSRange)range
+{
+    [_heap->_block didModifyRange:NSMakeRange(_offset + range.location, range.length)];
+}
+
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bytesPerRow
+{
+    return [_heap->_block newTextureWithDescriptor:descriptor offset:_offset + offset bytesPerRow:bytesPerRow];
+}
+
+- (void)addDebugMarker:(NSString *)marker range:(NSRange)range
+{
+}
+
+- (void)removeAllDebugMarkers
+{
+}
+
+// anything else the block answers for, as the IOAccel resource underneath this
+- (id)forwardingTargetForSelector:(SEL)selector
+{
+    return _heap->_block;
+}
+
+- (void)dealloc
+{
+    if (!_aliasable)
+        [_heap giveBack:_offset size:_size];
+}
 @end
 
 @implementation MalachiteHeap
@@ -5003,7 +6097,7 @@ static void malachite_upload_managed(MalachiteCommandBuffer *cb)
 
 - (MTLHeapType)type
 {
-    return MTLHeapTypeAutomatic;
+    return _desc.type;
 }
 
 - (NSUInteger)protectionOptions
@@ -5018,7 +6112,10 @@ static void malachite_upload_managed(MalachiteCommandBuffer *cb)
 
 - (NSUInteger)usedSize
 {
-    return _used;
+    os_unfair_lock_lock(&_lock);
+    NSUInteger used = _desc.size - _free;
+    os_unfair_lock_unlock(&_lock);
+    return used;
 }
 
 - (NSUInteger)currentAllocatedSize
@@ -5028,7 +6125,15 @@ static void malachite_upload_managed(MalachiteCommandBuffer *cb)
 
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment
 {
-    return _used < _desc.size ? _desc.size - _used : 0;
+    NSUInteger best = 0, align = MAX(alignment, vm_page_size);
+    os_unfair_lock_lock(&_lock);
+    for (auto &h : _holes) {
+        NSUInteger at = (h.first + align - 1) & ~(align - 1);
+        if (at < h.first + h.second)
+            best = MAX(best, h.first + h.second - at);
+    }
+    os_unfair_lock_unlock(&_lock);
+    return best;
 }
 
 - (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
@@ -5036,36 +6141,104 @@ static void malachite_upload_managed(MalachiteCommandBuffer *cb)
     return MTLPurgeableStateNonVolatile;
 }
 
+- (void)giveBack:(NSUInteger)offset size:(NSUInteger)size
+{
+    if (_desc.type == MTLHeapTypePlacement)  // nothing was taken
+        return;
+    os_unfair_lock_lock(&_lock);
+    _free += size;
+    auto next = _holes.lower_bound(offset);
+    if (next != _holes.end() && offset + size == next->first) {
+        size += next->second;
+        next = _holes.erase(next);
+    }
+    auto prev = next != _holes.begin() ? std::prev(next) : _holes.end();
+    if (prev != _holes.end() && prev->first + prev->second == offset)
+        prev->second += size;
+    else
+        _holes[offset] = size;
+    os_unfair_lock_unlock(&_lock);
+}
+
+// the free range [offset, offset + size) taken out of whichever hole holds it; false if no hole does
+- (bool)take:(NSUInteger)offset size:(NSUInteger)size
+{
+    auto h = _holes.upper_bound(offset);
+    if (h == _holes.begin())
+        return false;
+    h = std::prev(h);
+    NSUInteger start = h->first, len = h->second;
+    if (offset + size > start + len)
+        return false;
+    _holes.erase(h);
+    if (offset > start)
+        _holes[start] = offset - start;
+    if (offset + size < start + len)
+        _holes[offset + size] = start + len - offset - size;
+    _free -= size;
+    return true;
+}
+
+// A resource's range of the block: in a placement heap at offset, which must be aligned as the range is; in an
+// automatic one at offset if that's free, else in the first hole it fits aligned. nil when it doesn't fit.
+- (MalachiteHeapBuffer *)place:(NSUInteger)length
+                          size:(MTLSizeAndAlign)range
+                       options:(MTLResourceOptions)options
+                            at:(NSUInteger)offset
+{
+    if (_desc.type == MTLHeapTypePlacement) {
+        if (offset == NSNotFound || offset % range.align || offset > _desc.size || range.size > _desc.size - offset)
+            return nil;
+    } else {
+        os_unfair_lock_lock(&_lock);
+        if (offset == NSNotFound)
+            for (auto &h : _holes) {
+                NSUInteger at = (h.first + range.align - 1) & ~(range.align - 1);
+                if (at + range.size <= h.first + h.second) {
+                    offset = at;
+                    break;
+                }
+            }
+        bool found = offset != NSNotFound && [self take:offset size:range.size];
+        os_unfair_lock_unlock(&_lock);
+        if (!found)
+            return nil;
+    }
+    MalachiteHeapBuffer *b = [MalachiteHeapBuffer new];
+    b->_heap = self;
+    b->_offset = offset;
+    b->_length = length;
+    b->_size = range.size;
+    b->_options = options;
+    return b;
+}
+
 - (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
 {
-    _used += length;
-    return [_device newBufferWithLength:length options:options];
+    return [self place:length size:malachite_range_in_heap(length) options:options at:NSNotFound];
 }
 
 - (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options offset:(NSUInteger)offset
 {
-    return [self newBufferWithLength:length options:options];
+    return [self place:length size:malachite_range_in_heap(length) options:options at:offset];
 }
 
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
-    return [_device newTextureWithDescriptor:descriptor];
+    return [(MalachiteDevice *)_device newTextureWithDescriptor:descriptor heap:self offset:NSNotFound];
 }
 
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset
 {
-    return [_device newTextureWithDescriptor:descriptor];
+    return [(MalachiteDevice *)_device newTextureWithDescriptor:descriptor heap:self offset:offset];
 }
-@end
-
-@interface MalachiteDevice : MTLIOAccelDevice <MTLDeviceSPI>
-- (id)newImage:(MTLTextureDescriptor *)descriptor;
 @end
 
 // Reflection, as much as OpenGL's renderer reads: each function's arguments (it finds a GL program's uniform buffer,
 // textures and samplers by name), and the GL converter's return data. Both are kept on the function when it's
 // compiled.
 static const char malachite_return_key = 0, malachite_arguments_key = 0;
+static const char malachite_cl_program_key = 0;  // an OpenCL kernel's arguments as its program counts them
 
 @interface MalachiteArgument : NSObject
 @property (copy) NSString *name;
@@ -5074,17 +6247,23 @@ static const char malachite_return_key = 0, malachite_arguments_key = 0;
 @property MTLTextureType textureType;
 @property MTLDataType textureDataType;
 @property BOOL isDepthTexture;
+@property (strong) id dataTypeDescription;  // an OpenCL buffer's: whether it's a __constant one
+@property NSUInteger bufferDataSize;        // an OpenCL argument passed by value: its bytes
+@property BOOL inactive;
+@property MTLBindingAccess access;  // OpenCL syncs a Managed buffer back after a kernel that may write it
+@end
+
+@interface MalachitePointerType : NSObject
+@property BOOL isConstantBuffer;
+@end
+
+@implementation MalachitePointerType
 @end
 
 @implementation MalachiteArgument
 - (BOOL)isActive
 {
-    return YES;
-}
-
-- (MTLBindingAccess)access
-{
-    return MTLBindingAccessReadOnly;
+    return !self.inactive;
 }
 
 - (NSUInteger)arrayLength
@@ -5116,14 +6295,18 @@ static NSArray<MalachiteArgument *> *malachite_arguments(const struct malachite_
     NSMutableArray *args = [NSMutableArray array];
     for (uint32_t i = 0; i < k->h.nargs; i++) {
         unsigned kind = k->h.args[i].kind;
-        if (kind != NVK_ARG_BUFFER && kind != NVK_ARG_TEXTURE && kind != NVK_ARG_SAMPLER)
+        // threadgroup memory too: OpenCL takes an argument's index from its place in this list, and a __local one
+        // left out moved every one after it
+        if (kind != NVK_ARG_BUFFER && kind != NVK_ARG_TEXTURE && kind != NVK_ARG_SAMPLER && kind != NVK_ARG_THREADGROUP)
             continue;
         MalachiteArgument *a = [MalachiteArgument new];
         a.name = @(k->arg_names[i].name);
         a.index = k->h.args[i].index;
-        a.type = kind == NVK_ARG_BUFFER ? MTLArgumentTypeBuffer
+        a.access = (MTLBindingAccess)k->h.args[i].access;
+        a.type = kind == NVK_ARG_BUFFER    ? MTLArgumentTypeBuffer
                  : kind == NVK_ARG_TEXTURE ? MTLArgumentTypeTexture
-                                           : MTLArgumentTypeSampler;
+                 : kind == NVK_ARG_SAMPLER ? MTLArgumentTypeSampler
+                                           : MTLArgumentTypeThreadgroupMemory;
         if (kind == NVK_ARG_TEXTURE) {  // from the type's name: depth2d<float, sample>, texture2d_array<half>...
             const char *t = k->arg_names[i].type;
             a.isDepthTexture = !strncmp(t, "depth", 5);
@@ -5141,6 +6324,50 @@ static NSArray<MalachiteArgument *> *malachite_arguments(const struct malachite_
                                                      : MTLDataTypeFloat;
         }
         [args addObject:a];
+    }
+    return args;
+}
+
+// An OpenCL kernel's pipeline reflection: the renderer's own buffers 0-2 first (GLDKernelRec::initWithConfig asks
+// whether 1 and 2 are active, and our kernels read neither), then its arguments
+static NSArray<MalachiteArgument *> *malachite_cl_pipeline_arguments(const struct malachite_compiled *k)
+{
+    NSMutableArray *args = [NSMutableArray array];
+    for (NSUInteger i = 0; i < MALACHITE_CL_FIRST; i++) {
+        MalachiteArgument *a = [MalachiteArgument new];
+        a.name = [NSString stringWithFormat:@"__implicit%lu", (unsigned long)i];
+        a.index = i;
+        a.type = MTLArgumentTypeBuffer;
+        a.inactive = YES;
+        [args addObject:a];
+    }
+    [args addObjectsFromArray:malachite_arguments(k)];
+    return args;
+}
+
+// An OpenCL kernel's arguments as building its program counts them (GLDComputeProgramRec::buildComputeProgram,
+// from the function's reflectionWithOptions:): each in its own place, a buffer a pointer, one passed by value
+// argument type 0x16 with its bytes in bufferDataSize
+static NSArray<MalachiteArgument *> *malachite_cl_program_arguments(const struct malachite_compiled *k)
+{
+    NSMutableArray *args = [NSMutableArray array];
+    for (uint32_t i = 0; i < k->h.nargs; i++) {
+        const struct nvk_arg *a = &k->h.args[i];
+        if (a->kind != NVK_ARG_BUFFER && a->kind != NVK_ARG_THREADGROUP && a->kind != NVK_ARG_TEXTURE &&
+            a->kind != NVK_ARG_SAMPLER)
+            continue;
+        MalachiteArgument *arg = [MalachiteArgument new];
+        arg.name = @(k->arg_names[i].name);
+        arg.index = a->index;
+        arg.access = (MTLBindingAccess)a->access;
+        arg.type = a->kind == NVK_ARG_THREADGROUP ? MTLArgumentTypeThreadgroupMemory
+                   : a->kind == NVK_ARG_TEXTURE   ? MTLArgumentTypeTexture
+                   : a->kind == NVK_ARG_SAMPLER   ? MTLArgumentTypeSampler
+                   : a->size                      ? (MTLArgumentType)0x16
+                                                  : MTLArgumentTypeBuffer;
+        arg.bufferDataSize = a->size;
+        arg.dataTypeDescription = [MalachitePointerType new];
+        [args addObject:arg];
     }
     return args;
 }
@@ -5173,6 +6400,35 @@ static NSArray<MalachiteArgument *> *malachite_arguments(const struct malachite_
     return nil;
 }
 @end
+
+// Building an OpenCL program counts each kernel's arguments from the function's reflection (reflectionWithOptions:,
+// in GLDComputeProgramRec::buildComputeProgram), which Metal's compiler service makes from the AIR without the
+// vendor's word on them: zero, and every clSetKernelArg failed. A kernel of ours answers with its arguments, compiled
+// first if it hasn't been.
+static IMP malachite_reflection_orig;
+
+static id malachite_function_reflection(id self, SEL cmd, NSUInteger options)
+{
+    id<MTLFunction> function = self;
+    if ([function.name hasPrefix:@"__entry_"] && [function.device isKindOfClass:[MalachiteDevice class]]) {
+        if (!objc_getAssociatedObject(function, &malachite_cl_program_key))
+            [(MalachiteDevice *)function.device newComputePipelineStateWithFunction:function error:nil];
+        NSArray *args = objc_getAssociatedObject(function, &malachite_cl_program_key);
+        if (args) {
+            MalachiteComputeReflection *r = [MalachiteComputeReflection new];
+            r.arguments = args;
+            return r;
+        }
+    }
+    return ((id(*)(id, SEL, NSUInteger))malachite_reflection_orig)(self, cmd, options);
+}
+
+static void malachite_hook_function_reflection(void)
+{
+    Method m = class_getInstanceMethod(objc_getClass("_MTLFunction"), sel_registerName("reflectionWithOptions:"));
+    if (m && !malachite_reflection_orig)
+        malachite_reflection_orig = method_setImplementation(m, (IMP)malachite_function_reflection);
+}
 
 @implementation MalachiteDevice
 
@@ -5371,24 +6627,29 @@ static uint64_t malachite_vram(void)
     return [self newIndirectArgumentEncoderWithLayout:layout];
 }
 
+// A sparse heap maps its pages as resources ask for them, which nothing here does: no heap.
 - (id)newHeapWithDescriptor:(MTLHeapDescriptor *)descriptor
 {
+    if (descriptor.type == MTLHeapTypeSparse)
+        return nil;
+    NSUInteger page = vm_page_size, size = (descriptor.size + page - 1) & ~(page - 1);
     MalachiteHeap *h = [MalachiteHeap new];
     h->_device = self;
     h->_desc = [descriptor copy];
+    h->_desc.size = size;
+    h->_lock = OS_UNFAIR_LOCK_INIT;
+    h->_block = size ? [self newBufferWithLength:size options:descriptor.resourceOptions] : nil;
+    // out of VRAM the block gets no address the GPU can reach: no heap, as Metal answers when it can't make one
+    if (!h->_block || [(MTLIOAccelBuffer *)h->_block gpuAddress] >> 50)
+        return nil;
+    h->_holes[0] = size;
+    h->_free = size;
     return h;
 }
 
 - (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length options:(MTLResourceOptions)options
 {
-    return (MTLSizeAndAlign){ (length + vm_page_size - 1) & ~(NSUInteger)(vm_page_size - 1), vm_page_size };
-}
-
-- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)descriptor
-{
-    NSUInteger bpp = malachite_bytes_per_pixel(descriptor.pixelFormat);
-    NSUInteger size = ((descriptor.width * (bpp ? bpp : 8) + 255) & ~(NSUInteger)255) * descriptor.height;
-    return (MTLSizeAndAlign){ (size + vm_page_size - 1) & ~(NSUInteger)(vm_page_size - 1), vm_page_size };
+    return malachite_range_in_heap(length);
 }
 
 - (id)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(NSUInteger)options
@@ -5399,23 +6660,42 @@ static uint64_t malachite_vram(void)
     return b;
 }
 
-// the storage a texture's buffer takes: private (VRAM) when the texture is, shared otherwise. A managed one the GPU
-// only reads is managed here too, with the VRAM copy; one it renders or writes to stays in shared memory, since
-// callers read what it holds without the synchronizeTexture: a VRAM copy would need
+// The storage a texture's buffer takes. One the GPU renders to or writes is in VRAM whatever storage it asked for,
+// and the CPU reaches its pixels through a copy (copyRegion:): iOS code makes its render targets shared, which costs
+// nothing on Apple's GPUs, and in system memory here every pass of Genshin's went across PCIe, 7.5 billion pixels in
+// 10 s, at 5 fps. One the GPU only reads stays where it asked to be (a managed one with its VRAM copy): a blit may
+// still write it, and a shared one is read back after that with nothing to say so.
 static MTLResourceOptions malachite_storage(MTLTextureDescriptor *descriptor)
 {
-    if (descriptor.storageMode == MTLStorageModePrivate)
-        return MTLResourceStorageModePrivate;
     bool gpu_writes = descriptor.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite);
-    return descriptor.storageMode == MTLStorageModeManaged && !gpu_writes ? MTLResourceStorageModeManaged
-                                                                          : MTLResourceStorageModeShared;
+    if (descriptor.storageMode == MTLStorageModePrivate || descriptor.storageMode == MTLStorageModeMemoryless ||
+        gpu_writes)
+        return MTLResourceStorageModePrivate;
+    return descriptor.storageMode == MTLStorageModeManaged ? MTLResourceStorageModeManaged : MTLResourceStorageModeShared;
 }
 
-// A texture of its own. A plain 2D one (a 1D one, a 1D array) is linear rows in a buffer made for it, the pitch
-// 256-byte aligned so it can be a render target as well as sampled; 1D textures are a row, 1D arrays a row per
-// layer. Anything else is an image.
-- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+// a texture the device made, told the storage it asked for where that isn't where it is
+static void malachite_storage_asked(MalachiteTexture *t, MTLTextureDescriptor *descriptor)
 {
+    if (!t)
+        return;
+    t->_asked = descriptor.storageMode;
+    t->_moved = true;
+}
+
+// How the device lays a texture out. A plain 2D one (a 1D one, a 1D array) is linear rows, the pitch 256-byte
+// aligned so it can be a render target as well as sampled; 1D textures are a row, 1D arrays a row per layer. Anything
+// else is an image, its layers stride apart. bytes is 0 for a texture the device can't make.
+struct malachite_layout {
+    bool image;
+    NSUInteger pitch, height;  // an image's: level 0's row of GOBs, and its height
+    uint32_t depth, layers, levels, samples;
+    uint64_t stride, bytes;
+};
+
+static struct malachite_layout malachite_layout_of(MTLTextureDescriptor *descriptor)
+{
+    struct malachite_layout l = {};
     MTLTextureType type = descriptor.textureType;
     int f = malachite_format(descriptor.pixelFormat);
     uint32_t zbpp;
@@ -5426,55 +6706,107 @@ static MTLResourceOptions malachite_storage(MTLTextureDescriptor *descriptor)
         (type == MTLTextureType1DArray && descriptor.mipmapLevelCount > 1)) {
         os_log(OS_LOG_DEFAULT, "MalachiteDevice: unsupported texture (type %lu, %lu levels, format %lu)",
                (unsigned long)type, (unsigned long)descriptor.mipmapLevelCount, (unsigned long)descriptor.pixelFormat);
-        return nil;
+        return l;
     }
-    if (!plain || zeta || descriptor.mipmapLevelCount > 1 || tex_format_info((enum tex_format)f).block > 1)
-        return malachite_swizzled([self newImage:descriptor], descriptor.swizzle);
-    NSUInteger pitch = (descriptor.width * tex_format_info((enum tex_format)f).bytes + 255) & ~(NSUInteger)255;
+    // a 2D render target is an image too, block-linear: the texture unit reads pitch-linear rows with little reuse
+    // of what it cached, and passes sampling Genshin's render targets took 1-2 ms each
+    bool target = type == MTLTextureType2D && (descriptor.usage & MTLTextureUsageRenderTarget) &&
+                  malachite_storage(descriptor) == MTLResourceStorageModePrivate;
+    if (plain && !zeta && !target && descriptor.mipmapLevelCount == 1 && tex_format_info((enum tex_format)f).block == 1) {
+        l.pitch = (descriptor.width * tex_format_info((enum tex_format)f).bytes + 255) & ~(NSUInteger)255;
+        l.height = type == MTLTextureType1DArray ? descriptor.arrayLength : descriptor.height;
+        l.bytes = l.pitch * l.height;
+        return l;
+    }
+    l.image = true;
+    l.depth = type == MTLTextureType3D ? (uint32_t)descriptor.depth : 1;
+    l.height = type == MTLTextureType1D ? 1 : descriptor.height;
+    l.layers = (uint32_t)descriptor.arrayLength * (malachite_is_cube(type) ? 6 : 1);
+    l.levels = (uint32_t)descriptor.mipmapLevelCount;
+    bool ms = type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;
+    l.samples = ms && descriptor.sampleCount > 1 ? (uint32_t)descriptor.sampleCount : 0;
+    uint32_t sx, sy;
+    malachite_grid(l.samples, &sx, &sy);
+    l.stride = malachite_image_level(descriptor.pixelFormat, descriptor.width * sx, l.height * sy, l.depth, l.levels).offset;
+    l.pitch = malachite_image_level(descriptor.pixelFormat, descriptor.width * sx, l.height * sy, l.depth, 0).pitch;
+    l.bytes = l.stride * l.layers;
+    return l;
+}
+
+- (MTLSizeAndAlign)heapTextureSizeAndAlignWithDescriptor:(MTLTextureDescriptor *)descriptor
+{
+    return malachite_range_in_heap(malachite_layout_of(descriptor).bytes);
+}
+
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+{
+    return [self newTextureWithDescriptor:descriptor heap:nil offset:0];
+}
+
+// A texture of its own, or with heap, in a range of the heap's memory: at offset, or for NSNotFound wherever the heap
+// has room.
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor heap:(MalachiteHeap *)heap offset:(NSUInteger)offset
+{
+    struct malachite_layout l = malachite_layout_of(descriptor);
+    if (!l.bytes)
+        return nil;
+    MalachiteHeapBuffer *placed =
+        heap ? [heap place:l.bytes size:malachite_range_in_heap(l.bytes) options:heap.resourceOptions at:offset] : nil;
+    if (heap && !placed)
+        return nil;
+    if (l.image)
+        return malachite_swizzled([self newImage:descriptor layout:l placed:placed], descriptor.swizzle);
     MTLTextureDescriptor *d2 = [descriptor copy];
     d2.textureType = MTLTextureType2D;
-    d2.height = type == MTLTextureType1DArray ? descriptor.arrayLength : descriptor.height;
+    d2.height = l.height;
     d2.arrayLength = 1;
-    MalachiteBuffer *buf = [self newBufferWithLength:pitch * d2.height options:malachite_storage(descriptor)];
-    MalachiteTexture *t = [buf newTextureWithDescriptor:d2 offset:0 bytesPerRow:pitch];
+    MalachiteBuffer *buf = placed ? (MalachiteBuffer *)heap->_block
+                                  : [self newBufferWithLength:l.bytes options:malachite_storage(descriptor)];
+    MalachiteTexture *t = [buf newTextureWithDescriptor:d2 offset:placed.heapOffset bytesPerRow:l.pitch];
     if (t) {
         t->_owned = buf;
-        t->_type = type;
+        t->_placed = placed;
+        t->_type = descriptor.textureType;
     }
+    if (!placed)  // one in a heap is in the heap's storage
+        malachite_storage_asked(t, descriptor);
     return malachite_swizzled(t, descriptor.swizzle);
 }
 
-// An image: its layer's levels one after another, the layers after each other, in a buffer made for it. A depth/
-// stencil one is also a target the Z/S hardware renders to, which only renders block-linear.
-- (id)newImage:(MTLTextureDescriptor *)descriptor
+// An image: its layer's levels one after another, the layers after each other, in a buffer made for it or its range
+// of a heap. A depth/stencil one is also a target the Z/S hardware renders to, which only renders block-linear, and
+// its memory takes the target's PTE kind. The kernel gives a kind to a whole buffer's mapping (set_kind), which would
+// have the heap's other resources read through a Z kind, so one made in a heap still has a buffer of its own, its
+// range of the heap held for it unused.
+- (id)newImage:(MTLTextureDescriptor *)descriptor layout:(struct malachite_layout)l placed:(MalachiteHeapBuffer *)placed
 {
-    MTLTextureType type = descriptor.textureType;
-    uint32_t depth = type == MTLTextureType3D ? (uint32_t)descriptor.depth : 1;
-    NSUInteger height = type == MTLTextureType1D ? 1 : descriptor.height;
-    uint32_t layers = (uint32_t)descriptor.arrayLength * (malachite_is_cube(type) ? 6 : 1);
-    uint32_t levels = (uint32_t)descriptor.mipmapLevelCount;
-    bool ms = type == MTLTextureType2DMultisample || type == MTLTextureType2DMultisampleArray;
-    uint32_t samples = ms && descriptor.sampleCount > 1 ? (uint32_t)descriptor.sampleCount : 0, sx, sy;
-    malachite_grid(samples, &sx, &sy);
-    uint64_t stride = malachite_image_level(descriptor.pixelFormat, descriptor.width * sx, height * sy, depth, levels).offset;
-    uint64_t size = (stride * layers + 0xffff) & ~(uint64_t)0xffff;
-    MalachiteBuffer *buf = [self newBufferWithLength:size options:malachite_storage(descriptor)];
+    uint32_t zbpp;
+    uint8_t kind;
+    bool own = !placed || malachite_zeta(descriptor.pixelFormat, &zbpp, &kind);
+    MalachiteBuffer *buf = own ? [self newBufferWithLength:(l.bytes + 0xffff) & ~(uint64_t)0xffff
+                                                   options:malachite_storage(descriptor)]
+                               : (MalachiteBuffer *)placed->_heap->_block;
     MalachiteTexture *t = malachite_image_over(buf, descriptor.usage);
     if (!t)
         return nil;
-    buf->_one_image = true;
+    if (own)
+        buf->_one_image = true;
     t->_owned = buf;
-    t->_type = type;
-    t->_pitch = malachite_image_level(descriptor.pixelFormat, descriptor.width * sx, height * sy, depth, 0).pitch;
-    t->_samples = samples;
+    t->_placed = placed;
+    t->_offset = own ? 0 : placed->_offset;
+    t->_type = descriptor.textureType;
+    t->_pitch = (uint32_t)l.pitch;
+    t->_samples = l.samples;
     t->_format = descriptor.pixelFormat;
     t->_width = descriptor.width;
-    t->_height = height;
-    t->_depth = depth;
-    t->_layers = layers;
-    t->_levels = t->_image_levels = levels;
-    t->_layer_stride = stride;
+    t->_height = l.height;
+    t->_depth = l.depth;
+    t->_layers = l.layers;
+    t->_levels = t->_image_levels = l.levels;
+    t->_layer_stride = l.stride;
     t->_zt_format = malachite_zeta(descriptor.pixelFormat, &t->_zt_bpp, &t->_zt_kind);
+    if (own)
+        malachite_storage_asked(t, descriptor);
     return t;
 }
 
@@ -5678,10 +7010,12 @@ static void malachite_cache_hash(CC_SHA256_CTX *c, const void *p, size_t n)
 }
 
 static void malachite_cache_key(uint8_t key[CC_SHA256_DIGEST_LENGTH], NSData *air, NSArray<NSData *> *bitcode,
-                            NSArray<NSString *> *names, const struct airc_varyings *vertex)
+                            NSArray<NSString *> *names, const struct airc_varyings *vertex,
+                            const struct airc_stage_in *stage_in)
 {
     // a fragment function's inputs pair with the vertex outputs by name, or in order without any
-    uint32_t fixed[3] = { getenv("AIRC_SERIAL") != NULL, (uint32_t)bitcode.count, vertex ? vertex->n : UINT32_MAX };
+    uint32_t fixed[4] = { getenv("AIRC_SERIAL") != NULL, (uint32_t)bitcode.count, vertex ? vertex->n : UINT32_MAX,
+                          stage_in != NULL };
     CC_SHA256_CTX c;
     CC_SHA256_Init(&c);
     CC_SHA256_Update(&c, malachite_cache.identity, sizeof(malachite_cache.identity));
@@ -5693,6 +7027,8 @@ static void malachite_cache_key(uint8_t key[CC_SHA256_DIGEST_LENGTH], NSData *ai
     }
     for (uint32_t i = 0; vertex && i < vertex->n; i++)
         malachite_cache_hash(&c, vertex->names[i], strnlen(vertex->names[i], AIRC_NAME));
+    if (stage_in)
+        malachite_cache_hash(&c, stage_in, sizeof(*stage_in));
     CC_SHA256_Final(key, &c);
 }
 
@@ -5881,15 +7217,17 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
 
 - (id<MTLBuffer>)compile:(id<MTLFunction>)function header:(struct nvk_header *)h error:(NSError **)error
 {
-    return [self compile:function linked:nil vertex:NULL outputs:NULL header:h error:error];
+    return [self compile:function linked:nil vertex:NULL stageIn:NULL outputs:NULL header:h error:error];
 }
 
 // Compile a function's AIR to SASS with airc, in process, into a GPU-mapped buffer. nil (and *error) on failure.
 // The pipeline's linked functions are what the function's visible-function calls resolve to; a fragment function's
-// inputs are paired with the vertex function's outputs (vertex) by name, and a vertex function's are given back.
+// inputs are paired with the vertex function's outputs (vertex) by name, and a vertex function's are given back;
+// a kernel's stage input is fetched as stageIn lays it out.
 - (id<MTLBuffer>)compile:(id<MTLFunction>)function
                   linked:(MTLLinkedFunctions *)linked
                   vertex:(const struct airc_varyings *)vertex
+                 stageIn:(const struct airc_stage_in *)stageIn
                  outputs:(struct airc_varyings *)outputs
                   header:(struct nvk_header *)h
                    error:(NSError **)error
@@ -5947,7 +7285,7 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
     bool cached = !over && malachite_cache_init();
     uint8_t key[CC_SHA256_DIGEST_LENGTH];
     if (cached)
-        malachite_cache_key(key, air, bitcode, names, vertex);
+        malachite_cache_key(key, air, bitcode, names, vertex, stageIn);
     NSData *entry = cached ? malachite_cache_load(key) : nil;
     NSString *why = nil;
     if (!entry) {
@@ -5955,7 +7293,8 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
         for (NSUInteger i = 0; i < bitcode.count; i++)
             sources[i] = (struct airc_source){ bitcode[i].bytes, bitcode[i].length, names[i].UTF8String };
         os_unfair_lock_lock(&malachite_airc_lock);
-        if (airc_compile_linked(air.bytes, air.length, sources, (unsigned)bitcode.count, vertex, NULL, 0, 0, &k))
+        if (airc_compile_linked(air.bytes, air.length, sources, (unsigned)bitcode.count, vertex, stageIn, NULL, 0, 0,
+                                &k))
             why = @(k.error);
         else
             entry = malachite_cache_entry(&k);
@@ -5968,8 +7307,17 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
     const struct malachite_compiled *c = (const struct malachite_compiled *)entry.bytes;
     if (!failed && outputs)
         *outputs = c->outputs;
-    if (!failed && gl)
-        objc_setAssociatedObject(function, &malachite_arguments_key, malachite_arguments(c), OBJC_ASSOCIATION_RETAIN);
+    // reflection for the ones that read it: OpenGL's renderer, and OpenCL, whose kernels come as __entry_<name> and
+    // which takes its arguments' indices from it (without, clSetKernelArg says there's no such argument), and counts
+    // them from the function's own reflection (malachite_cl_reflection)
+    bool cl = !gl && [function.name hasPrefix:@"__entry_"];
+    if (!failed && (gl || cl))
+        objc_setAssociatedObject(function, &malachite_arguments_key,
+                                 cl ? malachite_cl_pipeline_arguments(c) : malachite_arguments(c),
+                                 OBJC_ASSOCIATION_RETAIN);
+    if (!failed && cl)
+        objc_setAssociatedObject(function, &malachite_cl_program_key, malachite_cl_program_arguments(c),
+                                 OBJC_ASSOCIATION_RETAIN);
     *h = failed ? (struct nvk_header){} : c->h;
     // the SMs prefetch instructions past a program's end: a page of slack keeps that inside the buffer (with none it
     // reads the next mapping, and faults once that one is freed)
@@ -5980,8 +7328,11 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
     // the AIR, for build/airc to reproduce a failure with; with the trace on, every shader's (not an override)
     // (in /tmp, or for a sandboxed process that can't write there, its own temporary directory)
     // (GL programs are all __main: numbered)
+    // (GL programs are all __main, and Unity's translated shaders all xlatMtlMain: numbered, and the code each one
+    // compiled to logged, so kern.malachite_prof's addresses lead to their AIR)
     NSString *dump = nil, *file = function.name;
-    if (gl) {
+    bool numbered = gl || malachite_trace || malachite_dump;
+    if (numbered) {
         static int programs;
         file = [NSString stringWithFormat:@"%@-%d", function.name, __sync_fetch_and_add(&programs, 1)];
     }
@@ -5995,6 +7346,8 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
             [bitcode[i] writeToFile:[dump stringByReplacingOccurrencesOfString:@".air"
                                                                     withString:[NSString stringWithFormat:@".linked%lu.air", i]]
                          atomically:YES];
+        if (code)
+            os_log(OS_LOG_DEFAULT, "Malachite dump: code %#llx from %{public}@", [(MTLIOAccelBuffer *)code gpuAddress], dump);
     }
     if (failed) {
         os_log(OS_LOG_DEFAULT, "Malachite: %{public}@: %{public}@ (AIR in %{public}@)", function.name, why, dump);
@@ -6025,11 +7378,51 @@ static id<MTLBuffer> malachite_tess_stage(id<MTLDevice> device, const struct air
     return code;
 }
 
-// a kernel with the functions its visible-function calls resolve to (MPS's stitched ones)
-- (id)computePipeline:(id<MTLFunction>)function linked:(MTLLinkedFunctions *)linked error:(NSError **)error
+// A compute pipeline's stage input as airc takes it, in out: NULL for one that describes no attribute, and NULL with
+// *why for one airc can't fetch. MTLAttributeFormat has MTLVertexFormat's values.
+static const struct airc_stage_in *malachite_stage_in(MTLStageInputOutputDescriptor *sd, struct airc_stage_in *out,
+                                                  NSString **why)
 {
+    *out = (struct airc_stage_in){};
+    bool any = false;
+    for (unsigned loc = 0; sd && loc < 31; loc++) {
+        MTLAttributeDescriptor *a = sd.attributes[loc];
+        if (a.format == MTLAttributeFormatInvalid)
+            continue;
+        MTLBufferLayoutDescriptor *l = sd.layouts[a.bufferIndex];
+        uint32_t f = malachite_vertex_format((MTLVertexFormat)a.format);
+        if (!f) {
+            *why = [NSString stringWithFormat:@"stage input attribute %u: format %lu", loc, (unsigned long)a.format];
+            return NULL;
+        }
+        out->attrs[loc] = (struct airc_tess_attr){ f, (uint32_t)a.bufferIndex, (uint32_t)a.offset, (uint32_t)l.stride,
+                                                   (uint32_t)l.stepFunction, (uint32_t)l.stepRate };
+        any = true;
+    }
+    out->index_buffer = (uint32_t)sd.indexBufferIndex;
+    out->index_size = sd.indexType == MTLIndexTypeUInt32 ? 4 : 2;
+    return any ? out : NULL;
+}
+
+// a kernel with the functions its visible-function calls resolve to (MPS's stitched ones), and its stage input
+- (id)computePipeline:(id<MTLFunction>)function
+               linked:(MTLLinkedFunctions *)linked
+              stageIn:(MTLStageInputOutputDescriptor *)stageIn
+                error:(NSError **)error
+{
+    struct airc_stage_in si;
+    NSString *why = nil;
+    const struct airc_stage_in *layout = malachite_stage_in(stageIn, &si, &why);
+    if (why) {
+        NSString *msg = [NSString stringWithFormat:@"%@: %@", function.name, why];
+        os_log(OS_LOG_DEFAULT, "Malachite: %{public}@", msg);
+        if (error)
+            *error = [NSError errorWithDomain:@"Malachite" code:1 userInfo:@{NSLocalizedDescriptionKey : msg}];
+        return nil;
+    }
     struct nvk_header h;
-    id<MTLBuffer> code = [self compile:function linked:linked vertex:NULL outputs:NULL header:&h error:error];
+    id<MTLBuffer> code = [self compile:function linked:linked vertex:NULL stageIn:layout outputs:NULL header:&h
+                                 error:error];
     if (!code)
         return nil;
     MTLComputePipelineDescriptor *desc = [MTLComputePipelineDescriptor new];
@@ -6038,6 +7431,7 @@ static id<MTLBuffer> malachite_tess_stage(id<MTLDevice> device, const struct air
     state->_kernel = h;
     state->_code = code;
     state->_label = function.name;
+    state->_cl = objc_getAssociatedObject(function, &malachite_cl_program_key) != nil;
     if (malachite_trace)
         os_log(OS_LOG_DEFAULT, "Malachite trace: kernel %{public}@ at %#llx, %u regs, %u bytes shared, %u args",
                function.name, [(MTLIOAccelBuffer *)code gpuAddress], h.reg_count, h.shared_size, h.nargs);
@@ -6046,16 +7440,17 @@ static id<MTLBuffer> malachite_tess_stage(id<MTLDevice> device, const struct air
 
 - (id)newComputePipelineStateWithFunction:(id<MTLFunction>)function error:(NSError **)error
 {
-    return [self computePipeline:function linked:nil error:error];
+    return [self computePipeline:function linked:nil stageIn:nil error:error];
 }
 
 // The other ways in to pipeline creation all come to the ones above. Reflection is only what OpenGL's renderer reads.
 - (id)computePipeline:(id<MTLFunction>)function
                linked:(MTLLinkedFunctions *)linked
+              stageIn:(MTLStageInputOutputDescriptor *)stageIn
            reflection:(MTLAutoreleasedComputePipelineReflection *)reflection
                 error:(NSError **)error
 {
-    id state = [self computePipeline:function linked:linked error:error];
+    id state = [self computePipeline:function linked:linked stageIn:stageIn error:error];
     if (reflection)
         *reflection = nil;
     if (reflection && objc_getAssociatedObject(function, &malachite_arguments_key)) {  // a GL program's
@@ -6072,7 +7467,7 @@ static id<MTLBuffer> malachite_tess_stage(id<MTLDevice> device, const struct air
                                reflection:(MTLAutoreleasedComputePipelineReflection *)reflection
                                     error:(NSError **)error
 {
-    return [self computePipeline:function linked:nil reflection:reflection error:error];
+    return [self computePipeline:function linked:nil stageIn:nil reflection:reflection error:error];
 }
 
 // a kernel's declared threadgroup size and the descriptor's must agree, as Apple's drivers have it
@@ -6097,8 +7492,11 @@ static id malachite_threads_asked(MalachiteComputePipelineState *state, MTLCompu
 
 - (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)desc error:(NSError **)error
 {
-    return malachite_threads_asked([self computePipeline:desc.computeFunction linked:desc.linkedFunctions error:error], desc,
-                               error);
+    return malachite_threads_asked([self computePipeline:desc.computeFunction
+                                                  linked:desc.linkedFunctions
+                                                 stageIn:desc.stageInputDescriptor
+                                                   error:error],
+                               desc, error);
 }
 
 - (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)desc
@@ -6106,8 +7504,11 @@ static id malachite_threads_asked(MalachiteComputePipelineState *state, MTLCompu
                                  reflection:(MTLAutoreleasedComputePipelineReflection *)reflection
                                       error:(NSError **)error
 {
-    return malachite_threads_asked([self computePipeline:desc.computeFunction linked:desc.linkedFunctions reflection:reflection
-                                               error:error],
+    return malachite_threads_asked([self computePipeline:desc.computeFunction
+                                                  linked:desc.linkedFunctions
+                                                 stageIn:desc.stageInputDescriptor
+                                              reflection:reflection
+                                                   error:error],
                                desc, error);
 }
 
@@ -6189,12 +7590,14 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     id<MTLBuffer> vcode = [self compile:desc.vertexFunction
                                  linked:desc.vertexLinkedFunctions
                                  vertex:NULL
+                                stageIn:NULL
                                 outputs:&varyings
                                  header:&vh
                                   error:error];
     id<MTLBuffer> fcode = vcode ? [self compile:desc.fragmentFunction ?: malachite_no_fragment(self)
                                          linked:desc.fragmentLinkedFunctions
                                          vertex:&varyings
+                                        stageIn:NULL
                                         outputs:NULL
                                          header:&fh
                                           error:error]
@@ -6404,6 +7807,8 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     for (NSString *w in words)
         if (malachite_trace && [w hasPrefix:@"+record="])
             malachite_rec_only = [[w substringFromIndex:8] componentsSeparatedByString:@"|"];
+        else if (malachite_trace && [w hasPrefix:@"+recskip="])
+            malachite_rec_skip = [w substringFromIndex:9].intValue;
     malachite_snap = malachite_trace && ((getenv("MALACHITE_TRACE") && !strcmp(getenv("MALACHITE_TRACE"), "snap")) ||
                                  [words containsObject:@"+snap"]);
     for (NSString *w in words)
@@ -6461,6 +7866,24 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
             IOObjectRelease(rm);
     });
     return name;
+}
+
+// OpenCL's compute units (AppleMetalOpenGLRenderer asks for this; without, 8)
+- (NSUInteger)gpuCoreCount
+{
+    static NSUInteger count;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        io_service_t rm = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("MalachiteGpu"));
+        CFTypeRef n = rm ? IORegistryEntryCreateCFProperty(rm, CFSTR("MalachiteSMCount"), kCFAllocatorDefault, 0) : NULL;
+        if (n && CFGetTypeID(n) == CFNumberGetTypeID())
+            CFNumberGetValue((CFNumberRef)n, kCFNumberNSIntegerType, &count);
+        if (n)
+            CFRelease(n);
+        if (rm)
+            IOObjectRelease(rm);
+    });
+    return count ?: 8;
 }
 
 - (BOOL)supportsTextureSampleCount:(NSUInteger)count

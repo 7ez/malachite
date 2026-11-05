@@ -41,6 +41,7 @@ class Accelerator : public IOGraphicsAccelerator2 {
     unsigned retireStamps();
     void queueStamp(int index, uint32_t value, uintptr_t ctx);  // under stampLock
     static const int kQueueStamp = 0;            // the command queues'
+    static const int kAppStamp = 1;              // apps' queues: their frames don't wait for WindowServer's stamps
     // PerformanceStatistics (what Activity Monitor and iStat read), refreshed from Gpu's NVGPU_FN_STATS; on the
     // stamp loop, as it never waits for the GPU
     IOTimerEventSource *statsTimer = nullptr;
@@ -73,7 +74,7 @@ public:
     void writeStamp(int index, uint32_t value);
     // a command queue's event (its last command buffer's) given a stamp of its own that the page reaches once the
     // GPU has done what the queue has submitted so far: its command buffer completes then
-    void stampEvent(IOAccelEvent *event, uintptr_t ctx);
+    void stampEvent(IOAccelEvent *event, uintptr_t ctx, bool app);
     uint64_t newEventMachine() override;
     uint64_t createUserGPUTask() override;
     uint64_t createKernelGPUTask() override;

@@ -60,8 +60,24 @@ struct ll_value {
     unsigned indices[4], nindices;  // extractvalue/insertvalue: the member indices, outermost first
     unsigned align;            // a load's or store's alignment in bytes, 0 for none given
     unsigned init;             // a global variable's initializer: value id + 1, or 0 for none
-    unsigned char noinline;    // a function's noinline attribute
+    const struct attr_list *attrs;  // a function's attributes, NULL for none
     unsigned char contract;    // a floating-point operation's contract or fast flag
+};
+
+// The attributes airc asks about (ATTR_*, a bit each) of a function (index ~0), its result (0) or its
+// parameter i (index i + 1)
+struct attr_list {
+    unsigned n;
+    struct {
+        uint32_t index;
+        unsigned bits;
+    } at[];
+};
+
+struct attr_group {
+    uint64_t id;
+    uint32_t index;
+    unsigned bits;
 };
 
 struct ll_block {
@@ -105,10 +121,9 @@ struct ll_module {
     struct ll_value **bodies;
     unsigned nbodies, capbodies, next_body;
     struct abbrevs blockinfo[32];
-    // attribute groups that put noinline on a function, and the attribute lists holding one, a flag each
-    uint64_t *noinline_groups;
-    unsigned nnoinline_groups, capnoinline_groups;
-    unsigned char *noinline_lists;
+    struct attr_group *groups;  // those with an attribute airc asks about
+    unsigned ngroups, capgroups;
+    const struct attr_list **lists;
     unsigned nlists, caplists;
     const char *strtab;
     size_t strtab_len;
@@ -407,13 +422,15 @@ static void parse_blockinfo(struct ll_module *m, struct bits *b)
     leave(&c, &r);
 }
 
-// Attributes: only whether a function is noinline. A group entry is [id, index, attrs...], each attr a kind and
-// its operands; kind 0 an enum attribute, 1 one with an integer, 3 and 4 strings. Enum attributes come first, so
-// the group is left at the first kind not read here.
-#define ATTR_NOINLINE 14
+// Attributes: only noinline, readonly, noalias and Metal's "air-buffer-no-alias". A group entry is [id, index,
+// attrs...], each attr a kind and its operands; kind 0 an enum attribute, 1 one with an integer, 3 and 4 strings,
+// 5 and 6 types. The others (constant ranges) are sorted after these but before the strings, so the group is left
+// at the first of them.
+enum { ATTR_NOINLINE = 1, ATTR_READONLY = 2, ATTR_NOALIAS = 4, ATTR_BUFFER_NO_ALIAS = 8 };
 
 static void parse_attr_groups(struct ll_module *m, struct bits *b)
 {
+    static const char no_alias[] = "air-buffer-no-alias";
     struct cursor c;
     struct record r = { 0 };
     unsigned id;
@@ -426,27 +443,36 @@ static void parse_attr_groups(struct ll_module *m, struct bits *b)
             skip(m, b);
             continue;
         }
-        if (r.code != 3 || r.n < 2 || (uint32_t)r.ops[1] != 0xffffffffu)
+        if (r.code != 3 || r.n < 2)
             continue;
+        unsigned bits = 0;
         for (unsigned i = 2; i < r.n;) {
             uint64_t kind = r.ops[i];
-            if (kind == 0 && i + 1 < r.n && r.ops[i + 1] == ATTR_NOINLINE) {
-                grow(m, (void **)&m->noinline_groups, &m->capnoinline_groups, m->nnoinline_groups + 1,
-                     sizeof(*m->noinline_groups));
-                m->noinline_groups[m->nnoinline_groups++] = r.ops[0];
-                break;
-            }
-            if (kind == 0)
+            if (kind == 0 && i + 1 < r.n)
+                bits |= r.ops[i + 1] == 14 ? ATTR_NOINLINE : r.ops[i + 1] == 21 ? ATTR_READONLY
+                        : r.ops[i + 1] == 9                                    ? ATTR_NOALIAS
+                                                                               : 0;
+            if (kind == 0 || kind == 6)
                 i += 2;
-            else if (kind == 1)
+            else if (kind == 1 || kind == 5)
                 i += 3;
             else if (kind == 3 || kind == 4) {
+                unsigned k = 0;
+                while (i + 1 + k < r.n && r.ops[i + 1 + k] && k < sizeof no_alias - 1 &&
+                       r.ops[i + 1 + k] == (unsigned char)no_alias[k])
+                    k++;
+                if (k == sizeof no_alias - 1 && i + 1 + k < r.n && !r.ops[i + 1 + k])
+                    bits |= ATTR_BUFFER_NO_ALIAS;
                 for (int strings = kind == 3 ? 1 : 2; strings && ++i < r.n;)
                     strings -= !r.ops[i];
                 i++;
             } else
                 break;
         }
+        if (!bits)
+            continue;
+        grow(m, (void **)&m->groups, &m->capgroups, m->ngroups + 1, sizeof(*m->groups));
+        m->groups[m->ngroups++] = (struct attr_group){ r.ops[0], (uint32_t)r.ops[1], bits };
     }
     leave(&c, &r);
 }
@@ -467,12 +493,15 @@ static void parse_attr_lists(struct ll_module *m, struct bits *b)
         }
         if (r.code != 2)
             continue;
-        grow(m, (void **)&m->noinline_lists, &m->caplists, m->nlists + 1, 1);
-        unsigned char noinline = 0;
+        struct attr_list *l = zalloc(m, sizeof(*l) + r.n * sizeof(l->at[0]));
         for (unsigned i = 0; i < r.n; i++)
-            for (unsigned k = 0; k < m->nnoinline_groups; k++)
-                noinline |= r.ops[i] == m->noinline_groups[k];
-        m->noinline_lists[m->nlists++] = noinline;
+            for (unsigned k = 0; k < m->ngroups; k++)
+                if (r.ops[i] == m->groups[k].id) {
+                    l->at[l->n].index = m->groups[k].index;
+                    l->at[l->n++].bits = m->groups[k].bits;
+                }
+        grow(m, (void **)&m->lists, &m->caplists, m->nlists + 1, sizeof(*m->lists));
+        m->lists[m->nlists++] = l;
     }
     leave(&c, &r);
 }
@@ -1501,7 +1530,7 @@ static void parse_module(struct ll_module *m, struct bits *b)
             v = define_value(m, V_FUNCTION, -1);
             v->fntype = fty;
             uint64_t list = r.n > s + 4 ? r.ops[s + 4] : 0;
-            v->noinline = list && list <= m->nlists && m->noinline_lists[list - 1];
+            v->attrs = list && list <= m->nlists ? m->lists[list - 1] : NULL;
             add_global(m, v, &r);
             if (!r.ops[s + 2]) {
                 grow(m, (void **)&m->bodies, &m->capbodies, m->nbodies + 1, sizeof(*m->bodies));
@@ -1612,8 +1641,8 @@ void LLVMDisposeModule(LLVMModuleRef m)
     free(m->mds);
     free(m->globals);
     free(m->bodies);
-    free(m->noinline_groups);
-    free(m->noinline_lists);
+    free(m->groups);
+    free(m->lists);
     free(m);
 }
 
@@ -2029,14 +2058,33 @@ LLVMValueRef LLVMGetCalledValue(LLVMValueRef call)
     return v;
 }
 
+static unsigned attr_bits(LLVMValueRef fn, LLVMAttributeIndex idx)
+{
+    unsigned bits = 0;
+    for (unsigned i = 0; fn->attrs && i < fn->attrs->n; i++)
+        if (fn->attrs->at[i].index == idx)
+            bits |= fn->attrs->at[i].bits;
+    return bits;
+}
+
+// the kinds are this reader's ATTR_* bits, not LLVM's numbers
 unsigned LLVMGetEnumAttributeKindForName(const char *name, size_t len)
 {
-    return len == 8 && !memcmp(name, "noinline", 8) ? ATTR_NOINLINE : 0;
+    return len == 8 && !memcmp(name, "noinline", 8)   ? ATTR_NOINLINE
+           : len == 8 && !memcmp(name, "readonly", 8) ? ATTR_READONLY
+           : len == 7 && !memcmp(name, "noalias", 7)  ? ATTR_NOALIAS
+                                                      : 0;
 }
 
 LLVMAttributeRef LLVMGetEnumAttributeAtIndex(LLVMValueRef fn, LLVMAttributeIndex idx, unsigned kind)
 {
-    return idx == LLVMAttributeFunctionIndex && kind == ATTR_NOINLINE && fn->noinline ? fn : NULL;
+    return attr_bits(fn, idx) & kind ? fn : NULL;
+}
+
+LLVMAttributeRef LLVMGetStringAttributeAtIndex(LLVMValueRef fn, LLVMAttributeIndex idx, const char *key, unsigned len)
+{
+    return len == 19 && !memcmp(key, "air-buffer-no-alias", 19) && attr_bits(fn, idx) & ATTR_BUFFER_NO_ALIAS ? fn
+                                                                                                            : NULL;
 }
 
 LLVMValueRef LLVMGetCondition(LLVMValueRef br)

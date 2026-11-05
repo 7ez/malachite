@@ -63,6 +63,13 @@ enum nvk_arg_kind {
     NVK_ARG_QUAD_GROUP,         // quadgroup_index_in_threadgroup
     NVK_ARG_QUAD_LANE,          // thread_index_in_quadgroup
     NVK_ARG_QUAD_GROUPS,        // quadgroups_per_threadgroup
+    NVK_ARG_STAGE_IN_ORIGIN,    // a kernel's stage_in_grid_origin: the stage-in region's origin
+    NVK_ARG_STAGE_IN_SIZE,      // stage_in_grid_size: and its size
+    // after the function's own arguments, a kernel with a stage input has a param at cbuf_off the dispatcher points
+    // at its stage-in region (as MTLStageInRegionIndirectArguments lays one out), and one for each buffer the stage
+    // input reads ([[buffer(index)]]), filled like a buffer argument's
+    NVK_ARG_STAGE_IN_REGION,
+    NVK_ARG_STAGE_IN_BUFFER,
 };
 
 // a post-tessellation vertex function is the tessellation stage; the tessellation init stage before it is generated
@@ -77,6 +84,8 @@ struct nvk_arg {
     uint8_t kind;
     uint8_t index;      // Metal [[buffer(n)]] slot (air.location_index)
     uint16_t cbuf_off;  // where the kernel reads it in const bank 0
+    uint16_t size;      // an OpenCL argument passed by value (air.constant): its bytes; 0 for the rest
+    uint8_t access;     // MTLBindingAccess: read (0), read_write (1) or write (2), from air.read_write and air.write
 };
 
 struct nvk_header {
@@ -100,6 +109,7 @@ struct nvk_header {
     uint32_t point_inputs, patch_inputs;
     // the sampler pool slots its samples with a depth compare use, and those its other samples and gathers use
     uint32_t compare_samplers, plain_samplers;
+    uint32_t nearest_samplers;  // those an integer texture is sampled with: Apple's GPUs never filter those
     uint32_t face_textures;  // the texture slots of cubes it reads or writes texels of, as layers of their faces
     uint32_t level_textures;  // those it writes texels of at a level that may not be the first (handle + level)
     uint32_t flags;  // NVK_FLAG_*

@@ -10,7 +10,7 @@
 
 enum mkind {
     MK_MOVIMM,   // def = imm
-    MK_MOV,      // def = src0
+    MK_MOV,      // def = src0 (aux: a phi copy)
     MK_MOVCBUF,  // def = c[0][imm]
     MK_LDC,      // def = c[0][src0 + imm]
     MK_ULDC,     // UR4 = c[0][imm]
@@ -20,20 +20,22 @@ enum mkind {
     MK_ISBERD,   // def = the input vertex handle at map offset src0
     MK_IADD3,    // def = src0 + src1
     MK_ISUB,     // def = src0 - src1
-    MK_IMAD,     // def = src0 * src1
+    MK_IMAD,     // def = src0 * src1, + src2 if there is one (src1 then VREG_RZ with immb)
     MK_IMADHI,   // def = the high word of src0 * src1 (aux: signed)
     MK_LOP3,     // def = src0 lut src1 (aux = lut)
+    MK_PRMT,     // def = the bytes of src0 (and zero) selector imm picks
     MK_SHL,      // def = src0 << src1
     MK_SHR,      // def = src0 >> src1 (aux: arithmetic)
     MK_IMNMX,    // def = min/max(src0, src1) (aux bit0 max, bit1 signed)
     MK_FADD,     // aux bit0: subtract; aux bit1: half
     MK_FMUL,     // aux bit1: half
     MK_FFMA,     // aux bit1: half; bits 2:3 SASS_RND_*; bit 4: imm is the multiplier (src a, c), bit 5: the addend
-    // (src a, b); FADD and FMUL with bit 4: imm is the second operand (src a only)
+    // (src a, b); FADD and FMUL with bit 4: imm is the second operand (src a only); all three with bit 6: .SAT
     MK_FMNMX,    // aux bit0: max
     MK_MUFU,     // aux = MUFU_*
     MK_I2F,      // aux: signed source
     MK_F2I,      // aux: signed result
+    MK_F2IP,     // def = src0 to an unsigned byte, saturated
     MK_F2H,
     MK_H2F,
     MK_FRND,     // aux = SASS_RND_*
@@ -49,19 +51,19 @@ enum mkind {
     MK_SEL,       // def = P0 ? src0 : src1
     MK_LDG,       // def = [src0 pair + imm], aux bytes (8 or 16: def is a pair or quad)
     MK_ATOM,      // def = the old value at [src0 + imm] (a pair global, RZ or a word shared), src1 data, src2 swapped
-                  // in (CAS), aux IR_ATOMA_*
+                  // in (CAS), aux IR_ATOMA_*; no def: RED (global) or ATOMS to RZ
     MK_STG,       // [src0 pair + imm] = src1, aux bytes (8 or 16: src1 is a pair or quad)
     MK_LDS,       // def = shared[src0 + imm] (src0 optional), aux bytes
     MK_STS,       // shared[src0 + imm] = src1, aux bytes
     MK_LDL,       // def = local[src0 + imm] (src0 optional), aux bytes (8 or 16: def is a pair or quad)
     MK_STL,       // local[src0 + imm] = src1 (a pair or quad when wide), aux bytes
     MK_BAR,       // aux: a memory fence instead
-    MK_IMADWIDE,  // def pair = src0 * src1 + src2 pair (aux: signed index)
+    MK_IMADWIDE,  // def pair = src0 * src1 (or imm, immb) + src2 pair (aux: signed index)
     MK_TEX,       // def quad = fetch(src0, src1) handle imm (aux: sample)
     MK_TXQ,       // def = a texture query (aux as IR_TXQ's)
     MK_SUST,      // texel (src0, src1) of texture imm = src2 quad
     MK_AST,       // a[imm] = src0.. (aux & 15 values) of vertex src1 if there is one (aux IR_ATTR_PATCH)
-    MK_BRA,       // to block `target`; aux 1 = @P0
+    MK_BRA,       // to block `target`; aux 1 = @P0, 2 = @!P0
     MK_OUTPUT,    // fragment: scratch[imm + k] = src k, the colour outputs on their way to R0..
     MK_EXIT,      // fragment: the imm colour registers scratch[0..] into R0.. first
     MK_DEMOTE,    // P6 |= src0 (aux: its inverse), or P6 = true without one: the exit drops the fragment
@@ -94,12 +96,16 @@ struct mop {
     int def;  // vreg, or -1
     int src[6];
     int nsrc;
-    int immb;    // src1 is the immediate imm instead (LOP3, IADD3, IMNMX, FMNMX, SHL, SHR, ISETP, FSETP, SEL)
+    int immb;    // src1 is the immediate imm instead (LOP3, IADD3, IMAD, IMNMX, FMNMX, SHL, SHR, ISETP, FSETP, SEL)
     int target;  // branch target block id, or -1
     int label;   // branch target mop index (a stub), or -1
     struct xfer *xs, *xd;  // a call's, entry's or return's sources and definitions beyond src and def
     int nxs, nxd;
     int mods;  // float sources' modifiers, MOD_NEG and MOD_ABS two bits a source (FADD, FMUL, FFMA, FSETP)
+    int ur;    // LDG, STG: the uniform register pair holding the base, src0 the offset from it (a pair, a word when
+               // narrow, or VREG_RZ for none); 0 when src0 is the whole address
+    int narrow;
+    int readonly;  // LDG: of memory nothing writes while the kernel runs, through the read-only cache
 };
 
 #define MAX_MOPS (1 << 17)
@@ -676,6 +682,423 @@ static int is_imm(const struct ir_val *v)
     return v->op == IR_CONST && v->type != IR_I64;
 }
 
+// A multiply that only an add in its own block reads is made by the add, as one IMAD (y * width + x, in nearly
+// every kernel's addressing); its operands are read there. A constant addend stays IADD3's immediate.
+static unsigned char *g_mul_fused;
+static unsigned char *g_late_def;  // made with the phi copies instead (lower_late_def)
+
+static void find_fused_muls(struct ir_func *f)
+{
+    int n = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            if (v->id >= n)
+                n = v->id + 1;
+    free(g_mul_fused);
+    g_mul_fused = calloc(n, 1);
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next) {
+            if (v->op != IR_ADD || v->type != IR_I32)
+                continue;
+            for (int i = 0; i < 2; i++) {
+                struct ir_val *m = v->src[i];
+                if (m->op == IR_MUL && m->type == IR_I32 && m->block == b && g_use_count[m->id] == 1 &&
+                    !is_imm(v->src[!i]) && !(is_imm(m->src[0]) && is_imm(m->src[1]))) {
+                    g_mul_fused[m->id] = 1;
+                    break;
+                }
+            }
+        }
+}
+
+static int lower_mul_add(struct ir_val *v)
+{
+    int i = v->src[0]->op == IR_MUL && g_mul_fused[v->src[0]->id] ? 0 : 1;
+    struct ir_val *mul = v->src[i], *a = mul->src[0], *b = mul->src[1];
+    if (mul->op != IR_MUL || !g_mul_fused[mul->id] || mul->vreg >= 0)
+        return 0;
+    if (is_imm(a)) {
+        a = mul->src[1];
+        b = mul->src[0];
+    }
+    int ra = vreg_of(a), rb = is_imm(b) ? VREG_RZ : vreg_of(b), rc = vreg_of(v->src[!i]);
+    v->vreg = new_vreg(1, 1);
+    struct mop *m = emit_mop(MK_IMAD);
+    m->def = v->vreg;
+    m->src[0] = ra;
+    m->src[1] = rb;
+    m->src[2] = rc;
+    m->nsrc = 3;
+    if (is_imm(b)) {
+        m->immb = 1;
+        m->imm = (uint32_t)b->imm;
+    }
+    return 1;
+}
+
+// Values only one instruction of their block reads, made by it instead (g_folded), one instruction fewer each:
+// a byte or two of a word shifted down and masked, or a low byte or half sign-extended, is one PRMT; a float
+// converted to an unsigned integer and clamped to [0, 255] is F2IP.U8 (byte_convert). An FMUL or FFMA that only a
+// saturate (FADD.SAT x, +0) reads is made with .SAT instead (g_sat): rounded once, flushed and a NaN made 0 alike.
+static unsigned char *g_folded, *g_sat;
+
+// the PRMT selector v is of *word, or -1
+static int byte_select(const struct ir_val *v, struct ir_val **word)
+{
+    if (v->type != IR_I32 || v->nsrc != 2)
+        return -1;
+    struct ir_val *x = v->src[0], *k = v->src[1];
+    if (v->op == IR_AND && x->op == IR_CONST) {
+        x = v->src[1];
+        k = v->src[0];
+    }
+    if (k->op != IR_CONST || x->type != IR_I32 || (x->op != IR_SHR && x->op != IR_SAR && x->op != IR_SHL) ||
+        x->src[1]->op != IR_CONST)
+        return -1;
+    int64_t s = x->src[1]->imm;
+    if (v->op == IR_AND && (x->op == IR_SHR || x->op == IR_SAR) && (k->imm == 0xff || k->imm == 0xffff) &&
+        (s == 8 || s == 16 || (s == 24 && k->imm == 0xff))) {
+        *word = x;
+        return k->imm == 0xff ? 0x4440 | (int)s / 8 : 0x4400 | ((int)s / 8 + 1) << 4 | (int)s / 8;
+    }
+    if (v->op == IR_SAR && x->op == IR_SHL && k->imm == s && (s == 16 || s == 24)) {
+        *word = x;
+        return s == 24 ? 0x8880 : 0x9910;
+    }
+    return -1;
+}
+
+static int is_float(const struct ir_val *v, uint32_t bits)
+{
+    return v->op == IR_CONST && (uint32_t)v->imm == bits;
+}
+
+// the float v is F2IP.U8 of, or NULL; *inner the value it is made with, which has to be folded for it (NULL for
+// none). F2IP truncates and saturates, a NaN to 0, so v is an unsigned conversion clamped to 255 after it (F2I makes
+// a NaN or a negative 0), or before (fmin(fmax(x, +0), 255.0): FMNMX makes a NaN 0), or of a saturate times less
+// than 256, which can't leave the range.
+static struct ir_val *byte_convert(const struct ir_val *v, struct ir_val **inner)
+{
+    struct ir_val *d;
+    if (v->op == IR_MIN && !v->aux && v->type == IR_I32)
+        for (int i = 0; i < 2; i++) {
+            struct ir_val *c = v->src[i], *k = v->src[!i];
+            if (c->op == IR_F2I && !c->aux && c->src[0]->type == IR_F32 && k->op == IR_CONST && k->imm == 255 &&
+                !byte_convert(c, &d)) {
+                *inner = c;
+                return c->src[0];
+            }
+        }
+    if (v->op != IR_F2I || v->aux || v->src[0]->type != IR_F32)
+        return NULL;
+    struct ir_val *x = v->src[0];
+    if (x->op == IR_FMIN && is_float(x->src[1], 0x437f0000) && x->src[0]->op == IR_FMAX &&
+        is_float(x->src[0]->src[1], 0)) {
+        *inner = x;
+        return x->src[0]->src[0];
+    }
+    for (int i = 0; x->op == IR_FMUL && i < 2; i++) {
+        struct ir_val *s = x->src[i], *k = x->src[!i];
+        // a positive float's bits order as it does: 0 < k < 256.0
+        if (s->op == IR_FADD && (s->aux & IR_FADD_SAT) && k->op == IR_CONST && (uint32_t)k->imm > 0 &&
+            (uint32_t)k->imm < 0x43800000) {
+            *inner = NULL;
+            return x;
+        }
+    }
+    return NULL;
+}
+
+// the FMUL or FFMA v saturates, or NULL
+static struct ir_val *sat_source(const struct ir_val *v)
+{
+    if (v->op != IR_FADD || !(v->aux & IR_FADD_SAT) || v->type != IR_F32 || v->src[1]->op != IR_CONST ||
+        v->src[1]->imm != 0)
+        return NULL;
+    struct ir_val *x = v->src[0];
+    return (x->op == IR_FMUL || x->op == IR_FFMA) && x->type == IR_F32 ? x : NULL;
+}
+
+static void find_folds(struct ir_func *f)
+{
+    int n = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            if (v->id >= n)
+                n = v->id + 1;
+    free(g_folded);
+    free(g_sat);
+    g_folded = calloc(n, 1);
+    g_sat = calloc(n, 1);
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next) {
+            struct ir_val *in;
+            if (byte_select(v, &in) >= 0) {
+                g_folded[in->id] = g_use_count[in->id] == 1 && in->block == b;
+            } else if (byte_convert(v, &in)) {
+                if (in) {
+                    struct ir_val *max = in->op == IR_FMIN ? in->src[0] : in;  // fmin(fmax(x, 0), 255) takes both
+                    g_folded[in->id] = g_folded[max->id] = g_use_count[in->id] == 1 && in->block == b &&
+                                                           g_use_count[max->id] == 1 && max->block == b;
+                }
+            } else if ((in = sat_source(v))) {
+                g_sat[in->id] = g_use_count[in->id] == 1 && in->block == b;
+            }
+        }
+}
+
+static int lower_byte_convert(struct ir_val *v)
+{
+    struct ir_val *in, *x = byte_convert(v, &in);
+    if (!x || (in && !g_folded[in->id]))
+        return 0;
+    v->vreg = new_vreg(1, 1);
+    struct mop *m = emit_mop(MK_F2IP);
+    m->def = v->vreg;
+    m->src[0] = vreg_of(x);
+    m->nsrc = 1;
+    return 1;
+}
+
+// An atomic whose old value nothing reads returns none where no barrier, fence or call can follow it: ATOMS to RZ,
+// or RED for global memory (not an exchange, which RED hasn't), neither taking a register or a write barrier. A
+// barrier waits for the atomics before it to land (g_mem_bars), which takes their write barriers, and ptxas turns RED
+// back into ATOMG ahead of a fence too.
+static unsigned char *g_reduce;
+
+static void find_reductions(struct ir_func *f)
+{
+    int n = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            if (v->id >= n)
+                n = v->id + 1;
+    free(g_reduce);
+    g_reduce = calloc(n, 1);
+    unsigned char *reach = calloc(f->nblocks, 1);  // a barrier, fence or call can be reached from the block
+    int anywhere = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            if (v->op == IR_BAR || v->op == IR_CALL)
+                reach[b->id] = anywhere = 1;
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (struct ir_block *b = f->entry; b; b = b->next)
+            for (unsigned k = 0; k < b->nsucc && !reach[b->id]; k++)
+                if (reach[b->succ[k]->id])
+                    reach[b->id] = changed = 1;
+    }
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next) {
+            int op = IR_ATOMA_OP(v->aux);
+            if (v->op != IR_ATOM || g_use_count[v->id] || op == SASS_ATOM_CAS)
+                continue;
+            // a subroutine's caller may go on to one
+            int later = (op == SASS_ATOM_EXCH && !IR_ATOMA_SHARED(v->aux)) || (b->func && anywhere);
+            for (struct ir_val *u = v->next; u && !later; u = u->next)
+                later = u->op == IR_BAR || u->op == IR_CALL;
+            for (unsigned k = 0; k < b->nsucc && !later; k++)
+                later = reach[b->succ[k]->id];
+            g_reduce[v->id] = !later;
+        }
+    free(reach);
+}
+
+// A buffer argument's address is the same in every thread, so it goes into a uniform register pair once, in the
+// prologue, and a load or store off it takes the base from there ([R.64+UR], as NAK addresses buffers): the
+// offset alone is made in registers, by IMAD.WIDE on RZ rather than on the base. That frees the base's pair and the
+// moves that make it, and buffers indexed alike share one offset. The offset stays 64-bit, which keeps a signed
+// index and a buffer past 4 GB right; only an unsigned 32-bit byte offset is used as it is ([R.U32+UR]). An address
+// read other than as a load's or store's (a phi's input, stored, compared, an atomic's) is made whole as before, and
+// so is the base it is made from.
+#define UR_FIRST 6  // UR4:UR5 hold the memory descriptor
+#define UR_PAIRS 28
+static int *g_ur;  // by IR id: a base's uniform register pair, or the pair an offset is from; 0 for none
+static unsigned char *g_whole;  // a base also read as a whole address
+static unsigned char *g_narrow;  // an offset that is its 32-bit index, zero-extended
+static struct {
+    int64_t off;  // in const bank 0
+    int used;
+} g_ubase[UR_PAIRS];
+static int g_nubase;
+
+// the offsets from a base the block being lowered has made, by index and scale
+static struct offset {
+    int block;
+    struct ir_val *index;
+    int64_t scale;
+    int aux;
+    int vreg;
+} g_offsets[32];
+static int g_noffsets;
+
+static int address_use(const struct ir_val *u, unsigned i)
+{
+    return i == 0 && (u->op == IR_LDG || u->op == IR_STG || (u->op == IR_ADDR && g_ur[u->id]));
+}
+
+static void find_uniform_bases(struct ir_func *f)
+{
+    int n = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            if (v->id >= n)
+                n = v->id + 1;
+    free(g_ur);
+    free(g_whole);
+    free(g_narrow);
+    g_ur = calloc(n, sizeof(*g_ur));
+    g_whole = calloc(n, 1);
+    g_narrow = calloc(n, 1);
+    g_nubase = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            if (v->op == IR_CBUF && v->type == IR_I64 && !v->nsrc && !(v->imm & 7)) {
+                int k = 0;
+                while (k < g_nubase && g_ubase[k].off != v->imm)
+                    k++;
+                if (k == UR_PAIRS)
+                    continue;
+                if (k == g_nubase) {
+                    g_ubase[k].off = v->imm;
+                    g_ubase[k].used = 0;
+                    g_nubase++;
+                }
+                g_ur[v->id] = UR_FIRST + 2 * k;
+            } else if (v->op == IR_ADDR && g_ur[v->src[0]->id]) {
+                g_ur[v->id] = g_ur[v->src[0]->id];
+            }
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (struct ir_block *b = f->entry; b; b = b->next)
+            for (struct ir_val *u = b->first; u; u = u->next) {
+                if (u->op == IR_ADDR && g_ur[u->id] && !g_ur[u->src[0]->id]) {
+                    g_ur[u->id] = 0;
+                    changed = 1;
+                }
+                for (unsigned i = 0; i < u->nsrc; i++) {
+                    struct ir_val *s = u->src[i];
+                    if (s && s->op == IR_ADDR && g_ur[s->id] && !address_use(u, i)) {
+                        g_ur[s->id] = 0;
+                        changed = 1;
+                    }
+                }
+            }
+    }
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            g_narrow[v->id] = v->op == IR_ADDR && g_ur[v->id] && v->src[0]->op == IR_CBUF && v->imm == 1 && !v->aux;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *u = b->first; u; u = u->next)
+            for (unsigned i = 0; i < u->nsrc; i++) {
+                struct ir_val *s = u->src[i];
+                if (s && u->op == IR_ADDR)  // what extends it needs the pair
+                    g_narrow[s->id] = 0;
+                if (!s || s->op != IR_CBUF || !g_ur[s->id])
+                    continue;
+                if (address_use(u, i))
+                    g_ubase[(g_ur[s->id] - UR_FIRST) / 2].used = 1;
+                else
+                    g_whole[s->id] = 1;
+            }
+}
+
+// Loads of memory nothing writes while the kernel runs go through the read-only cache (LDG.CONSTANT, __ldg's path).
+// Each global address is followed back to the buffer argument it points into: a load qualifies when the AIR says
+// its buffer is only read and aliases no other argument, and no store or atomic here goes into it or anywhere not
+// traced to one buffer. A texture written may be a view of a buffer, so a kernel that writes one gets none. Kernels
+// only: every launch empties the cache, while draws in a pass may not.
+#define ROOT_NONE (-1)  // no address seen yet (a null pointer)
+#define ROOT_ANY (-2)   // one from memory or a parameter, or from more than one buffer
+static unsigned char *g_readonly_load;  // by IR id
+
+static int meet_root(int a, int b)
+{
+    return a == ROOT_NONE ? b : b == ROOT_NONE || a == b ? a : ROOT_ANY;
+}
+
+// the buffer argument read from const bank 0 at off, or -1
+static int buffer_arg_at(int off)
+{
+    for (unsigned i = 0; i < g_info->nargs; i++)
+        if (g_info->args[i].kind == NVK_ARG_BUFFER && g_info->args[i].cbuf_off == off)
+            return (int)i;
+    return -1;
+}
+
+static void find_readonly_loads(struct ir_func *f)
+{
+    int n = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            if (v->id >= n)
+                n = v->id + 1;
+    free(g_readonly_load);
+    g_readonly_load = calloc(n, 1);
+    if (g_info->stage != NVK_COMPUTE || !g_info->readonly_args)
+        return;
+    int *root = malloc(n * sizeof(*root));
+    for (int i = 0; i < n; i++)
+        root[i] = ROOT_NONE;
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (struct ir_block *b = f->entry; b; b = b->next)
+            for (struct ir_val *v = b->first; v; v = v->next) {
+                if (v->type != IR_I64)
+                    continue;
+                int r = ROOT_ANY;
+                if (v->op == IR_CBUF && !v->nsrc)
+                    r = (int)v->imm;
+                else if (v->op == IR_CONST || v->op == IR_UNDEF)
+                    r = ROOT_NONE;
+                else if (v->op == IR_ADDR)
+                    r = root[v->src[0]->id];
+                else if (v->op == IR_SEL)
+                    r = meet_root(root[v->src[1]->id], root[v->src[2]->id]);
+                else if (v->op == IR_PHI) {
+                    r = ROOT_NONE;
+                    for (unsigned i = 0; i < v->nsrc; i++)
+                        r = meet_root(r, root[v->src[i]->id]);
+                }
+                if (r != root[v->id]) {
+                    root[v->id] = r;
+                    changed = 1;
+                }
+            }
+    }
+    uint64_t written = 0;
+    int anywhere = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next) {
+            if (v->op == IR_SUST)
+                anywhere = 1;
+            if (v->op != IR_STG && (v->op != IR_ATOM || IR_ATOMA_SHARED(v->aux)))
+                continue;
+            int a = root[v->src[0]->id] >= 0 ? buffer_arg_at(root[v->src[0]->id]) : -1;
+            if (a < 0)
+                anywhere = 1;
+            else
+                written |= 1ull << a;
+        }
+    for (struct ir_block *b = f->entry; b && !anywhere; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next) {
+            int a = v->op == IR_LDG && root[v->src[0]->id] >= 0 ? buffer_arg_at(root[v->src[0]->id]) : -1;
+            g_readonly_load[v->id] = a >= 0 && (g_info->readonly_args & ~written) >> a & 1;
+        }
+    free(root);
+}
+
+// source i of a memory op: a global address off a uniform base is the offset (RZ for none), the base m->ur
+static int vreg_of_address(struct ir_val *v, unsigned i, struct mop *m)
+{
+    struct ir_val *a = v->src[i];
+    if (i || (v->op != IR_LDG && v->op != IR_STG) || !g_ur[a->id])
+        return vreg_of(a);
+    m->ur = g_ur[a->id];
+    m->narrow = g_narrow[a->id];
+    return a->op == IR_CBUF ? VREG_RZ : vreg_of(a);
+}
+
 // P0 = the compare c, the constant side as an immediate (so on the right: its operands swapped if need be)
 static void emit_setp(const struct ir_val *c)
 {
@@ -718,6 +1141,8 @@ static void lower_value(struct ir_val *v)
     case IR_UNDEF:
         break;  // made where used (vreg_of)
     case IR_CBUF:
+        if (v->type == IR_I64 && g_ur[v->id] && !g_whole[v->id])
+            break;  // only ever a base, read from its uniform pair
         if (v->type == IR_I64) {
             int m[2];
             v->vreg = new_cluster(2, 2, m);
@@ -781,6 +1206,27 @@ static void lower_value(struct ir_val *v)
     case IR_FMUL:
     case IR_FMIN:
     case IR_FMAX: {
+        if ((v->op == IR_MUL && g_mul_fused[v->id]) || g_late_def[v->id] || g_folded[v->id])
+            break;  // made by the instruction that reads it, or at the end of its loop
+        if (v->op == IR_ADD && lower_mul_add(v))
+            break;
+        struct ir_val *in;
+        int sel = byte_select(v, &in);
+        if (sel >= 0 && g_folded[in->id]) {
+            v->vreg = new_vreg(1, 1);
+            struct mop *m = emit_mop(MK_PRMT);
+            m->def = v->vreg;
+            m->src[0] = vreg_of(in->src[0]);
+            m->nsrc = 1;
+            m->imm = sel;
+            break;
+        }
+        if (lower_byte_convert(v))
+            break;
+        if ((in = sat_source(v)) && g_sat[in->id]) {
+            v->vreg = in->vreg;  // made saturated
+            break;
+        }
         v->vreg = new_vreg(1, 1);
         struct mop *m = emit_mop(binop_kind(v));
         m->def = v->vreg;
@@ -802,8 +1248,8 @@ static void lower_value(struct ir_val *v)
         // an integer or logic operand as the immediate: the first one if the operation doesn't care which
         int immb = 0;
         if (!imm && !(v->op == IR_FADD || v->op == IR_FSUB || v->op == IR_FMUL) &&
-            (m->k == MK_LOP3 || m->k == MK_IADD3 || m->k == MK_IMNMX || m->k == MK_FMNMX || m->k == MK_ISUB ||
-             m->k == MK_SHL || m->k == MK_SHR) &&
+            (m->k == MK_LOP3 || m->k == MK_IADD3 || m->k == MK_IMAD || m->k == MK_IMNMX || m->k == MK_FMNMX ||
+             m->k == MK_ISUB || m->k == MK_SHL || m->k == MK_SHR) &&
             v->type != IR_I64) {
             if (is_imm(fa) && !is_imm(fb) && m->k != MK_ISUB && m->k != MK_SHL && m->k != MK_SHR) {
                 fa = v->src[1];
@@ -843,7 +1289,7 @@ static void lower_value(struct ir_val *v)
             if (v->op == IR_FADD && (v->aux & IR_FADD_SAT))
                 m->aux |= 64;
         } else if (m->k == MK_FMUL)
-            m->aux = (half ? 2 : 0) | (imm ? 16 : 0);
+            m->aux = (half ? 2 : 0) | (imm ? 16 : 0) | (g_sat[v->id] ? 64 : 0);
         else if (m->k == MK_FMNMX)
             m->aux = v->op == IR_FMAX;
         else if (m->k == MK_IMADHI)
@@ -894,7 +1340,7 @@ static void lower_value(struct ir_val *v)
         } else {
             m->src[m->nsrc++] = vreg_of(x[2]);
         }
-        m->aux = (half ? 2 : 0) | v->aux << 2 | flag;
+        m->aux = (half ? 2 : 0) | v->aux << 2 | flag | (g_sat[v->id] ? 64 : 0);
         break;
     }
     case IR_FNEG:
@@ -924,8 +1370,8 @@ static void lower_value(struct ir_val *v)
     case IR_POPC:
     case IR_BREV:
     case IR_FLO: {
-        if (v->op == IR_F2H && g_first[v->id])  // made with the one it is paired with, later
-            break;
+        if ((v->op == IR_F2H && g_first[v->id]) || g_folded[v->id] || lower_byte_convert(v))
+            break;  // made with its pair, by its clamp, or as F2IP
         if (v->op == IR_F2H && g_pair[v->id]) {  // the second of a pair: both halves of one register
             struct ir_val *lo = g_pair[v->id];
             v->vreg = lo->vreg = new_vreg(1, 1);
@@ -1073,22 +1519,40 @@ static void lower_value(struct ir_val *v)
         break;
     }
     case IR_ADDR: {
-        int m[2];
+        int m[2], from_base = g_ur[v->id] && v->src[0]->op == IR_CBUF;
+        if (g_narrow[v->id]) {
+            v->vreg = vreg_of(v->src[1]);
+            break;
+        }
+        if (from_base) {
+            if (g_noffsets && g_offsets[0].block != g_block)
+                g_noffsets = 0;
+            for (int k = 0; k < g_noffsets && v->vreg < 0; k++)
+                if (g_offsets[k].index == v->src[1] && g_offsets[k].scale == v->imm && g_offsets[k].aux == v->aux)
+                    v->vreg = g_offsets[k].vreg;
+            if (v->vreg >= 0)
+                break;
+        }
         v->vreg = new_cluster(2, 2, m);
-        int scale = mov_imm(v->imm);
+        if (from_base && g_noffsets < (int)(sizeof g_offsets / sizeof g_offsets[0]))
+            g_offsets[g_noffsets++] = (struct offset){ g_block, v->src[1], v->imm, v->aux, v->vreg };
         struct mop *w = emit_mop(MK_IMADWIDE);
         w->def = v->vreg;
         w->src[0] = vreg_of(v->src[1]);
-        w->src[1] = scale;
-        w->src[2] = vreg_of(v->src[0]);
+        w->src[1] = VREG_RZ;  // the scale is the immediate
+        w->src[2] = from_base ? VREG_RZ : vreg_of(v->src[0]);
         w->nsrc = 3;
+        w->immb = 1;
+        w->imm = (uint32_t)v->imm;
         w->aux = v->aux;
         break;
     }
     case IR_ATOM: {
-        v->vreg = new_vreg(1, 1);
         struct mop *m = emit_mop(MK_ATOM);
-        m->def = v->vreg;
+        if (!g_reduce[v->id]) {
+            v->vreg = new_vreg(1, 1);
+            m->def = v->vreg;
+        }
         m->src[0] = v->src[0] ? vreg_of(v->src[0]) : VREG_RZ;
         m->src[1] = vreg_of(v->src[1]);
         m->src[2] = v->nsrc > 2 ? vreg_of(v->src[2]) : VREG_RZ;
@@ -1107,9 +1571,10 @@ static void lower_value(struct ir_val *v)
         m->def = v->vreg;
         m->nsrc = v->nsrc;
         for (unsigned i = 0; i < v->nsrc; i++)
-            m->src[i] = vreg_of(v->src[i]);
+            m->src[i] = vreg_of_address(v, i, m);
         m->imm = v->imm;
         m->aux = v->aux;
+        m->readonly = v->op == IR_LDG && g_readonly_load[v->id];
         break;
     }
     case IR_TEX: {
@@ -1177,7 +1642,7 @@ static void lower_effect(struct ir_val *v)
             data = vreg_of(v->src[1]);
         }
         struct mop *m = emit_mop(v->op == IR_STG ? MK_STG : v->op == IR_STS ? MK_STS : MK_STL);
-        m->src[0] = v->src[0] ? vreg_of(v->src[0]) : VREG_RZ;  // a shared or local store may have no base register
+        m->src[0] = v->src[0] ? vreg_of_address(v, 0, m) : VREG_RZ;  // a shared or local store may have no base register
         m->src[1] = data;
         m->nsrc = 2;
         m->imm = v->imm;
@@ -1243,7 +1708,9 @@ static void lower_effect(struct ir_val *v)
 // from then on. The block's own mops have all been made by now, so that is checked on them; a read in another
 // block, by a phi, or by something that takes its operand later (a compare fused into a branch, a modifier, a
 // paired half) rules it out beforehand (phi_outside). AIRC_NOPHIDEF=1 turns it off.
-static unsigned char *g_phi_outside, *g_phi_moved;
+// g_phi_escapes: the phi's register is read after its block, so a copy into it may not run on the way out of the
+// loop. A modifier or a compare that reads it is read where its own readers are.
+static unsigned char *g_phi_outside, *g_phi_moved, *g_phi_escapes;
 
 static void phi_outside(struct ir_func *f)
 {
@@ -1254,17 +1721,66 @@ static void phi_outside(struct ir_func *f)
                 n = v->id + 1;
     free(g_phi_outside);
     free(g_phi_moved);
+    free(g_phi_escapes);
     g_phi_outside = calloc(n, 1);
     g_phi_moved = calloc(n, 1);
+    g_phi_escapes = calloc(n, 1);
+    unsigned char *late = calloc(n, 1);  // read in another block, by a phi or by a modifier
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *u = b->first; u; u = u->next)
             for (unsigned i = 0; i < u->nsrc; i++) {
                 struct ir_val *s = u->src[i];
-                if (s && s->op == IR_PHI &&
-                    (u->block != s->block || u->op == IR_PHI || u->op == IR_FNEG || u->op == IR_FABS ||
-                     u->op == IR_CMP || u->op == IR_F2H))
-                    g_phi_outside[s->id] = 1;
+                if (s && (u->block != s->block || u->op == IR_PHI || u->op == IR_FNEG || u->op == IR_FABS))
+                    late[s->id] = 1;
             }
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *u = b->first; u; u = u->next)
+            for (unsigned i = 0; i < u->nsrc; i++) {
+                struct ir_val *s = u->src[i];
+                if (!s || s->op != IR_PHI)
+                    continue;
+                int deferred = u->op == IR_FNEG || u->op == IR_FABS || u->op == IR_CMP || u->op == IR_F2H;
+                if (u->block != s->block || u->op == IR_PHI || deferred)
+                    g_phi_outside[s->id] = 1;
+                if (u->block != s->block || u->op == IR_PHI || (deferred && late[u->id]))
+                    g_phi_escapes[s->id] = 1;
+            }
+    free(late);
+    free(g_late_def);
+    g_late_def = calloc(n, 1);
+    for (struct ir_block *b = f->entry; b; b = b->next) {
+        if (!b->last || b->last->op != IR_CBR || b->succ[0] == b->succ[1] || (b->succ[0] != b && b->succ[1] != b))
+            continue;
+        for (struct ir_val *p = b->first; p && p->op == IR_PHI; p = p->next)
+            for (unsigned k = 0; k < p->nsrc; k++) {
+                struct ir_val *v = p->src[k];
+                if (p->phi_blocks[k] != b || v->block != b || v->type != IR_I32 || p->type != IR_I32 ||
+                    g_use_count[v->id] != 1 || v->op < IR_ADD || v->op > IR_SAR || v->op == IR_MUL || v->op == IR_MULHI)
+                    continue;
+                for (int i = 0; i < 2; i++) {
+                    struct ir_val *x = v->src[!i];
+                    if (v->src[i] == p && x != p && (x->op == IR_CONST || x->block != b))
+                        g_late_def[v->id] = 1;
+                }
+            }
+    }
+}
+
+// v, which only phi p of its own loop reads, made at the end of the way round straight into p's register: p's
+// last reads (the loop's compare among them) then come before it, so no copy is needed
+static void lower_late_def(struct ir_val *p, struct ir_val *v)
+{
+    for (unsigned i = 0; i < v->nsrc; i++)
+        if (v->src[i]->op == IR_CONST)
+            vreg_of(v->src[i]);
+    g_late_def[v->id] = 0;
+    lower_value(v);
+    for (int k = g_nmops - 1; k >= 0; k--)
+        if (g_mops[k].def == v->vreg) {
+            g_mops[k].def = p->vreg;
+            break;
+        }
+    v->vreg = p->vreg;
 }
 
 static void phi_into_def(struct ir_block *b, struct ir_val *p, struct ir_val *v)
@@ -1322,6 +1838,8 @@ static void phi_copies(struct ir_block *pred, struct ir_block *b)
                 in = p->src[k];
         if (!in)
             airc_fail("phi edge without a value");
+        if (pred == b && g_late_def[in->id])
+            continue;
         if (n + 2 > MAX_COPIES)
             airc_fail("too many phis in a block");
         int is_const = in->op == IR_CONST || in->op == IR_UNDEF;
@@ -1351,6 +1869,7 @@ static void phi_copies(struct ir_block *pred, struct ir_block *b)
             m->def = tmp[i];
             m->src[0] = src[i];
             m->nsrc = 1;
+            m->aux = 1;
         }
     }
     for (int i = 0; i < n; i++) {
@@ -1364,9 +1883,15 @@ static void phi_copies(struct ir_block *pred, struct ir_block *b)
             m = emit_mop(MK_MOV);
             m->src[0] = tmp[i] >= 0 ? tmp[i] : src[i];
             m->nsrc = 1;
+            m->aux = 1;
         }
         m->def = dst[i];
     }
+    // after the copies, which read the old values
+    for (struct ir_val *p = b->first; pred == b && p && p->op == IR_PHI; p = p->next)
+        for (unsigned k = 0; k < p->nsrc; k++)
+            if (p->phi_blocks[k] == b && g_late_def[p->src[k]->id])
+                lower_late_def(p, p->src[k]);
 }
 
 static void set_convergence(struct ir_block *b)
@@ -1503,7 +2028,6 @@ static void lower_block(struct ir_block *b)
             }
             break;
         case IR_CBR: {
-            set_convergence(b);
             if (v->src[0]->op == IR_CMP && g_cmp_fused[v->src[0]->id]) {
                 emit_setp(v->src[0]);
             } else {
@@ -1513,14 +2037,25 @@ static void lower_block(struct ir_block *b)
                 s->nsrc = 2;
                 s->aux = IR_NE;
             }
+            // A loop of one block whose phis nothing reads past it makes its copies before the branch, on both
+            // edges: the way round is then the branch alone, not a branch to a stub of copies and one back
+            int self = b->succ[0] == b->succ[1] ? -1 : b->succ[0] == b ? 0 : b->succ[1] == b ? 1 : -1;
+            for (struct ir_val *p = b->first; self >= 0 && p && p->op == IR_PHI; p = p->next)
+                if (g_phi_escapes[p->id])
+                    self = -1;
+            if (self >= 0)
+                phi_copies(b, b);
+            // after the compare, which the scheduler can then start early: the branch waits 13 cycles for P0
+            set_convergence(b);
             // the true edge's phi copies may only run when it is taken: they get a stub after the false path
-            int stub = b->succ[0]->first && b->succ[0]->first->op == IR_PHI;
+            int stub = self != 0 && b->succ[0]->first && b->succ[0]->first->op == IR_PHI;
             int bt = g_nmops;
             struct mop *m = emit_mop(MK_BRA);
             m->aux = 1;
             if (!stub)
                 m->target = b->succ[0]->id;
-            phi_copies(b, b->succ[1]);
+            if (self != 1)
+                phi_copies(b, b->succ[1]);
             emit_mop(MK_BRA)->target = b->succ[1]->id;
             if (stub) {
                 g_mops[bt].label = g_nmops;
@@ -1596,6 +2131,9 @@ static int add_seg(int v, int tail, int start, int end)
 // Live ranges from liveness dataflow over the blocks of one function, so a value read again around a loop's back
 // edge stays live to the end of the loop. A range is one interval [start, end] in mop order, covering every block
 // the value is live through. Values of the shader a subroutine reads keep the ranges they have in the shader.
+// A block ending in a conditional branch is three parts here: up to the branch, the false edge's phi copies, and
+// the true edge's stub. A value only one edge reads is live in that edge's part alone, so the copies of the other
+// can write its register.
 static void compute_ranges(struct ir_func *f, int region)
 {
     int nb = 0;
@@ -1603,28 +2141,66 @@ static void compute_ranges(struct ir_func *f, int region)
         if (!b->dead && b->func == region)
             nb++;
     struct ir_block **blocks = malloc(nb * sizeof(*blocks));
-    int *bstart = malloc(nb * sizeof(*bstart)), *bend = malloc(nb * sizeof(*bend));
-    int *index = malloc(f->nblocks * sizeof(*index));
+    int *bstart = malloc(3 * nb * sizeof(*bstart)), *bend = malloc(3 * nb * sizeof(*bend));
+    int(*succ)[2] = malloc(3 * nb * sizeof(*succ)), *nsucc = malloc(3 * nb * sizeof(*nsucc));
+    int *index = malloc(f->nblocks * sizeof(*index)), *cbr = malloc(nb * sizeof(*cbr));
     nb = 0;
     for (struct ir_block *b = f->entry; b; b = b->next)
-        if (!b->dead && b->func == region) {
-            index[b->id] = nb;
+        if (!b->dead && b->func == region)
             blocks[nb++] = b;
-        }
+    int np = 0;
     for (int i = 0; i < nb; i++) {
-        bstart[i] = g_block_mop[blocks[i]->id];
-        bend[i] = i + 1 < nb ? g_block_mop[blocks[i + 1]->id] : g_region_end[region];
+        int k = g_block_mop[blocks[i]->id], e = i + 1 < nb ? g_block_mop[blocks[i + 1]->id] : g_region_end[region];
+        while (k < e && !(g_mops[k].k == MK_BRA && g_mops[k].aux))
+            k++;
+        cbr[i] = k < e ? k : -1;
+        index[blocks[i]->id] = np;
+        np += k == e ? 1 : g_mops[k].label < 0 ? 2 : 3;
+    }
+    np = 0;
+    for (int i = 0; i < nb; i++) {
+        struct ir_block *b = blocks[i];
+        int s = g_block_mop[b->id], e = i + 1 < nb ? g_block_mop[blocks[i + 1]->id] : g_region_end[region];
+        int k = cbr[i];
+        if (k < 0) {
+            bstart[np] = s;
+            bend[np] = e;
+            nsucc[np] = (int)b->nsucc;
+            for (unsigned j = 0; j < b->nsucc; j++)
+                succ[np][j] = index[b->succ[j]->id];
+            np++;
+            continue;
+        }
+        int stub = g_mops[k].label;
+        bstart[np] = s;
+        bend[np] = k + 1;
+        nsucc[np] = 2;
+        succ[np][0] = np + 1;
+        succ[np][1] = stub < 0 ? index[b->succ[0]->id] : np + 2;
+        np++;
+        bstart[np] = k + 1;
+        bend[np] = stub < 0 ? e : stub;
+        nsucc[np] = 1;
+        succ[np][0] = index[b->succ[1]->id];
+        np++;
+        if (stub >= 0) {
+            bstart[np] = stub;
+            bend[np] = e;
+            nsucc[np] = 1;
+            succ[np][0] = index[b->succ[0]->id];
+            np++;
+        }
     }
     // the leading MOVIMM of the integer 1 sits before the first block: fold it into block 0
-    if (nb)
+    if (np)
         bstart[0] = g_region_start[region];
 
     int words = (g_nvregs + 63) / 64;
-    uint64_t *use = calloc((size_t)nb * words, 8), *def = calloc((size_t)nb * words, 8);
-    uint64_t *in = calloc((size_t)nb * words, 8), *out = calloc((size_t)nb * words, 8);
+    uint64_t *use = calloc((size_t)np * words, 8), *def = calloc((size_t)np * words, 8);
+    uint64_t *in = calloc((size_t)np * words, 8), *out = calloc((size_t)np * words, 8);
 #define BIT(set, i, v) ((set)[(size_t)(i) * words + (v) / 64] >> ((v) % 64) & 1)
 #define SETBIT(set, i, v) ((set)[(size_t)(i) * words + (v) / 64] |= 1ull << ((v) % 64))
-    for (int i = 0; i < nb; i++)
+    for (int i = 0; i < np; i++)
         for (int k = bstart[i]; k < bend[i]; k++) {
             struct mop *m = &g_mops[k];
             for (int j = 0; j < m->nsrc + m->nxs; j++) {
@@ -1642,10 +2218,10 @@ static void compute_ranges(struct ir_func *f, int region)
     // iterate in reverse layout order until nothing changes
     for (int changed = 1; changed;) {
         changed = 0;
-        for (int i = nb - 1; i >= 0; i--) {
+        for (int i = np - 1; i >= 0; i--) {
             uint64_t *o = &out[(size_t)i * words], *n = &in[(size_t)i * words];
-            for (unsigned s = 0; s < blocks[i]->nsucc; s++) {
-                uint64_t *si = &in[(size_t)index[blocks[i]->succ[s]->id] * words];
+            for (int s = 0; s < nsucc[i]; s++) {
+                uint64_t *si = &in[(size_t)succ[i][s] * words];
                 for (int w = 0; w < words; w++)
                     o[w] |= si[w];
             }
@@ -1677,8 +2253,8 @@ static void compute_ranges(struct ir_func *f, int region)
         for (int j = 0; j < m->nxd; j++)
             touch(m->xd[j].vreg, k);
     }
-    // stretch over every block a value is live into or out of
-    for (int i = 0; i < nb; i++)
+    // stretch over every part a value is live into or out of
+    for (int i = 0; i < np; i++)
         for (int v = 0; v < g_nvregs; v++) {
             int li = BIT(in, i, v), lo = BIT(out, i, v);
             if ((!li && !lo) || g_vregs[v].hw >= 0)
@@ -1690,7 +2266,7 @@ static void compute_ranges(struct ir_func *f, int region)
             if (e > r->end)
                 r->end = e;
         }
-    // the runs: in a block, from its start if the value is live in (else from where it is first named) to its
+    // the runs: in a part, from its start if the value is live in (else from where it is first named) to its
     // end if live out (else to where it is last named)
     g_nsegs = 0;
     int *tail = malloc((unsigned)g_nvregs * sizeof(*tail)), *stamp = calloc((unsigned)g_nvregs, sizeof(*stamp));
@@ -1701,7 +2277,7 @@ static void compute_ranges(struct ir_func *f, int region)
         if (g_vregs[v].hw < 0)
             g_vregs[v].seg = -1;
     }
-    for (int i = 0; i < nb; i++) {
+    for (int i = 0; i < np; i++) {
         int nnamed = 0;
         for (int k = bstart[i]; k < bend[i]; k++) {
             struct mop *m = &g_mops[k];
@@ -1757,7 +2333,10 @@ static void compute_ranges(struct ir_func *f, int region)
     free(blocks);
     free(bstart);
     free(bend);
+    free(succ);
+    free(nsucc);
     free(index);
+    free(cbr);
     free(use);
     free(def);
     free(in);
@@ -2049,7 +2628,222 @@ static void seg_take(uint64_t *row, int seg, int base)
         }
 }
 
+// Phi copies coalesced before allocation: a copy's two values take one register unless one is written while the
+// other is live past the write and the write isn't a copy of the other (Chaitin's test, on the runs above). Each
+// group's live members hold the same value wherever they meet, so the test holds for groups as for values. An
+// instruction of a fixed latency reads its sources before it writes, so its result may take the register of a
+// source that dies there; anything else keeps clear of what it reads. Clusters keep registers of their own.
+static int g_group[MAX_VREGS], g_gnext[MAX_VREGS];
+
+static int group_of(int v)
+{
+    while (g_group[v] != v)
+        v = g_group[v] = g_group[g_group[v]];
+    return v;
+}
+
+static int in_place(enum mkind k)
+{
+    switch (k) {
+    case MK_MOV:
+    case MK_IADD3:
+    case MK_ISUB:
+    case MK_IMAD:
+    case MK_IMADHI:
+    case MK_LOP3:
+    case MK_LOP3_IMM:
+    case MK_PRMT:
+    case MK_SHL:
+    case MK_SHR:
+    case MK_IMNMX:
+    case MK_FADD:
+    case MK_FMUL:
+    case MK_FFMA:
+    case MK_FMNMX:
+    case MK_I2F:
+    case MK_F2IP:
+    case MK_F2H:
+    case MK_H2F:
+    case MK_FSWZADD:
+    case MK_SEL:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static int group_live(int g, int k)
+{
+    for (int v = g; v >= 0; v = g_gnext[v])
+        for (int s = g_vregs[v].seg; s >= 0 && g_segs[s].start <= k; s = g_segs[s].next)
+            if (g_segs[s].end >= k)
+                return 1;
+    return 0;
+}
+
+// is group g live past mop k: in a run at the next mop, unless the run starts there with a write. A write never
+// ends a part, so the next mop is the one after k on every path.
+static int live_past(int g, int k, const char *part_start)
+{
+    const struct mop *m = &g_mops[k + 1];
+    for (int v = g; v >= 0; v = g_gnext[v])
+        for (int s = g_vregs[v].seg; s >= 0 && g_segs[s].start <= k + 1; s = g_segs[s].next) {
+            if (g_segs[s].end <= k)
+                continue;
+            if (g_segs[s].start <= k || part_start[k + 1])
+                return 1;
+            for (int j = 0; j < m->nsrc + m->nxs; j++)
+                if ((j < m->nsrc ? m->src[j] : m->xs[j - m->nsrc].vreg) == v)
+                    return 1;
+        }
+    return 0;
+}
+
+// would a write to group a's register clobber group b; the mops defining each vreg are dmop[dstart[v]..]
+static int clobbers(int a, int b, const int *dstart, const int *dmop, const char *part_start)
+{
+    for (int v = a; v >= 0; v = g_gnext[v])
+        for (int d = dstart[v]; d < dstart[v + 1]; d++) {
+            const struct mop *m = &g_mops[dmop[d]];
+            if (m->k == MK_MOV && m->src[0] >= 0 && group_of(m->src[0]) == b)
+                continue;
+            if (live_past(b, dmop[d], part_start) || (!in_place(m->k) && group_live(b, dmop[d])))
+                return 1;
+        }
+    return 0;
+}
+
+// the operands coalescing renamed, to put back and again
+static struct {
+    int *at, from, to;
+} *g_renames;
+static int g_nrenames, g_cap_renames;
+
+static void rename_to(int *at, int to)
+{
+    if (*at == to)
+        return;
+    if (g_nrenames == g_cap_renames) {
+        g_cap_renames = g_cap_renames ? 2 * g_cap_renames : 1024;
+        g_renames = realloc(g_renames, g_cap_renames * sizeof(*g_renames));
+    }
+    g_renames[g_nrenames].at = at;
+    g_renames[g_nrenames].from = *at;
+    g_renames[g_nrenames++].to = to;
+    *at = to;
+}
+
+static void rename_vregs(int coalesced)
+{
+    for (int i = 0; i < g_nrenames; i++)
+        *g_renames[i].at = coalesced ? g_renames[i].to : g_renames[i].from;
+}
+
+static int coalesce_phis(int region)
+{
+    int lo = g_region_start[region], hi = g_region_end[region];
+    int *dstart = calloc(g_nvregs + 1, sizeof(*dstart));
+    char *single = calloc(g_nvregs, 1);
+    for (int v = 0; v < g_nvregs; v++) {
+        g_group[v] = v;
+        g_gnext[v] = -1;
+        single[v] = g_vregs[v].hw < 0 && g_vregs[v].size == 1;
+    }
+    for (int v = 0; v < g_nvregs; v++)
+        for (int j = g_vregs[v].next; j >= 0; j = g_vregs[j].next)
+            single[j] = single[v] = 0;
+    for (int k = lo; k < hi; k++)
+        for (int j = -1; j < g_mops[k].nxd; j++)
+            MEMBERS(w, j < 0 ? g_mops[k].def : g_mops[k].xd[j].vreg)
+                dstart[w + 1]++;
+    for (int v = 0; v < g_nvregs; v++)
+        dstart[v + 1] += dstart[v];
+    int *dmop = malloc((dstart[g_nvregs] + 1) * sizeof(*dmop)), *fill = malloc(g_nvregs * sizeof(*fill));
+    memcpy(fill, dstart, g_nvregs * sizeof(*fill));
+    for (int k = lo; k < hi; k++)
+        for (int j = -1; j < g_mops[k].nxd; j++)
+            MEMBERS(w, j < 0 ? g_mops[k].def : g_mops[k].xd[j].vreg)
+                dmop[fill[w]++] = k;
+    char *part_start = calloc(hi + 1, 1);
+    for (struct ir_block *b = g_fn->entry; b; b = b->next)
+        if (!b->dead && b->func == region)
+            part_start[g_block_mop[b->id]] = 1;
+    for (int k = lo; k < hi; k++)
+        if (g_mops[k].k == MK_BRA && g_mops[k].aux) {
+            part_start[k + 1] = 1;
+            if (g_mops[k].label >= 0)
+                part_start[g_mops[k].label] = 1;
+        }
+    part_start[hi] = 1;
+    int merged = 0;
+    for (int k = lo; k < hi; k++) {
+        const struct mop *m = &g_mops[k];
+        if (m->k != MK_MOV || !m->aux || !single[m->def] || !single[m->src[0]])
+            continue;
+        int a = group_of(m->def), b = group_of(m->src[0]);
+        if (a == b || clobbers(a, b, dstart, dmop, part_start) || clobbers(b, a, dstart, dmop, part_start))
+            continue;
+        int t = a;
+        while (g_gnext[t] >= 0)
+            t = g_gnext[t];
+        g_gnext[t] = b;
+        g_group[b] = a;
+        merged = 1;
+    }
+    // a subroutine may read the shader's values too: every mop is renamed
+    g_nrenames = 0;
+    for (int k = 0; merged && k < g_nmops; k++) {
+        struct mop *m = &g_mops[k];
+        if (m->def >= 0)
+            rename_to(&m->def, group_of(m->def));
+        for (int j = 0; j < m->nsrc; j++)
+            if (m->src[j] >= 0)
+                rename_to(&m->src[j], group_of(m->src[j]));
+        for (int j = 0; j < m->nxs; j++)
+            rename_to(&m->xs[j].vreg, group_of(m->xs[j].vreg));
+        for (int j = 0; j < m->nxd; j++)
+            rename_to(&m->xd[j].vreg, group_of(m->xd[j].vreg));
+    }
+    free(dstart);
+    free(single);
+    free(dmop);
+    free(fill);
+    free(part_start);
+    return merged;
+}
+
 static int g_clusters_first;
+
+// Warps an SM keeps resident at a thread's register count, taken in 8-register units. GA10x: four partitions of
+// 16K registers, 48 warps.
+static int warps_at(int regs)
+{
+    regs = (regs + 7) & ~7;
+    int w = 16384 / (regs * 32) * 4;
+    return w < 48 ? w : 48;
+}
+
+// the last mop before k a register's row is taken at, -1 for none
+static int last_taken(const uint64_t *row, const int *row_end, int c, int k)
+{
+    if (row_end[c] < k)
+        return row_end[c];
+    for (int w = k / 64; w >= 0; w--) {
+        uint64_t bits = row[w];
+        if (w == k / 64)
+            bits &= (1ull << (k % 64)) - 1;
+        if (bits)
+            return w * 64 + 63 - __builtin_clzll(bits);
+    }
+    return -1;
+}
+
+static void took(int *row_end, int v, int base)
+{
+    for (int s = g_vregs[v].seg; s >= 0; s = g_segs[s].next)
+        if (g_segs[s].end - base > row_end[g_vregs[v].hw])
+            row_end[g_vregs[v].hw] = g_segs[s].end - base;
+}
 
 static int place_before(int a, int b)
 {
@@ -2059,9 +2853,10 @@ static int place_before(int a, int b)
     return g_vregs[a].start < g_vregs[b].start;
 }
 
-static void regalloc(struct ir_func *f, int region)
+// the registers of one function's values on their ranges; how many registers there are then, or -1 if they don't
+// fit (the spill candidates noted)
+static int place(int region)
 {
-    compute_ranges(f, region);
     // the mops moving values through the subroutine window, in order
     int *xfer = malloc((g_region_end[region] - g_region_start[region] + 1) * sizeof(*xfer)), nxfer = 0;
     for (int k = g_region_start[region]; k < g_region_end[region]; k++)
@@ -2085,9 +2880,29 @@ static void regalloc(struct ir_func *f, int region)
     int *active = malloc(g_nvregs * sizeof(*active));
     // Placed twice, in start order and with the clusters first (they need aligned runs, which singles would leave no
     // room for), and the one that takes fewer registers kept: neither always does, and one may not fit at all.
-    int *best = malloc(g_nvregs * sizeof(*best)), best_count = 0, fitted = 0;
-    for (int attempt = 0; attempt < 2; attempt++) {
-        g_clusters_first = attempt;
+    // Then once more in the winner's order, spread: each value in the register left alone longest of those below
+    // the most the same occupancy allows. Taking the lowest free register puts a value where one just died, and the
+    // scheduler can't move a write above the reads of the register's last value, nor a load above an earlier
+    // load's use when both land in one register. Spread singles can leave a cluster no aligned room below that
+    // budget: then spread in the other order, rather than fall back to the packed placement.
+    int *best = malloc(g_nvregs * sizeof(*best)), best_count = 0, fitted = 0, best_first = 0, budget = NREGS;
+    int *row_end = malloc(NREGS * sizeof(*row_end));
+    int spread_fitted = 0;
+    for (int attempt = 0; attempt < 4 && !spread_fitted; attempt++) {
+        int spread = attempt >= 2;
+        if (attempt == 2) {
+            if (!fitted)
+                break;
+            // + 1 for the exit's temporary and + 2 for the program counter (airc_back)
+            budget = best_count;
+            while (budget < NREGS && warps_at(budget + 1 + 3) == warps_at(best_count + 3))
+                budget++;
+            if (budget == best_count)
+                break;
+        }
+        g_clusters_first = spread ? best_first ^ (attempt == 3) : attempt;
+        for (int c = 0; c < NREGS; c++)
+            row_end[c] = -1;
         for (int i = 1; i < n; i++)
             for (int j = i; j > 0 && place_before(order[j], order[j - 1]); j--) {
                 int t = order[j];
@@ -2115,18 +2930,25 @@ static void regalloc(struct ir_func *f, int region)
                 if (seg_free(row, g_vregs[h].seg, base)) {
                     g_vregs[h].hw = g_vregs[src].hw;
                     seg_take(row, g_vregs[h].seg, base);
+                    took(row_end, h, base);
                     placed[h] = 1;
                     continue;
                 }
                 row[(start - base) / 64] |= 1ull << ((start - base) % 64);
             }
-            int r = -1, size = g_vregs[h].size, align = g_vregs[h].align;
-            for (int c = (from + align - 1) & ~(align - 1); c + size <= NREGS && r < 0; c += align) {
-                int ok = 1, j = h;
-                for (int k = 0; k < size && ok; k++, j = g_vregs[j].next)
+            int r = -1, size = g_vregs[h].size, align = g_vregs[h].align, age = 0;
+            for (int c = (from + align - 1) & ~(align - 1); c + size <= budget && (r < 0 || spread); c += align) {
+                int ok = 1, j = h, last = -1;
+                for (int k = 0; k < size && ok; k++, j = g_vregs[j].next) {
                     ok = !g_reserved[region][c + k] && seg_free(occ + (size_t)(c + k) * words, g_vregs[j].seg, base);
-                if (ok)
+                    int t = ok && spread ? last_taken(occ + (size_t)(c + k) * words, row_end, c + k, start - base) : -1;
+                    if (t > last)
+                        last = t;
+                }
+                if (ok && (r < 0 || last < age)) {
                     r = c;
+                    age = last;
+                }
             }
             if (r < 0) {
                 failed = i;
@@ -2136,14 +2958,17 @@ static void regalloc(struct ir_func *f, int region)
             for (int j = h; j >= 0; j = g_vregs[j].next, k++) {
                 g_vregs[j].hw = r + k;
                 seg_take(occ + (size_t)(r + k) * words, g_vregs[j].seg, base);
+                took(row_end, j, base);
                 if (r + k + 1 > g_regcount)
                     g_regcount = r + k + 1;
             }
             placed[h] = 1;
         }
-        if (failed < 0 && (!fitted || g_regcount < best_count)) {
+        spread_fitted = spread && failed < 0;
+        if (failed < 0 && (!fitted || g_regcount < best_count || spread)) {
             fitted = 1;
             best_count = g_regcount;
+            best_first = g_clusters_first;
             for (int i = 0; i < n; i++)
                 for (int j = order[i]; j >= 0; j = g_vregs[j].next)
                     best[j] = g_vregs[j].hw;
@@ -2154,28 +2979,72 @@ static void regalloc(struct ir_func *f, int region)
                 if (g_vregs[order[a]].start <= start && g_vregs[order[a]].end >= start)
                     active[na++] = order[a];
             note_spill_candidates(active, na);
-            airc_fail("out of registers");
         }
         for (int i = 0; i < (failed < 0 ? n : failed); i++)
             for (int j = order[i]; j >= 0; j = g_vregs[j].next)
                 g_vregs[j].hw = -1;
         g_regcount = regcount;
     }
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n && fitted; i++)
         for (int j = order[i]; j >= 0; j = g_vregs[j].next)
             g_vregs[j].hw = best[j];
-    g_regcount = best_count;
+    g_regcount = fitted ? best_count : regcount;
+    free(xfer);
+    free(order);
+    free(member);
     free(best);
+    free(row_end);
     free(occ);
     free(placed);
     free(active);
+    return fitted ? best_count : -1;
+}
+
+static int regalloc(struct ir_func *f, int region)
+{
+    // Coalescing can leave the clusters no aligned room: the values are placed with the phi copies coalesced and
+    // without, and the coalesced ones kept unless they take more granules of 8 registers (or don't fit).
+    int *hw0 = malloc(g_nvregs * sizeof(*hw0)), *hw1 = malloc(g_nvregs * sizeof(*hw1)), regcount = g_regcount;
+    for (int v = 0; v < g_nvregs; v++)
+        hw0[v] = g_vregs[v].hw;
+    compute_ranges(f, region);
+    int coalesced = coalesce_phis(region), count = -1, plain;
+    if (coalesced) {
+        compute_ranges(f, region);
+        count = place(region);
+        for (int v = 0; v < g_nvregs; v++) {
+            hw1[v] = g_vregs[v].hw;
+            g_vregs[v].hw = hw0[v];
+        }
+        int used = g_regcount;
+        g_regcount = regcount;
+        g_ncand = 0;
+        rename_vregs(0);
+        compute_ranges(f, region);
+        plain = place(region);
+        if (count >= 0 && (plain < 0 || (count + 9) / 8 <= (plain + 9) / 8)) {
+            for (int v = 0; v < g_nvregs; v++)
+                g_vregs[v].hw = hw0[v];
+            rename_vregs(1);
+            compute_ranges(f, region);
+            for (int v = 0; v < g_nvregs; v++)
+                g_vregs[v].hw = hw1[v];
+            g_regcount = used;
+            plain = count;
+        }
+    } else {
+        plain = place(region);
+    }
+    free(hw0);
+    free(hw1);
+    if (plain < 0)
+        return -1;
     // what each callee keeps out of: what this one does, and its values live across the call or read in the callee
-    for (int x = 0; x < nxfer; x++) {
-        const struct mop *m = &g_mops[xfer[x]];
+    for (int k = g_region_start[region]; k < g_region_end[region]; k++) {
+        const struct mop *m = &g_mops[k];
         if (m->k != MK_CALL)
             continue;
         char *keep = g_reserved[m->imm + 1];
-        int k = xfer[x];
         for (int r = 0; r < NREGS; r++)
             keep[r] |= g_reserved[region][r];
         for (int v = 0; v < g_nvregs; v++)
@@ -2186,9 +3055,7 @@ static void regalloc(struct ir_func *f, int region)
                 MEMBERS(w, m->xs[j].vreg)
                     keep[g_vregs[w].hw] = 1;
     }
-    free(xfer);
-    free(order);
-    free(member);
+    return 0;
 }
 
 static int hw(int vreg)
@@ -2205,15 +3072,14 @@ static int hw(int vreg)
 #define UNIFORM_LAT 3
 #define BAR_LAT 2
 #define UNIFORM_CYCLES 7  // the uniform datapath is slower: a load reading UR4 right after its ULDC reads garbage
-#define SLOW_CYCLES 13    // I2F: no table entry, kept well above the ALU's
-#define UR4_PSEUDO 254
+#define UR_PSEUDO 254     // the uniform registers, all loaded in the prologue
 #define P0_PSEUDO 250
 #define P6_PSEUDO 249
 
 // The pipe a fixed-latency result comes from, and the one that reads it, for the cycles from the writer's issue to
 // the reader's (NVIDIA's sm_80 table, as Mesa's NAK has it). IMAD.WIDE writes its low and high words at different
 // times and reads its operands at different stages.
-enum { WC_NONE, WC_ALU, WC_FMA, WC_WIDE_LO, WC_WIDE_HI, WC_FP16, WC_PRED, WC_UNIFORM, WC_SLOW };
+enum { WC_NONE, WC_ALU, WC_FMA, WC_WIDE_LO, WC_WIDE_HI, WC_FP16, WC_PRED, WC_UNIFORM, WC_I2FP };
 enum { RC_ALU, RC_FMA, RC_WIDE_AB, RC_WIDE_CH, RC_FP16, RC_DECOUPLED, RC_AGU, RC_VOTE };
 
 static int writer_class(const struct sass_insn *in)
@@ -2226,8 +3092,9 @@ static int writer_class(const struct sass_insn *in)
         return WC_FMA;
     case 0x030 ... 0x032:
         return WC_FP16;
+    case 0x043:  // F2IP, as nvcc spaces its readers
     case 0x045:
-        return WC_SLOW;
+        return WC_I2FP;
     default:
         return WC_ALU;
     }
@@ -2236,8 +3103,8 @@ static int writer_class(const struct sass_insn *in)
 static int reader_class(const struct sass_insn *in, int i)
 {
     switch (in->lo & 0x1ff) {
-    case 0x002: case 0x007: case 0x009: case 0x00b: case 0x00c: case 0x010: case 0x012: case 0x017: case 0x019:
-    case 0x03e:
+    case 0x002: case 0x007: case 0x009: case 0x00b: case 0x00c: case 0x010: case 0x012: case 0x016: case 0x017:
+    case 0x019: case 0x03e:
         return RC_ALU;
     case 0x006:
         return RC_VOTE;
@@ -2248,8 +3115,8 @@ static int reader_class(const struct sass_insn *in, int i)
         return i < 2 ? RC_WIDE_AB : i == 2 ? RC_FMA : RC_WIDE_CH;
     case 0x030 ... 0x032:
         return RC_FP16;
-    case 0x045: case 0x100: case 0x101: case 0x105: case 0x107: case 0x108: case 0x109: case 0x119: case 0x150:
-    case 0x161: case 0x164: case 0x167: case 0x16d: case 0x170: case 0x182:
+    case 0x043: case 0x045: case 0x100: case 0x101: case 0x105: case 0x107: case 0x108: case 0x109: case 0x119:
+    case 0x150: case 0x161: case 0x164: case 0x167: case 0x16d: case 0x170: case 0x182:
         return RC_DECOUPLED;
     default:
         return RC_AGU;
@@ -2266,8 +3133,8 @@ static unsigned raw_latency(int writer, int reader)
     };
     if (writer == WC_UNIFORM)
         return UNIFORM_CYCLES;
-    if (writer == WC_SLOW)
-        return SLOW_CYCLES;
+    if (writer == WC_I2FP)  // not in the table: nvcc's distances for sm_86
+        return reader == RC_ALU ? 4 : reader == RC_FMA ? 5 : 6;
     if (writer == WC_PRED)  // only an ALU or FMA instruction takes a predicate quickly
         return reader == RC_ALU ? 4 : reader == RC_FMA ? 5 : 13;
     // a cycle more for readers outside the ALU and FMA pipes: at the table's figures the compute thread ID,
@@ -2288,7 +3155,6 @@ static unsigned worst_latency(int writer)
 
 static struct sass_insn *g_prog;
 static unsigned g_np, g_prog_cap;
-static int g_barrier_of[256];
 static unsigned g_wcycle[256];  // when a fixed-latency write to each register issued
 static uint8_t g_wclass[256];    // and from which pipe, WC_NONE when nothing is pending
 static unsigned g_bar_set[6];
@@ -2359,6 +3225,10 @@ static void probe_write(int reg)
         g_fx.wr[g_fx.nwr++] = (uint8_t)reg;
 }
 
+// barriers a drain left for the next instruction: waiting on one nothing is pending on costs nothing, so it may
+// be reached from elsewhere too
+static unsigned g_carried_waits;
+
 static void sched_push(struct sass_insn in, const uint8_t *srcs, int nsrc, int dst, int wide, unsigned lat)
 {
     if (g_probe) {
@@ -2381,6 +3251,8 @@ static void sched_push(struct sass_insn in, const uint8_t *srcs, int nsrc, int d
         if (t > need)
             need = t;
     }
+    in.hi |= (uint64_t)g_carried_waits << 52;
+    g_carried_waits = 0;
     unsigned wait = (in.hi >> 52) & 0x3f;
     for (int b = 0; b < 6; b++)
         if ((wait >> b & 1) && g_bar_set[b] + BAR_LAT > need)
@@ -2403,31 +3275,66 @@ static void sched_push(struct sass_insn in, const uint8_t *srcs, int nsrc, int d
     g_cycle += get_stall(&in);
 }
 
-// g_rbar_of[r]: the read barrier a still-pending instruction holds on r (it reads r after issue), or -1
-static int g_rbar_of[256];
+// The scoreboards still pending for each register, a bit each: a result to land in it (g_wbar_of), and late reads
+// of it (g_rbar_of: memory, texture and the like read their sources after issue). Where paths meet a register may
+// be pending on several, and a register read late by several instructions has to wait for them all before it is
+// written.
+static unsigned g_wbar_of[256], g_rbar_of[256];
 
 // The scoreboards held by atomics and loads of shared memory, which a threadgroup barrier has to wait for: one
 // still in flight when the barrier releases the other warps lets them read or update the word before it lands.
 static unsigned g_mem_bars;
 static int g_mem_op;
 
-// A scoreboard nothing waits on any more, the one set longest ago first; with none free the one set longest ago,
-// which is the nearest to done.
-static int take_bar(void)
+// By mop: its late reads' registers aren't written again in its run, so its result's barrier can stand for them, and
+// one fewer is taken (schedule_segment); g_rd_free for the mop being emitted.
+static unsigned char *g_rd_free_of;
+static int g_rd_free;
+
+// an instruction waits on these: everything they were set for is done, whichever registers it was for
+static void settle(unsigned waits)
 {
-    char used[6] = { 0 };
+    if (!waits)
+        return;
     for (int r = 0; r < 256; r++) {
-        if (g_barrier_of[r] >= 0)
-            used[g_barrier_of[r]] = 1;
-        if (g_rbar_of[r] >= 0)
-            used[g_rbar_of[r]] = 1;
+        g_wbar_of[r] &= ~waits;
+        g_rbar_of[r] &= ~waits;
     }
-    int best = 0;
-    for (int b = 1; b < 6; b++)
-        if (used[b] < used[best] || (used[b] == used[best] && g_bar_set[b] < g_bar_set[best]))
+    g_mem_bars &= ~waits;
+}
+
+// the scoreboards something is still pending on, a bit each
+static unsigned taken(void)
+{
+    unsigned used = 0;
+    for (int r = 0; r < 256; r++)
+        used |= g_wbar_of[r] | g_rbar_of[r];
+    return used;
+}
+
+// A scoreboard nothing waits on any more, the one set longest ago first. With none free, the one set longest ago,
+// which is the nearest to done: shared while it is recent, as whatever reads its results then waits a little longer
+// for the new one too; once it is older than a load takes, waited for first instead (*wait), which costs nothing
+// by then and keeps a long wait on the new one off the old results' readers. Never one in avoid: the instruction's
+// own write barrier, which waiting on would lose.
+#define STALE_BAR 150
+static int take_bar(unsigned *wait, unsigned avoid)
+{
+    unsigned used = taken();
+    int best = -1;
+    for (int b = 0; b < 6; b++) {
+        if (avoid >> b & 1)
+            continue;
+        int ub = used >> b & 1, ubest = best >= 0 ? (int)(used >> best & 1) : 2;
+        if (ub < ubest || (ub == ubest && g_bar_set[b] < g_bar_set[best]))
             best = b;
-    if (!used[best])
+    }
+    if (!(used >> best & 1))
         g_mem_bars &= ~(1u << best);
+    else if (g_bar_set[best] + STALE_BAR <= g_cycle) {
+        *wait |= 1u << best;
+        settle(1u << best);
+    }
     return best;
 }
 
@@ -2446,67 +3353,104 @@ static uint32_t sched(const uint8_t *srcs, int nsrc, int var_dst, int dst, int d
     }
     struct sass_ctrl c = { .stall = 1, .yield = 1, .wr = SASS_NO_BARRIER, .rd = SASS_NO_BARRIER };
     for (int i = 0; i < nsrc; i++)
-        if (srcs[i] != SASS_RZ && g_barrier_of[srcs[i]] >= 0) {
-            c.wait |= 1u << g_barrier_of[srcs[i]];
-            g_barrier_of[srcs[i]] = -1;
-        }
-    for (int k = 0; dst >= 0 && k < dstw; k++) {
-        int r = dst + k;
-        if (g_barrier_of[r] >= 0) {
-            c.wait |= 1u << g_barrier_of[r];
-            g_barrier_of[r] = -1;
-        }
-        if (g_rbar_of[r] >= 0) {
-            int b = g_rbar_of[r];
-            c.wait |= 1u << b;
-            for (int j = 0; j < 256; j++)  // that barrier covered every register its reader held
-                if (g_rbar_of[j] == b)
-                    g_rbar_of[j] = -1;
-        }
-    }
-    if (late) {
-        c.rd = take_bar();
-        if (g_mem_op)
-            g_mem_bars |= 1u << c.rd;
-        for (int i = 0; i < nsrc; i++)
-            if (srcs[i] != SASS_RZ && srcs[i] < 240)
-                g_rbar_of[srcs[i]] = c.rd;
-    }
+        if (srcs[i] != SASS_RZ)
+            c.wait |= g_wbar_of[srcs[i]];
+    for (int k = 0; dst >= 0 && k < dstw; k++)
+        c.wait |= g_wbar_of[dst + k] | g_rbar_of[dst + k];
+    settle(c.wait);
+    unsigned wait = c.wait;
     if (var_dst) {
-        c.wr = take_bar();
+        c.wr = take_bar(&wait, 0);
         if (g_mem_op)
             g_mem_bars |= 1u << c.wr;
         for (int k = 0; k < dstw; k++)
-            g_barrier_of[dst + k] = c.wr;
+            g_wbar_of[dst + k] = 1u << c.wr;
     }
+    // A result lands after its sources are read, so its barrier covers the reads too: with every scoreboard taken,
+    // that is where they go when nothing writes them again before the result would be waited for anyway.
+    if (late) {
+        if (!var_dst || !g_rd_free || taken() != 0x3f)
+            c.rd = take_bar(&wait, var_dst ? 1u << c.wr : 0);
+        int b = c.rd >= 0 ? c.rd : c.wr;
+        if (g_mem_op)
+            g_mem_bars |= 1u << b;
+        for (int i = 0; i < nsrc; i++)
+            if (srcs[i] != SASS_RZ && srcs[i] < 240)
+                g_rbar_of[srcs[i]] |= 1u << b;
+    }
+    c.wait = wait;
     return sass_ctrl_word(c);
 }
 
-// Before control leaves a block: wait until every outstanding result and late read is done, so the block
-// reached starts from nothing pending (it may be entered from elsewhere).
-static void drain(void)
+// Before a branch: let every fixed-latency result land, as the code it goes to doesn't know their timing, and keep
+// a scoreboard set just before from being waited for straight after the jump.
+static void settle_fixed(void)
 {
     unsigned need = g_cycle;
-    struct sass_ctrl c = { .stall = 1, .wr = SASS_NO_BARRIER, .rd = SASS_NO_BARRIER };
-    for (int r = 0; r < 256; r++) {
+    for (int r = 0; r < 256; r++)
         if (g_wclass[r] != WC_NONE) {
             unsigned t = g_wcycle[r] + worst_latency(g_wclass[r]);
             if (t > need)
                 need = t;
             g_wclass[r] = WC_NONE;
         }
-        if (g_barrier_of[r] >= 0) {
-            c.wait |= 1u << g_barrier_of[r];
-            g_barrier_of[r] = -1;
-        }
-        if (g_rbar_of[r] >= 0) {
-            c.wait |= 1u << g_rbar_of[r];
-            g_rbar_of[r] = -1;
-        }
-    }
+    unsigned pending = taken() | g_mem_bars;
+    for (int b = 0; b < 6; b++)
+        if ((pending >> b & 1) && g_bar_set[b] + BAR_LAT > need)
+            need = g_bar_set[b] + BAR_LAT;
     stall_until(need);
-    if (c.wait)  // the NOP only carries the waits
-        sched_push(sass_nop(sass_ctrl_word(c)), NULL, 0, -1, 0, 0);
+}
+
+// Before a branch back, a call or a return: wait until every outstanding result and late read is done, so the code
+// reached starts from nothing pending. The barriers are waited for by the next instruction (g_carried_waits).
+static void drain(void)
+{
+    settle_fixed();
+    unsigned wait = taken();
+    settle(wait);
+    g_carried_waits |= wait;
+}
+
+// What the forward branches to a mop leave pending, by its index (NULL for none): the scoreboards of a block
+// reached from more than one place are those of every way in, and a branch back drains, so a loop's head only sees
+// the ways in from before it.
+struct pending {
+    unsigned wbar[256], rbar[256], mem;
+};
+static struct pending **g_into;
+static int g_reached;  // the code being emitted is reached from the instruction before it
+
+static void branch_to(int mop)
+{
+    if (!g_into[mop])
+        g_into[mop] = calloc(1, sizeof(**g_into));
+    struct pending *p = g_into[mop];
+    for (int r = 0; r < 256; r++) {
+        p->wbar[r] |= g_wbar_of[r];
+        p->rbar[r] |= g_rbar_of[r];
+    }
+    p->mem |= g_mem_bars;
+}
+
+// at a mop branches may go to: what is pending there
+static void arrive(int mop)
+{
+    struct pending *p = g_into[mop];
+    if (!g_reached) {
+        memset(g_wbar_of, 0, sizeof(g_wbar_of));
+        memset(g_rbar_of, 0, sizeof(g_rbar_of));
+        g_mem_bars = 0;
+    }
+    g_reached = 1;
+    if (!p)
+        return;
+    for (int r = 0; r < 256; r++) {
+        g_wbar_of[r] |= p->wbar[r];
+        g_rbar_of[r] |= p->rbar[r];
+    }
+    g_mem_bars |= p->mem;
+    free(p);
+    g_into[mop] = NULL;
 }
 
 // A demoted thread's memory writes don't happen: they go under @!P6, which joins their sources so they wait for
@@ -2629,6 +3573,7 @@ static void emit_ret(const struct mop *m)
     drain();
     sched_push(sass_ret_rel(WIN_RA, 0, sched(NULL, 0, 0, -1, 0, 0)), NULL, 0, -1, 0, 0);
     set_rel(&g_prog[g_np - 1], -(int32_t)g_np * 16);
+    g_reached = 0;
 }
 
 // A fragment's colours into R0.. at its exit, from the registers MK_OUTPUT found them in. Some of those may be in
@@ -2671,13 +3616,60 @@ static void exit_moves(int n)
     }
 }
 
+// An edge whose phi copies all coalesced is a branch alone, so a loop branches once a trip. A true edge's stub is
+// left out (its branch without a target) and the conditional branch goes there itself; a false edge's branch is
+// the conditional one, negated, when the true edge's block follows.
+static int coalesced(const struct mop *m)
+{
+    return m->k == MK_MOV && hw(m->def) == hw(m->src[0]);
+}
+
+// does the code after mop i go on into block b: past nothing, or only a stub or a branch left out
+static int falls_into(int i, int b)
+{
+    int k = i + 1;
+    while (k < g_block_mop[b] &&
+           (coalesced(&g_mops[k]) || (g_mops[k].k == MK_BRA && g_mops[k].target < 0 && g_mops[k].label < 0)))
+        k++;
+    return k == g_block_mop[b];
+}
+
+static void skip_empty_edges(void)
+{
+    for (int i = 0; i < g_nmops; i++) {
+        struct mop *m = &g_mops[i];
+        if (m->k != MK_BRA || !m->aux)
+            continue;
+        if (m->label >= 0) {
+            int k = m->label;
+            while (coalesced(&g_mops[k]))
+                k++;
+            if (g_mops[k].k != MK_BRA || g_mops[k].aux)
+                continue;
+            m->target = g_mops[k].target;
+            m->label = -1;
+            g_mops[k].target = -1;
+        }
+        int k = i + 1;
+        while (coalesced(&g_mops[k]))
+            k++;
+        if (g_mops[k].k == MK_BRA && !g_mops[k].aux && g_mops[k].target >= 0 && falls_into(k, m->target)) {
+            m->aux = 2;
+            m->target = g_mops[k].target;
+            g_mops[k].target = -1;
+        }
+    }
+}
+
 static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
 {
     for (int k = 0; k < n; k++) {
         int i = list[k];
         struct mop *m = &g_mops[i];
-        if (!g_probe)
+        if (!g_probe) {
             g_mop_np[i] = g_np;
+            g_rd_free = g_rd_free_of[i];
+        }
         int d = m->def >= 0 ? hw(m->def) : -1;
         uint8_t s[6];
         for (int j = 0; j < m->nsrc; j++)
@@ -2691,7 +3683,9 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             sched_push(sass_imadmov_imm(d, (uint32_t)m->imm, c), NULL, 0, d, 0, FIXED_LAT);
             break;
         case MK_MOV:
-            if (d == s[0])  // coalesced
+            // coalesced; the scheduler still sees it read and write the register, so it keeps its place among the
+            // two values' other reads and writes for the second allocation, which may not coalesce it
+            if (d == s[0] && !g_probe)
                 break;
             c = sched(s, 1, 0, d, 1, 0);
             sched_push(sass_mov_rr(d, s[0], c), s, 1, d, 0, FIXED_LAT);
@@ -2733,10 +3727,19 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             c = sched(s, 2, 0, d, 1, 0);
             sched_push(sass_isub_rr(d, s[0], s[1], c), s, 2, d, 0, FIXED_LAT);
             break;
-        case MK_IMAD:
-            c = sched(s, 2, 0, d, 1, 0);
-            sched_push(sass_imad_rr(d, s[0], s[1], c), s, 2, d, 0, FIXED_LAT);
+        case MK_IMAD: {
+            uint8_t rc = m->nsrc > 2 ? s[2] : SASS_RZ, ss[3] = { s[0] };
+            int n = 1;
+            if (!m->immb)
+                ss[n++] = s[1];
+            if (m->nsrc > 2)
+                ss[n++] = rc;
+            c = sched(ss, n, 0, d, 1, 0);
+            sched_push(m->immb ? sass_imm(sass_imad_rr(d, s[0], 0, rc, c), (uint32_t)m->imm)
+                               : sass_imad_rr(d, s[0], s[1], rc, c),
+                       ss, n, d, 0, FIXED_LAT);
             break;
+        }
         case MK_IMADHI:
             c = sched(s, 2, 0, d, 1, 0);
             sched_push(sass_imadhi_rr(d, s[0], s[1], m->aux, c), s, 2, d, 0, FIXED_LAT);
@@ -2746,6 +3749,10 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             sched_push(m->immb ? sass_imm(sass_lop3(d, s[0], 0, (uint8_t)m->aux, c), (uint32_t)m->imm)
                                : sass_lop3(d, s[0], s[1], (uint8_t)m->aux, c),
                        s, m->nsrc, d, 0, FIXED_LAT);
+            break;
+        case MK_PRMT:
+            c = sched(s, 1, 0, d, 1, 0);
+            sched_push(sass_prmt(d, s[0], (uint16_t)m->imm, SASS_RZ, c), s, 1, d, 0, FIXED_LAT);
             break;
         case MK_LOP3_IMM:
             c = sched(s, 1, 0, d, 1, 0);
@@ -2787,26 +3794,28 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             sched_push(add, s, m->nsrc, d, 0, FIXED_LAT);
             break;
         }
-        case MK_FMUL:
+        case MK_FMUL: {
             c = sched(s, m->nsrc, 0, d, 1, 0);
-            sched_push(m->aux & 2    ? sass_hmul2(d, s[0], s[1], c)
-                       : m->aux & 16 ? with_mods(sass_ftz(sass_fmul_imm(d, s[0], (uint32_t)m->imm, c)), m->mods,
-                                                 SASS_MOD_A, -1, -1)
-                                     : with_mods(sass_ftz(sass_fmul(d, s[0], s[1], c)), m->mods, SASS_MOD_A,
-                                                 SASS_MOD_B, -1),
-                       s, m->nsrc, d, 0, FIXED_LAT);
+            struct sass_insn mul = m->aux & 2    ? sass_hmul2(d, s[0], s[1], c)
+                                   : m->aux & 16 ? with_mods(sass_ftz(sass_fmul_imm(d, s[0], (uint32_t)m->imm, c)),
+                                                             m->mods, SASS_MOD_A, -1, -1)
+                                                 : with_mods(sass_ftz(sass_fmul(d, s[0], s[1], c)), m->mods,
+                                                             SASS_MOD_A, SASS_MOD_B, -1);
+            sched_push(m->aux & 64 ? sass_sat(mul) : mul, s, m->nsrc, d, 0, FIXED_LAT);
             break;
+        }
         case MK_FFMA: {
             int mode = m->aux >> 2 & 3;
             c = sched(s, m->nsrc, 0, d, 1, 0);
-            sched_push(m->aux & 2    ? sass_hfma2(d, s[0], s[1], s[2], c)
-                       : m->aux & 16 ? with_mods(sass_ftz(sass_ffma_imm_b(d, s[0], (uint32_t)m->imm, s[1], mode, c)),
-                                                 m->mods, SASS_MOD_A, SASS_MOD_C, -1)
-                       : m->aux & 32 ? with_mods(sass_ftz(sass_ffma_imm_c(d, s[0], s[1], (uint32_t)m->imm, mode, c)),
-                                                 m->mods, SASS_MOD_A, SASS_MOD_C, -1)
-                                     : with_mods(sass_ftz(sass_ffma(d, s[0], s[1], s[2], mode, c)), m->mods,
-                                                 SASS_MOD_A, SASS_MOD_B, SASS_MOD_C),
-                       s, m->nsrc, d, 0, FIXED_LAT);
+            struct sass_insn fma =
+                m->aux & 2    ? sass_hfma2(d, s[0], s[1], s[2], c)
+                : m->aux & 16 ? with_mods(sass_ftz(sass_ffma_imm_b(d, s[0], (uint32_t)m->imm, s[1], mode, c)), m->mods,
+                                          SASS_MOD_A, SASS_MOD_C, -1)
+                : m->aux & 32 ? with_mods(sass_ftz(sass_ffma_imm_c(d, s[0], s[1], (uint32_t)m->imm, mode, c)),
+                                          m->mods, SASS_MOD_A, SASS_MOD_C, -1)
+                              : with_mods(sass_ftz(sass_ffma(d, s[0], s[1], s[2], mode, c)), m->mods, SASS_MOD_A,
+                                          SASS_MOD_B, SASS_MOD_C);
+            sched_push(m->aux & 64 ? sass_sat(fma) : fma, s, m->nsrc, d, 0, FIXED_LAT);
             break;
         }
         case MK_FMNMX:
@@ -2842,6 +3851,10 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
         case MK_F2I:
             c = sched(s, 1, 1, d, 1, 1);
             sched_push(sass_f2i(d, s[0], m->aux, c), s, 1, d, 0, 0);
+            break;
+        case MK_F2IP:
+            c = sched(s, 1, 0, d, 1, 0);
+            sched_push(sass_f2ip_u8(d, s[0], c), s, 1, d, 0, FIXED_LAT);
             break;
         case MK_F2H:
             c = sched(s, m->nsrc, 0, d, 1, 0);
@@ -2894,47 +3907,72 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
                        ss, m->immb ? 2 : 3, d, 0, FIXED_LAT);
             break;
         }
-        case MK_ATOM: {  // variable latency, like a load
-            int shared = IR_ATOMA_SHARED(m->aux);
-            uint8_t ss[5] = { s[0], s[1], s[2], (uint8_t)(s[0] + 1) };
+        case MK_ATOM: {  // variable latency, like a load; with no result, a read barrier on its sources alone
+            int shared = IR_ATOMA_SHARED(m->aux), ret = m->def >= 0;
+            uint8_t ss[6] = { s[0], s[1], s[2], (uint8_t)(s[0] + 1) };
             int n = demote_src(ss, shared ? 3 : 4);
             g_mem_op = 1;
-            c = sched(ss, n, 1, d, 1, 1);
+            c = sched(ss, n, ret, d, ret, 1);
             g_mem_op = 0;
-            sched_push(demote_guard(sass_atom(IR_ATOMA_OP(m->aux), shared, IR_ATOMA_TYPE(m->aux), d, s[0],
-                                              (uint32_t)m->imm, s[1], s[2], c)),
-                       ss, n, d, 0, 0);
+            struct sass_insn in;
+            if (ret || shared) {
+                in = sass_atom(IR_ATOMA_OP(m->aux), shared, IR_ATOMA_TYPE(m->aux), ret ? d : SASS_RZ, s[0],
+                               (uint32_t)m->imm, s[1], s[2], c);
+            } else {
+                in = sass_red(IR_ATOMA_OP(m->aux), IR_ATOMA_TYPE(m->aux), s[0], (uint32_t)m->imm, s[1], c);
+                ss[n++] = UR_PSEUDO;  // the descriptor, as LDG.E reads it
+            }
+            sched_push(demote_guard(in), ss, n, d, 0, 0);
             break;
         }
         case MK_LDG: {
-            uint8_t ss[3] = { s[0], (uint8_t)(s[0] + 1), UR4_PSEUDO };
-            c = sched(ss, 2, 1, d, m->aux > 4 ? m->aux / 4 : 1, 1);
-            sched_push(sass_ldg(d, s[0], (uint32_t)m->imm, mem_size(m->aux), c), ss, 3, d, 0, 0);
+            int wide = m->src[0] != VREG_RZ && !m->narrow, n = 0;
+            uint8_t ss[3];
+            if (m->src[0] != VREG_RZ)
+                ss[n++] = s[0];
+            if (wide)
+                ss[n++] = (uint8_t)(s[0] + 1);
+            c = sched(ss, n, 1, d, m->aux > 4 ? m->aux / 4 : 1, n > 0);
+            ss[n++] = UR_PSEUDO;
+            struct sass_insn in = m->ur ? sass_ldg_ur(d, s[0], wide, (uint8_t)m->ur, (uint32_t)m->imm, mem_size(m->aux), c)
+                                        : sass_ldg(d, s[0], (uint32_t)m->imm, mem_size(m->aux), c);
+            sched_push(m->readonly ? sass_ldg_constant(in) : in, ss, n, d, 0, 0);
             break;
         }
         case MK_STG: {
-            int words = m->aux > 4 ? m->aux / 4 : 1;
-            uint8_t ss[7] = { s[0], (uint8_t)(s[0] + 1) };
+            int words = m->aux > 4 ? m->aux / 4 : 1, wide = m->src[0] != VREG_RZ && !m->narrow, n = 0;
+            uint8_t ss[8];
+            if (m->src[0] != VREG_RZ)
+                ss[n++] = s[0];
+            if (wide)
+                ss[n++] = (uint8_t)(s[0] + 1);
             for (int k = 0; k < words; k++)
-                ss[2 + k] = (uint8_t)(s[1] + k);
-            int n = demote_src(ss, 2 + words);
+                ss[n++] = (uint8_t)(s[1] + k);
+            n = demote_src(ss, n);
             c = sched(ss, n, 0, -1, 0, 1);
-            sched_push(demote_guard(sass_stg(s[0], (uint32_t)m->imm, s[1], mem_size(m->aux), c)), ss, n, -1, 0, 0);
+            ss[n++] = UR_PSEUDO;
+            sched_push(demote_guard(m->ur ? sass_stg_ur(s[0], wide, (uint8_t)m->ur, (uint32_t)m->imm, s[1],
+                                                        mem_size(m->aux), c)
+                                          : sass_stg(s[0], (uint32_t)m->imm, s[1], mem_size(m->aux), c)),
+                       ss, n, -1, 0, 0);
             break;
         }
         case MK_LDS: {
             uint8_t a = m->nsrc ? s[0] : SASS_RZ;
             uint8_t ss[1] = { a };
             g_mem_op = 1;
-            c = sched(ss, m->nsrc, 1, d, 1, 1);
+            c = sched(ss, m->nsrc, 1, d, m->aux > 4 ? m->aux / 4 : 1, 1);
             g_mem_op = 0;
             sched_push(sass_lds(d, a, (uint32_t)m->imm, mem_size(m->aux), c), ss, m->nsrc, d, 0, 0);
             break;
         }
-        case MK_STS: {
-            uint8_t ss[2] = { s[1], s[0] };
-            c = sched(ss, 2, 0, -1, 0, 1);
-            sched_push(sass_sts(s[0], (uint32_t)m->imm, s[1], mem_size(m->aux), c), ss, 2, -1, 0, 0);
+        case MK_STS: {  // every register of a wide store's data is read late
+            int words = m->aux > 4 ? m->aux / 4 : 1;
+            uint8_t ss[5] = { s[0] };
+            for (int k = 0; k < words; k++)
+                ss[1 + k] = (uint8_t)(s[1] + k);
+            c = sched(ss, 1 + words, 0, -1, 0, 1);
+            sched_push(sass_sts(s[0], (uint32_t)m->imm, s[1], mem_size(m->aux), c), ss, 1 + words, -1, 0, 0);
             break;
         }
         case MK_LDL: {  // as LDG: every register of a wide load waits on it
@@ -2964,20 +4002,13 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
                 break;
             }
             c = sched(NULL, 0, 0, -1, 0, 0);
-            for (int r = 0; r < 256; r++) {
-                if (g_barrier_of[r] >= 0 && (g_mem_bars >> g_barrier_of[r] & 1)) {
-                    c |= (uint32_t)1 << (20 + g_barrier_of[r]);
-                    g_barrier_of[r] = -1;
-                }
-                if (g_rbar_of[r] >= 0 && (g_mem_bars >> g_rbar_of[r] & 1)) {
-                    c |= (uint32_t)1 << (20 + g_rbar_of[r]);
-                    g_rbar_of[r] = -1;
-                }
-            }
-            sched_push(sass_bar_sync(c), NULL, 0, -1, 0, 0);
+            unsigned held = 0;
+            for (int r = 0; r < 256; r++)
+                held |= (g_wbar_of[r] | g_rbar_of[r]) & g_mem_bars;
+            settle(held);
+            sched_push(sass_bar_sync(c | held << 20), NULL, 0, -1, 0, 0);
             break;
         case MK_BSSY:
-            drain();
             c = sched(NULL, 0, 0, -1, 0, 0);
             sched_push(sass_bssy((uint8_t)m->imm, 0, c), NULL, 0, -1, 0, 0);
             g_fix[g_nfix].at = g_np - 1;
@@ -2985,7 +4016,6 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             g_fix[g_nfix++].mop = 0;
             break;
         case MK_BSYNC:
-            drain();
             c = sched(NULL, 0, 0, -1, 0, 0);
             sched_push(sass_bsync((uint8_t)m->imm, c), NULL, 0, -1, 0, 0);
             break;
@@ -3001,9 +4031,11 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             }
             break;
         case MK_IMADWIDE: {
-            uint8_t ss[4] = { s[0], s[1], s[2], (uint8_t)(s[2] + 1) };
-            c = sched(ss, 4, 0, d, 2, 0);
-            sched_push(sass_imadwide_rr(d, s[0], s[1], s[2], m->aux, c), ss, 4, d, 1, FIXED_LAT);
+            uint8_t ss[4] = { s[0], s[2], (uint8_t)(s[2] + 1), s[1] };
+            int n = m->immb ? 3 : 4;
+            c = sched(ss, n, 0, d, 2, 0);
+            struct sass_insn in = sass_imadwide_rr(d, s[0], m->immb ? 0 : s[1], s[2], m->aux, c);
+            sched_push(m->immb ? sass_imm(in, m->imm) : in, ss, n, d, 1, FIXED_LAT);
             break;
         }
         case MK_TEX: {
@@ -3050,13 +4082,21 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             break;
         }
         case MK_BRA: {
-            drain();
             uint8_t ps[1] = { P0_PSEUDO };
-            int cond = m->aux;
-            if (!cond && m->target >= 0 && g_block_mop[m->target] == i + 1)
+            int cond = m->aux != 0;
+            if (m->target < 0 && m->label < 0)
+                break;
+            if (!cond && falls_into(i, m->target))
                 break;  // the block it goes to follows
+            settle_fixed();
+            int to = m->target >= 0 ? g_block_mop[m->target] : m->label;
+            if (to <= i)
+                drain();
+            else
+                branch_to(to);
             c = sched(cond ? ps : NULL, cond, 0, -1, 0, 0);
-            sched_push(sass_bra(0, cond ? 0 : 7, 0, c), cond ? ps : NULL, cond, -1, 0, 0);
+            sched_push(sass_bra(0, cond ? 0 : 7, m->aux == 2, c), cond ? ps : NULL, cond, -1, 0, 0);
+            g_reached = cond;
             g_fix[g_nfix].at = g_np - 1;
             g_fix[g_nfix].block = m->target;
             g_fix[g_nfix++].mop = m->label;
@@ -3094,6 +4134,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             }
             c = sched(NULL, 0, 0, -1, 0, 0);
             sched_push(sass_exit(c), NULL, 0, -1, 0, 0);
+            g_reached = 0;
             break;
         case MK_CALL:
             emit_call(m);
@@ -3377,6 +4418,20 @@ static void schedule_segment(int *order, int lo, int hi, int sink, enum nvk_stag
             now++;
         }
         free(ready);
+        uint64_t later[4] = { 0 };  // registers written after, in the order chosen
+        for (int p = n - 1; p >= 0; p--) {
+            struct snode *nd = &nodes[order[lo + p] - lo];
+            int free_rd = nd->fx.late && nd->fx.async;
+            for (int a = 0; a < nd->fx.nrd && free_rd; a++) {
+                int r = nd->fx.rd[a];
+                free_rd = !(later[r / 64] >> r % 64 & 1);
+                for (int k = 0; k < nd->fx.nwr && free_rd; k++)
+                    free_rd = nd->fx.wr[k] != r;
+            }
+            g_rd_free_of[nd->mop] = (unsigned char)free_rd;
+            for (int k = 0; k < nd->fx.nwr; k++)
+                later[nd->fx.wr[k] / 64] |= 1ull << nd->fx.wr[k] % 64;
+        }
     }
     for (int j = 0; j < n; j++) {
         free(nodes[j].out);
@@ -3389,9 +4444,9 @@ static void schedule_segment(int *order, int lo, int hi, int sink, enum nvk_stag
     free(nodes);
 }
 
-static void emit_mops(enum nvk_stage stage)
+// the mops into SASS, each straight run in the order schedule_segment gives it, which is left in order
+static void emit_mops(enum nvk_stage stage, int *order)
 {
-    int *order = malloc((g_nmops + 1) * sizeof(*order));
     char *start = calloc(g_nmops + 1, 1);
     for (int i = 0; i < g_nmops; i++) {
         order[i] = i;
@@ -3409,34 +4464,126 @@ static void emit_mops(enum nvk_stage stage)
             while (hi < g_nmops && !start[hi] && !is_fence(&g_mops[hi]))
                 hi++;
         if (!plain && hi - lo > 1) {
-            int sink = hi < g_nmops && g_mops[hi].k == MK_BRA && g_mops[hi].aux ? P0_PSEUDO : -1;
+            int f = hi < g_nmops && g_mops[hi].k == MK_BSSY ? hi + 1 : hi;
+            int sink = f < g_nmops && g_mops[f].k == MK_BRA && g_mops[f].aux ? P0_PSEUDO : -1;
             schedule_segment(order, lo, hi, sink, stage);
         }
         unsigned at = g_np;
+        arrive(lo);
         emit_mops_in(order + lo, hi - lo, stage);
         g_mop_np[lo] = at;
         lo = hi;
     }
-    free(order);
     free(start);
+}
+
+// Registers for the mops, then their SASS into g_prog, the order emit_mops gave each straight run left in order.
+// 0, or -1 when the values don't fit.
+static int allocate_and_emit(struct ir_func *f, const struct airc_info *info, int *order)
+{
+    memset(g_reserved, 0, sizeof(g_reserved));
+    g_regcount = 2;
+    for (int r = 0; r < g_nregions; r++)
+        g_reserved[r][1] = 1;
+    for (int k = 0; k < g_nregions; k++)
+        if (regalloc(f, g_topo[k]) < 0)
+            return -1;
+    skip_empty_edges();
+    if (g_win_end > g_regcount)
+        g_regcount = g_win_end;
+    g_scratch = g_regcount;
+    g_stage_exit = airc_pass_off("AIRC_STAGEEXIT");
+    if (g_stage_exit) {
+        g_regcount += g_exit_regs > 4 ? g_exit_regs : 4;
+        g_exit_tmp = g_regcount - 1;
+    } else {
+        // the colours land in R0.. and the one temporary a cycle of moves needs is past them
+        g_exit_tmp = g_scratch > g_exit_regs ? g_scratch : g_exit_regs;
+        g_regcount = g_exit_tmp + 1;
+    }
+
+    g_np = 0;
+    g_nfix = 0;
+    g_mem_bars = 0;
+    g_cycle = 0;
+    g_carried_waits = 0;
+    g_reached = 1;
+    memset(g_wbar_of, 0, sizeof(g_wbar_of));
+    memset(g_rbar_of, 0, sizeof(g_rbar_of));
+    memset(g_wclass, WC_NONE, sizeof(g_wclass));
+    memset(g_bar_set, 0, sizeof(g_bar_set));
+    g_mop_np = calloc(g_nmops + 1, sizeof(*g_mop_np));
+    g_rd_free_of = calloc(g_nmops + 1, 1);
+    g_rd_free = 0;
+    g_into = calloc(g_nmops + 1, sizeof(*g_into));
+    g_block_np = calloc(f->nblocks, sizeof(*g_block_np));
+
+    // prologue: R1 = stack pointer, UR4 = the global memory base (LDG reads it implicitly), the buffers' bases
+    sched_push(sass_mov_cbuf(1, 0, 0x28, sched(NULL, 0, 0, 1, 1, 0)), NULL, 0, 1, 0, FIXED_LAT);
+    sched_push(sass_uldc64_cbuf(4, 0, 0x118, sched(NULL, 0, 0, -1, 0, 0)), NULL, 0, UR_PSEUDO, 0, UNIFORM_LAT);
+    for (int k = 0; k < g_nubase; k++)
+        if (g_ubase[k].used)
+            sched_push(sass_uldc64_cbuf(UR_FIRST + 2 * k, 0, (uint16_t)g_ubase[k].off, sched(NULL, 0, 0, -1, 0, 0)),
+                       NULL, 0, UR_PSEUDO, 0, UNIFORM_LAT);
+    if (g_demote)
+        sched_push(sass_isetp(6, SASS_RZ, SASS_RZ, ISETP_NE, 0, sched(NULL, 0, 0, P6_PSEUDO, 1, 0)), NULL, 0, P6_PSEUDO,
+                   0, PRED_LAT);
+
+    emit_mops(info->stage, order);
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        if (!b->dead)
+            g_block_np[b->id] = g_mop_np[g_block_mop[b->id]];
+
+    prog_emit(sass_bra_self(CTRL_STALL1));
+    while (g_np % 8 || g_np < 16)
+        prog_emit(sass_nop(CTRL_STALL1));
+
+    for (int i = 0; i < g_nfix; i++) {
+        int target = g_fix[i].block >= 0 ? g_block_np[g_fix[i].block] : (int)g_mop_np[g_fix[i].mop];
+        set_rel(&g_prog[g_fix[i].at], target * 16 - ((int)g_fix[i].at * 16 + 0x10));
+    }
+    free(g_mop_np);
+    free(g_rd_free_of);
+    free(g_block_np);
+    for (int i = 0; i <= g_nmops; i++)  // a stub's, left out
+        free(g_into[i]);
+    free(g_into);
+    return 0;
+}
+
+// does a schedule keep every mop within the run it was lowered in: between fences, block starts and stubs
+static int in_runs(const int *order)
+{
+    char *start = calloc(g_nmops + 1, 1);
+    for (int i = 0; i < g_nmops; i++)
+        if (g_mops[i].label >= 0)
+            start[g_mops[i].label] = 1;
+    for (struct ir_block *b = g_fn->entry; b; b = b->next)
+        if (!b->dead)
+            start[g_block_mop[b->id]] = 1;
+    int ok = 1;
+    for (int lo = 0; lo < g_nmops && ok;) {
+        int hi = lo + 1;
+        if (!is_fence(&g_mops[lo]))
+            while (hi < g_nmops && !start[hi] && !is_fence(&g_mops[hi]))
+                hi++;
+        for (int i = lo; i < hi && ok; i++)
+            ok = order[i] >= lo && order[i] < hi;
+        lo = hi;
+    }
+    free(start);
+    return ok;
 }
 
 unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsigned *size, unsigned *regs)
 {
     g_info = (struct airc_info *)info;
+    airc_widen_shared(f, info);
     spill_values(f);
     g_nmops = 0;
     g_nvregs = 0;
-    g_nfix = 0;
     g_exit_regs = 0;
     g_demote = 0;
-    g_np = 0;
-    g_mem_bars = 0;
-    g_cycle = 0;
-    for (int i = 0; i < 256; i++)
-        g_barrier_of[i] = g_rbar_of[i] = -1;
-    memset(g_wclass, WC_NONE, sizeof(g_wclass));
-    memset(g_bar_set, 0, sizeof(g_bar_set));
 
     memset(g_consts, 0xff, sizeof(g_consts));  // block -1: all free
     g_one = new_vreg(1, 1);
@@ -3457,7 +4604,13 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
     find_needed_mods(f);
     find_half_pairs(f);
     count_uses(f);
+    find_fused_muls(f);
+    find_folds(f);
+    find_reductions(f);
     phi_outside(f);
+    find_uniform_bases(f);
+    find_readonly_loads(f);
+    g_noffsets = 0;
     memset(g_region_start, 0, sizeof(g_region_start));
     memset(g_region_end, 0, sizeof(g_region_end));
     for (struct ir_block *b = f->entry, *prev = NULL; b; b = b->next)
@@ -3475,51 +4628,64 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
                 v->op != IR_CALL && g_vregs[v->vreg].size == 1)
                 g_vregs[v->vreg].ir = v->id;
             else if (v->vreg >= 0 && v->type == IR_VOID && g_vregs[v->vreg].size > 1 &&
-                     (v->op == IR_LDG || v->op == IR_LDL || v->op == IR_TEX))
+                     (v->op == IR_LDG || v->op == IR_LDS || v->op == IR_LDL || v->op == IR_TEX))
                 g_vregs[v->vreg].ir = v->id;
 
-    memset(g_reserved, 0, sizeof(g_reserved));
-    g_regcount = 2;
-    for (int r = 0; r < g_nregions; r++)
-        g_reserved[r][1] = 1;
-    for (int k = 0; k < g_nregions; k++)
-        regalloc(f, g_topo[k]);
-    if (g_win_end > g_regcount)
-        g_regcount = g_win_end;
-    g_scratch = g_regcount;
-    g_stage_exit = airc_pass_off("AIRC_STAGEEXIT");
-    if (g_stage_exit) {
-        g_regcount += g_exit_regs > 4 ? g_exit_regs : 4;
-        g_exit_tmp = g_regcount - 1;
+    // Allocated and scheduled twice: the second time with each straight run's mops in the order the first
+    // schedule left them, so the registers follow the loads it started early, and the scheduler is no longer held
+    // back by the first allocation's reuse of a register. Kept unless it costs occupancy or doesn't fit.
+    struct mop *mops = malloc(g_nmops * sizeof(*mops));
+    memcpy(mops, g_mops, g_nmops * sizeof(*mops));
+    struct vreg *vregs = malloc(g_nvregs * sizeof(*vregs));
+    memcpy(vregs, g_vregs, g_nvregs * sizeof(*vregs));
+    size_t nxfers = 0;
+    for (int i = 0; i < g_nmops; i++)
+        nxfers += g_mops[i].nxs + g_mops[i].nxd;
+    struct xfer *xfers = malloc((nxfers + 1) * sizeof(*xfers));
+    nxfers = 0;
+    for (int i = 0; i < g_nmops; i++) {
+        memcpy(xfers + nxfers, g_mops[i].xs, g_mops[i].nxs * sizeof(*xfers));
+        nxfers += g_mops[i].nxs;
+        memcpy(xfers + nxfers, g_mops[i].xd, g_mops[i].nxd * sizeof(*xfers));
+        nxfers += g_mops[i].nxd;
+    }
+    int *order = malloc((g_nmops + 1) * sizeof(*order));
+    if (allocate_and_emit(f, info, order) < 0) {
+        free(mops);
+        free(vregs);
+        free(xfers);
+        free(order);
+        airc_fail("out of registers");
+    }
+    struct sass_insn *prog = g_prog;
+    unsigned np = g_np, count = g_regcount;
+    g_prog = NULL;
+    g_prog_cap = 0;
+
+    memcpy(g_mops, mops, g_nmops * sizeof(*mops));
+    memcpy(g_vregs, vregs, g_nvregs * sizeof(*vregs));
+    nxfers = 0;
+    for (int i = 0; i < g_nmops; i++) {
+        memcpy(g_mops[i].xs, xfers + nxfers, g_mops[i].nxs * sizeof(*xfers));
+        nxfers += g_mops[i].nxs;
+        memcpy(g_mops[i].xd, xfers + nxfers, g_mops[i].nxd * sizeof(*xfers));
+        nxfers += g_mops[i].nxd;
+    }
+    int again = in_runs(order);
+    for (int i = 0; again && i < g_nmops; i++)
+        g_mops[i] = mops[order[i]];
+    if (again && allocate_and_emit(f, info, order) == 0 && warps_at(g_regcount + 2) >= warps_at(count + 2)) {
+        free(prog);
     } else {
-        // the colours land in R0.. and the one temporary a cycle of moves needs is past them
-        g_exit_tmp = g_scratch > g_exit_regs ? g_scratch : g_exit_regs;
-        g_regcount = g_exit_tmp + 1;
+        free(g_prog);
+        g_prog = prog;
+        g_np = np;
+        g_regcount = count;
     }
-
-    g_mop_np = calloc(g_nmops + 1, sizeof(*g_mop_np));
-    g_block_np = calloc(f->nblocks, sizeof(*g_block_np));
-
-    // prologue: R1 = stack pointer, UR4 = the global memory base (LDG reads it implicitly)
-    sched_push(sass_mov_cbuf(1, 0, 0x28, sched(NULL, 0, 0, 1, 1, 0)), NULL, 0, 1, 0, FIXED_LAT);
-    sched_push(sass_uldc64_cbuf(4, 0, 0x118, sched(NULL, 0, 0, -1, 0, 0)), NULL, 0, UR4_PSEUDO, 0, UNIFORM_LAT);
-    if (g_demote)
-        sched_push(sass_isetp(6, SASS_RZ, SASS_RZ, ISETP_NE, 0, sched(NULL, 0, 0, P6_PSEUDO, 1, 0)), NULL, 0, P6_PSEUDO,
-                   0, PRED_LAT);
-
-    emit_mops(info->stage);
-    for (struct ir_block *b = f->entry; b; b = b->next)
-        if (!b->dead)
-            g_block_np[b->id] = g_mop_np[g_block_mop[b->id]];
-
-    prog_emit(sass_bra_self(CTRL_STALL1));
-    while (g_np % 8 || g_np < 16)
-        prog_emit(sass_nop(CTRL_STALL1));
-
-    for (int i = 0; i < g_nfix; i++) {
-        int target = g_fix[i].block >= 0 ? g_block_np[g_fix[i].block] : (int)g_mop_np[g_fix[i].mop];
-        set_rel(&g_prog[g_fix[i].at], target * 16 - ((int)g_fix[i].at * 16 + 0x10));
-    }
+    free(mops);
+    free(vregs);
+    free(xfers);
+    free(order);
 
     unsigned hdr = info->stage == NVK_COMPUTE ? 0 : SPH_BYTES;
     *size = hdr + g_np * 16;
@@ -3545,8 +4711,6 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
     unsigned r = (g_regcount + 2 + 7) & ~7u;  // + 2 for the program counter, rounded to the 8-register granule
     *regs = r < 8 ? 8 : r;
 
-    free(g_mop_np);
-    free(g_block_np);
     free(g_prog);
     g_prog = NULL;
     g_prog_cap = 0;

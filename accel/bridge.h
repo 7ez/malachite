@@ -3,6 +3,7 @@
 #pragma once
 #include <IOKit/IOService.h>
 #include "../gpu_bridge.h"
+#include "commands.h"
 
 namespace malachite::accel {
 
@@ -16,6 +17,7 @@ namespace malachite::rm {
 
 IOReturn queue_dispatch(IOService *gpu, void *ctx, const struct nvgpu_dispatch *d);
 IOReturn queue_draw(IOService *gpu, void *ctx, const struct nvgpu_draw *d, const char **why);
+IOReturn queue_push(IOService *gpu, void *ctx, const struct malachite_push *p);
 IOReturn queue_copy2d(IOService *gpu, void *ctx, const struct nvgpu_copy2d *p);
 IOReturn queue_compress(IOService *gpu, void *ctx, uint64_t va);
 

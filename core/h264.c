@@ -1,77 +1,6 @@
 // H.264 parameter sets, slice headers, picture order count and reference marking, ITU-T H.264 7.3, 8.2.1, 8.2.5
 #include "h264.h"
-
-// RBSP bits of one NAL unit, emulation prevention bytes skipped; reads past the end give zeros and set over
-struct bits {
-    const uint8_t *p;
-    size_t len, pos;  // pos: the next byte of the NAL to load
-    uint32_t cur;
-    int left, zeros;
-    int over;
-    uint64_t stop;  // the bit position of rbsp_stop_one_bit
-};
-
-static void bits_init(struct bits *b, const uint8_t *p, size_t len)
-{
-    *b = (struct bits){ .p = p, .len = len };
-    while (len && !p[len - 1])
-        len--;
-    if (len) {
-        int bit = 0;
-        while (!(p[len - 1] >> bit & 1))
-            bit++;
-        b->stop = (uint64_t)len * 8 - 1 - bit;
-    }
-}
-
-static uint32_t bit(struct bits *b)
-{
-    if (!b->left) {
-        if (b->pos < b->len && b->zeros >= 2 && b->p[b->pos] == 3) {
-            b->pos++;
-            b->zeros = 0;
-        }
-        if (b->pos >= b->len) {
-            b->over = 1;
-            return 0;
-        }
-        b->cur = b->p[b->pos++];
-        b->zeros = b->cur ? 0 : b->zeros + 1;
-        b->left = 8;
-    }
-    return b->cur >> --b->left & 1;
-}
-
-static uint32_t u(struct bits *b, int n)
-{
-    uint32_t v = 0;
-    while (n--)
-        v = v << 1 | bit(b);
-    return v;
-}
-
-static uint32_t ue(struct bits *b)
-{
-    int n = 0;
-    while (!bit(b) && n < 32 && !b->over)
-        n++;
-    if (n >= 32) {
-        b->over = 1;
-        return 0;
-    }
-    return (uint32_t)((1ull << n) - 1 + u(b, n));
-}
-
-static int32_t se(struct bits *b)
-{
-    uint32_t v = ue(b);
-    return v & 1 ? (int32_t)((v + 1) / 2) : -(int32_t)(v / 2);
-}
-
-static int more_rbsp_data(struct bits *b)
-{
-    return (uint64_t)b->pos * 8 - b->left < b->stop;
-}
+#include "bitreader.h"
 
 // whether a scaling_list() was anything but the flat default
 static int scaling_list(struct bits *b, int size)
@@ -79,7 +8,7 @@ static int scaling_list(struct bits *b, int size)
     int last = 8, next = 8, flat = 1;
     for (int j = 0; j < size; j++) {
         if (next) {
-            next = (last + se(b) + 256) % 256;
+            next = (last + bits_se(b) + 256) % 256;
             if (j == 0 && !next)
                 return 0;  // the default list, not flat either
         }
@@ -95,7 +24,7 @@ static int scaling_matrix(struct bits *b, int lists)
 {
     int flat = 1;
     for (int i = 0; i < lists; i++)
-        if (u(b, 1))
+        if (bits_u(b, 1))
             flat &= scaling_list(b, i < 6 ? 16 : 64);
     return flat ? 0 : -1;
 }
@@ -103,10 +32,10 @@ static int scaling_matrix(struct bits *b, int lists)
 static int parse_sps(struct h264_dec *d, struct bits *b)
 {
     struct h264_sps s = { .valid = 1, .chroma_format = 1 };
-    s.profile = u(b, 8);
-    u(b, 8);
-    s.level = u(b, 8);
-    uint32_t id = ue(b);
+    s.profile = bits_u(b, 8);
+    bits_u(b, 8);
+    s.level = bits_u(b, 8);
+    uint32_t id = bits_ue(b);
     if (id >= H264_MAX_SPS)
         return -1;
     // the profiles whose SPS says how chroma and bit depth go
@@ -115,44 +44,44 @@ static int parse_sps(struct h264_dec *d, struct bits *b)
     for (unsigned i = 0; i < sizeof(high); i++)
         is_high |= s.profile == high[i];
     if (is_high) {
-        s.chroma_format = ue(b);
+        s.chroma_format = bits_ue(b);
         if (s.chroma_format == 3)
-            u(b, 1);  // separate_colour_plane_flag
-        s.bit_depth_luma = ue(b);
-        s.bit_depth_chroma = ue(b);
-        s.transform_bypass = u(b, 1);
-        if (u(b, 1) && scaling_matrix(b, s.chroma_format != 3 ? 8 : 12)) {
+            bits_u(b, 1);  // separate_colour_plane_flag
+        s.bit_depth_luma = bits_ue(b);
+        s.bit_depth_chroma = bits_ue(b);
+        s.transform_bypass = bits_u(b, 1);
+        if (bits_u(b, 1) && scaling_matrix(b, s.chroma_format != 3 ? 8 : 12)) {
             log_msg("h264: SPS %u has scaling matrices\n", id);
             return -1;
         }
     }
-    s.log2_max_frame_num = ue(b) + 4;
-    s.poc_type = ue(b);
+    s.log2_max_frame_num = bits_ue(b) + 4;
+    s.poc_type = bits_ue(b);
     if (s.poc_type == 0) {
-        s.log2_max_poc_lsb = ue(b) + 4;
+        s.log2_max_poc_lsb = bits_ue(b) + 4;
     } else if (s.poc_type == 1) {
-        s.delta_pic_order_always_zero = u(b, 1);
-        s.offset_for_non_ref_pic = se(b);
-        s.offset_for_top_to_bottom = se(b);
-        s.poc_cycle = ue(b);
+        s.delta_pic_order_always_zero = bits_u(b, 1);
+        s.offset_for_non_ref_pic = bits_se(b);
+        s.offset_for_top_to_bottom = bits_se(b);
+        s.poc_cycle = bits_ue(b);
         if (s.poc_cycle > 255)
             return -1;
         for (uint32_t i = 0; i < s.poc_cycle; i++)
-            s.offset_for_ref_frame[i] = se(b);
+            s.offset_for_ref_frame[i] = bits_se(b);
     }
-    s.max_num_ref_frames = ue(b);
-    s.gaps_allowed = u(b, 1);
-    s.width_mbs = ue(b) + 1;
-    s.height_mbs = ue(b) + 1;
-    s.frame_mbs_only = u(b, 1);
+    s.max_num_ref_frames = bits_ue(b);
+    s.gaps_allowed = bits_u(b, 1);
+    s.width_mbs = bits_ue(b) + 1;
+    s.height_mbs = bits_ue(b) + 1;
+    s.frame_mbs_only = bits_u(b, 1);
     if (!s.frame_mbs_only)
-        s.mbaff = u(b, 1);
-    s.direct_8x8_inference = u(b, 1);
-    if (u(b, 1)) {
-        s.crop_left = ue(b) * 2;
-        s.crop_right = ue(b) * 2;
-        s.crop_top = ue(b) * 2;
-        s.crop_bottom = ue(b) * 2;
+        s.mbaff = bits_u(b, 1);
+    s.direct_8x8_inference = bits_u(b, 1);
+    if (bits_u(b, 1)) {
+        s.crop_left = bits_ue(b) * 2;
+        s.crop_right = bits_ue(b) * 2;
+        s.crop_top = bits_ue(b) * 2;
+        s.crop_bottom = bits_ue(b) * 2;
     }
     if (b->over || s.max_num_ref_frames > H264_DPB || s.log2_max_frame_num > 16 || s.log2_max_poc_lsb > 16 ||
         s.width_mbs > 512 || s.height_mbs > 512 || s.crop_left + s.crop_right >= s.width_mbs * 16 ||
@@ -169,34 +98,34 @@ static int parse_sps(struct h264_dec *d, struct bits *b)
 static int parse_pps(struct h264_dec *d, struct bits *b)
 {
     struct h264_pps p = { .valid = 1 };
-    uint32_t id = ue(b);
-    p.sps = ue(b);
+    uint32_t id = bits_ue(b);
+    p.sps = bits_ue(b);
     if (id >= H264_MAX_PPS || p.sps >= H264_MAX_SPS || !d->sps[p.sps].valid)
         return -1;
-    p.cabac = u(b, 1);
-    p.bottom_field_pic_order = u(b, 1);
-    if (ue(b)) {
+    p.cabac = bits_u(b, 1);
+    p.bottom_field_pic_order = bits_u(b, 1);
+    if (bits_ue(b)) {
         log_msg("h264: PPS %u has slice groups\n", id);
         return -1;
     }
-    p.num_ref_idx_l0 = ue(b);
-    p.num_ref_idx_l1 = ue(b);
-    p.weighted_pred = u(b, 1);
-    p.weighted_bipred_idc = u(b, 2);
-    p.pic_init_qp = se(b);
-    se(b);  // pic_init_qs_minus26
-    p.chroma_qp_index_offset = se(b);
-    p.deblocking_control = u(b, 1);
-    p.constrained_intra_pred = u(b, 1);
-    p.redundant_pic_cnt = u(b, 1);
+    p.num_ref_idx_l0 = bits_ue(b);
+    p.num_ref_idx_l1 = bits_ue(b);
+    p.weighted_pred = bits_u(b, 1);
+    p.weighted_bipred_idc = bits_u(b, 2);
+    p.pic_init_qp = bits_se(b);
+    bits_se(b);  // pic_init_qs_minus26
+    p.chroma_qp_index_offset = bits_se(b);
+    p.deblocking_control = bits_u(b, 1);
+    p.constrained_intra_pred = bits_u(b, 1);
+    p.redundant_pic_cnt = bits_u(b, 1);
     p.second_chroma_qp_index_offset = p.chroma_qp_index_offset;
-    if (more_rbsp_data(b)) {
-        p.transform_8x8 = u(b, 1);
-        if (u(b, 1) && scaling_matrix(b, 6 + 2 * p.transform_8x8)) {
+    if (bits_more_rbsp_data(b)) {
+        p.transform_8x8 = bits_u(b, 1);
+        if (bits_u(b, 1) && scaling_matrix(b, 6 + 2 * p.transform_8x8)) {
             log_msg("h264: PPS %u has scaling matrices\n", id);
             return -1;
         }
-        p.second_chroma_qp_index_offset = se(b);
+        p.second_chroma_qp_index_offset = bits_se(b);
     }
     if (b->over || p.num_ref_idx_l0 > 31 || p.num_ref_idx_l1 > 31)
         return -1;
@@ -206,30 +135,30 @@ static int parse_pps(struct h264_dec *d, struct bits *b)
 
 static void skip_ref_list_modification(struct bits *b)
 {
-    if (!u(b, 1))
+    if (!bits_u(b, 1))
         return;
     for (int i = 0; i < 100 && !b->over; i++) {
-        uint32_t idc = ue(b);
+        uint32_t idc = bits_ue(b);
         if (idc == 3)
             return;
-        ue(b);
+        bits_ue(b);
     }
     b->over = 1;
 }
 
 static void skip_pred_weight_table(struct bits *b, const struct h264_slice *h, uint32_t l0, uint32_t l1)
 {
-    ue(b);  // luma_log2_weight_denom
-    ue(b);  // chroma_log2_weight_denom, 4:2:0 only
+    bits_ue(b);  // luma_log2_weight_denom
+    bits_ue(b);  // chroma_log2_weight_denom, 4:2:0 only
     for (int list = 0; list < (h->type == 1 ? 2 : 1); list++) {
         for (uint32_t i = 0; i <= (list ? l1 : l0); i++) {
-            if (u(b, 1)) {
-                se(b);
-                se(b);
+            if (bits_u(b, 1)) {
+                bits_se(b);
+                bits_se(b);
             }
-            if (u(b, 1))
+            if (bits_u(b, 1))
                 for (int j = 0; j < 4; j++)
-                    se(b);
+                    bits_se(b);
         }
     }
 }
@@ -239,40 +168,40 @@ static int parse_slice(const struct h264_dec *d, struct bits *b, uint32_t nal_ty
                        struct h264_slice *h)
 {
     *h = (struct h264_slice){ .nal_type = nal_type, .nal_ref_idc = nal_ref_idc };
-    h->first_mb = ue(b);
-    h->type = ue(b) % 5;
-    h->pps = ue(b);
+    h->first_mb = bits_ue(b);
+    h->type = bits_ue(b) % 5;
+    h->pps = bits_ue(b);
     if (h->pps >= H264_MAX_PPS || !d->pps[h->pps].valid)
         return -1;
     const struct h264_pps *p = &d->pps[h->pps];
     const struct h264_sps *s = &d->sps[p->sps];
     if (!s->valid)
         return -1;
-    h->frame_num = u(b, s->log2_max_frame_num);
+    h->frame_num = bits_u(b, s->log2_max_frame_num);
     if (nal_type == 5)
-        h->idr_pic_id = ue(b);
+        h->idr_pic_id = bits_ue(b);
     if (s->poc_type == 0) {
-        h->poc_lsb = u(b, s->log2_max_poc_lsb);
+        h->poc_lsb = bits_u(b, s->log2_max_poc_lsb);
         if (p->bottom_field_pic_order)
-            h->delta_poc_bottom = se(b);
+            h->delta_poc_bottom = bits_se(b);
     }
     if (s->poc_type == 1 && !s->delta_pic_order_always_zero) {
-        h->delta_poc[0] = se(b);
+        h->delta_poc[0] = bits_se(b);
         if (p->bottom_field_pic_order)
-            h->delta_poc[1] = se(b);
+            h->delta_poc[1] = bits_se(b);
     }
-    if (p->redundant_pic_cnt && ue(b)) {
+    if (p->redundant_pic_cnt && bits_ue(b)) {
         log_msg("h264: redundant pictures\n");
         return -1;
     }
     if (h->type == 1)
-        u(b, 1);  // direct_spatial_mv_pred_flag
+        bits_u(b, 1);  // direct_spatial_mv_pred_flag
     uint32_t l0 = p->num_ref_idx_l0, l1 = p->num_ref_idx_l1;
     if (h->type == 0 || h->type == 1 || h->type == 3) {
-        if (u(b, 1)) {
-            l0 = ue(b);
+        if (bits_u(b, 1)) {
+            l0 = bits_ue(b);
             if (h->type == 1)
-                l1 = ue(b);
+                l1 = bits_ue(b);
         }
     }
     if (h->type != 2 && h->type != 4) {
@@ -284,11 +213,11 @@ static int parse_slice(const struct h264_dec *d, struct bits *b, uint32_t nal_ty
         skip_pred_weight_table(b, h, l0, l1);
     if (nal_ref_idc) {
         if (nal_type == 5) {
-            u(b, 1);  // no_output_of_prior_pics_flag
-            h->long_term_reference = u(b, 1);
-        } else if ((h->adaptive_marking = u(b, 1))) {
+            bits_u(b, 1);  // no_output_of_prior_pics_flag
+            h->long_term_reference = bits_u(b, 1);
+        } else if ((h->adaptive_marking = bits_u(b, 1))) {
             for (;;) {
-                uint32_t op = ue(b);
+                uint32_t op = bits_ue(b);
                 if (!op || b->over)
                     break;
                 if (h->nmmco == H264_MMCO_MAX || op > 6)
@@ -296,13 +225,13 @@ static int parse_slice(const struct h264_dec *d, struct bits *b, uint32_t nal_ty
                 struct h264_mmco *m = &h->mmco[h->nmmco++];
                 m->op = op;
                 if (op == 1 || op == 3)
-                    m->pic_num_diff = ue(b) + 1;
+                    m->pic_num_diff = bits_ue(b) + 1;
                 if (op == 2)
-                    m->long_term_pic_num = ue(b);
+                    m->long_term_pic_num = bits_ue(b);
                 if (op == 3 || op == 6)
-                    m->long_term_frame_idx = ue(b);
+                    m->long_term_frame_idx = bits_ue(b);
                 if (op == 4)
-                    m->max_long_term_frame_idx = ue(b);
+                    m->max_long_term_frame_idx = bits_ue(b);
             }
         }
     }
@@ -314,24 +243,6 @@ void h264_init(struct h264_dec *d)
     *d = (struct h264_dec){ 0 };
 }
 
-// the next NAL unit from *pos: its payload and length, start code skipped; 0 at the end
-static int next_nal(const uint8_t *s, size_t len, size_t *pos, size_t *start, size_t *size)
-{
-    size_t i = *pos;
-    while (i + 3 <= len && !(s[i] == 0 && s[i + 1] == 0 && s[i + 2] == 1))
-        i++;
-    if (i + 3 > len)
-        return 0;
-    *start = i + 3;
-    for (i = *start; i + 3 <= len; i++)
-        if (s[i] == 0 && s[i + 1] == 0 && s[i + 2] <= 1)
-            break;
-    if (i + 3 > len)
-        i = len;
-    *size = i - *start;
-    *pos = i;
-    return 1;
-}
 
 static uint32_t max_frame_num(const struct h264_sps *s)
 {
@@ -479,7 +390,7 @@ int h264_next(struct h264_dec *d, const uint8_t *s, size_t len, size_t *pos, str
     size_t at = *pos, start, size;
     int ret = 0;
     pic->nslices = 0;
-    while (next_nal(s, len, &at, &start, &size)) {
+    while (bits_next_nal(s, len, &at, &start, &size)) {
         if (!size)
             continue;
         uint32_t type = s[start] & 0x1f, ref_idc = s[start] >> 5 & 3;

@@ -8,6 +8,8 @@
 #include <IOKit/IOMemoryDescriptor.h>
 #include <libkern/OSAtomic.h>
 
+extern "C" void log_msg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 namespace malachite::accel {
 
 MalachiteDefineClass(Task, IOAccelTask)
@@ -41,6 +43,11 @@ void Task::free()
 // (which preparing the map later walks); we hand out Gpu's: the map's VRAM or pages, mapped in the GPU vmm.
 uint64_t Task::allocate(const IOAccelMemoryMap *map)
 {
+    // with no context of its own a task's maps would land in the kernel's address space
+    if (gGpu && !kernel && !context()) {
+        log_msg("Malachite: a buffer is refused, its task has no GPU context\n");
+        return 0;
+    }
     uint64_t va = 0;
     IOReturn r = kIOReturnNotReady;
     IOAccelMemory *mem = map_memory(map);

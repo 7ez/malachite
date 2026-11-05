@@ -42,8 +42,12 @@ int chan_alloc(struct gsp *s, const struct rm_client *c, uint32_t parent, uint32
 void chan_res_free(struct gsp *s, struct chan_res *res);  // after GSP-RM freed the channel
 
 int chan_find_engine(struct gsp *s, const struct rm_client *c, uint32_t want, uint32_t *engine, uint32_t *runlist);
-// privileged: an admin channel (the kernel's own); else a user one, which can't touch its own GPFIFO and push
-// buffer, nor the registers an admin channel may
+// privileged: an admin channel, CHAN_KERNEL for the kernel's own, CHAN_ADMIN for an app's the kernel alone pushes
+// to (its GPFIFO and push buffer read-only to the app's shaders), which may run host methods a user one may not
+// (MEM_OP's L2 operations); 0 a user one, which can't touch its own GPFIFO and push buffer, nor the registers an
+// admin channel may
+#define CHAN_KERNEL 1
+#define CHAN_ADMIN 2
 int chan_create(struct gsp *s, const struct rm_client *c, struct vmm *vm, uint32_t engine, uint32_t runlist,
                 uint32_t chid, uint32_t handle, int privileged, struct chan *ch);
 int chan_schedule(struct chan *ch);
@@ -61,6 +65,11 @@ uint32_t chan_save(const struct chan *ch, uint32_t gp, uint32_t *out);
 int chan_replay(struct chan *ch, const uint32_t *saved, uint32_t n);
 // chan_submit in two: queue methods, then have the GPU go on with everything queued
 void chan_push(struct chan *ch, const uint32_t *push, uint32_t n);
+// chan_push in two, for methods written in place: room for n words, then the n written
+uint32_t *chan_reserve(struct chan *ch, uint32_t n);
+void chan_commit(struct chan *ch, uint32_t n);
+// one GPFIFO entry for `words` of methods elsewhere than the pushbuffer (va 4-aligned); push_off stays
+void chan_entry(struct chan *ch, uint64_t va, uint32_t words);
 void chan_kick(struct chan *ch);
 uint32_t chan_gp_get(struct chan *ch);
 
@@ -97,8 +106,14 @@ void chan_copy_surface_queue(struct chan *ch, const struct copy_surface *src, co
                              uint32_t bytes, uint32_t lines, uint32_t remap, uint64_t semva, uint32_t payload);
 // a copy channel writing payload to the word at semva once the work queued before it is done
 void chan_release_queue(struct chan *ch, uint64_t semva, uint32_t payload);
+// queued on an admin channel: L2's dirty lines written back, and with invalidate its lines of system memory dropped
+// too, so VMM_CACHED memory the CPU wrote is read afresh
+void chan_l2_sysmem(struct chan *ch, int invalidate);
 // the channel's later work waits until the word at semva has reached payload (a release by another channel)
 void chan_acquire_queue(struct chan *ch, uint64_t semva, uint32_t payload);
+// likewise, but giving the engine to other channels while it waits (ACQUIRE_SWITCH_TSG): a wait that may never end
+// (on work a fault lost) then holds up only this channel
+void chan_acquire_queue_switch(struct chan *ch, uint64_t semva, uint32_t payload);
 // lines rows of bytes each, from src to dst, rows src_pitch and dst_pitch apart; otherwise as chan_copy
 int chan_copy2d(struct chan *ch, uint64_t src, uint32_t src_pitch, uint64_t dst, uint32_t dst_pitch, uint32_t bytes,
                 uint32_t lines, volatile uint32_t *sem, uint64_t semva, uint32_t payload);
