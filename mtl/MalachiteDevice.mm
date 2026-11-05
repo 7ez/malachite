@@ -5788,6 +5788,23 @@ static void malachite_upload_wait(void)
         usleep(20);
 }
 
+// Whether the queue has a command buffer to spare now. Asking for one waits on the queue's semaphore with no timeout,
+// and WindowServer can hold every one of its own until the one being committed is through: its main thread hung there
+// for good. Taken and given straight back, so another thread can still take it first, which only delays this one.
+static bool malachite_queue_has_room(id<MTLCommandQueue> queue)
+{
+    static Ivar ivar;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        ivar = class_getInstanceVariable(objc_getClass("_MTLCommandQueue"), "_commandBufferSemaphore");
+    });
+    dispatch_semaphore_t sem = ivar ? object_getIvar(queue, ivar) : nil;
+    if (!sem || dispatch_semaphore_wait(sem, DISPATCH_TIME_NOW))
+        return false;
+    dispatch_semaphore_signal(sem);
+    return true;
+}
+
 static void malachite_upload_managed(MalachiteCommandBuffer *cb)
 {
     static id<MTLCommandQueue> last;
@@ -5818,7 +5835,7 @@ static void malachite_upload_managed(MalachiteCommandBuffer *cb)
                                                                               options:MTLResourceStorageModeShared];
     });
     bool direct = ((id<MTLCommandBuffer>)cb).status < MTLCommandBufferStatusEnqueued &&
-                  [(MTLIOAccelCommandQueue *)queue maxCommandBufferCount] >= 32;
+                  [(MTLIOAccelCommandQueue *)queue maxCommandBufferCount] >= 32 && malachite_queue_has_room(queue);
     id<MTLCommandBuffer> u = [direct ? queue : own commandBuffer];
     for (NSUInteger i = 0; i < work.count; i++) {
         MalachiteBuffer *b = work[i];
