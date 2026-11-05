@@ -51,8 +51,19 @@ int gsp_cleanup(struct gpu *g);
 struct gpu *gsp_gpu(struct gsp *s);
 struct vram *gsp_vram(struct gsp *s);
 
-// called from message processing when GSP-RM recovers a channel; must not send RPCs itself
-typedef void (*gsp_rc_fn)(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, uint64_t fault_va);
+// an MMU fault as GSP-RM described it with the channel recovery, names from dev_fault.h (NV_PFAULT_*)
+struct gsp_fault {
+    uint64_t va;         // of the page; 0 is a real answer (a null pointer), not a missing one
+    const char *type;    // "PDE", "PTE", "read-only", ...
+    const char *access;  // "read", "write", ...
+    char client[24];     // the unit that faulted: "GPC 1 PE_2" (a TPC's primitive engine), "hub CE0"
+    uint32_t engine;     // NV_PFAULT_MMU_ENG_ID_*, 0x40 graphics
+};
+
+// called from message processing when GSP-RM recovers a channel; must not send RPCs itself. fault is NULL when
+// the recovery wasn't for an MMU fault and only lives for the call.
+typedef void (*gsp_rc_fn)(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception,
+                          const struct gsp_fault *fault);
 // Channel IDs, one space for every client of ours: the core keeps 1-5 (copy, its tests, golden context, the
 // kernel's graphics channel), contexts and the frontend's clients take the rest from first on; -1 when all are taken
 #define GSP_CHIDS 2048

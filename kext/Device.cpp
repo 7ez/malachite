@@ -150,7 +150,8 @@ struct gpu_ctx {
     // writing L2's dirty ones back (l2_sysmem), so the CPU and WindowServer's uncached mappings see them
     bool cached_sys;
     uint64_t methods_va;  // the mapping push_run last found a run in
-    uint64_t fault_va;    // where GSP-RM's word of the last fault says it was, for recover()'s log
+    gsp_fault fault;      // GSP-RM's word of the last MMU fault, for recover()'s log; type NULL for none
+    uint32_t fault_chid;  // the channel it was on
     uint64_t kind_va;       // the depth target last given its kind
     uint32_t kind_set;
     bool kind_compressed;
@@ -189,6 +190,7 @@ struct gpu_ctx {
         uint64_t prog, vs;  // a draw's vs, and its ps in prog
         uint64_t params[4];  // its first two shader argument words, of the vs then the ps
         uint64_t target, zt;  // a draw's colour and depth targets
+        uint64_t index, streams[4];  // and what its primitive engine fetches: index buffer, first vertex streams
     } launches[8];
     uint64_t busy_since;  // when its outstanding graphics work began (time_us), 0 when none is
     uint64_t busy_unbilled;  // its busy time Accelerator has not yet charged to the task (NVGPU_FN_CTX_BUSY)
@@ -561,7 +563,8 @@ class Gpu : public IOService
     {
         c->issued[c->issued_next++ % 128] = { c->compute_seq, c->compute_ch.gp_put };
     }
-    static void rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, uint64_t fault_va);
+    static void rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, const gsp_fault *fault);
+    void log_fault(gpu_ctx *c, const char *channel, uint32_t chid);
     void recover(gpu_ctx *c);
     int ring_wait(gpu_ctx *c, int counter, uint32_t payload, int ms);
     void resync_screens();
@@ -2852,7 +2855,7 @@ void Gpu::ctx_close(uintptr_t handle)
 
 // GSP-RM's word that a channel faulted and is torn down: GSP-RM stops it and it never runs again, so ours are freed
 // and made anew before their next use (recover()). Called from message handling, which may be inside a wait.
-void Gpu::rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, uint64_t fault_va)
+void Gpu::rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, const gsp_fault *fault)
 {
     Gpu *self = (Gpu *)ctx;
     for (int i = -1; i < MAX_CTXS; i++) {
@@ -2861,9 +2864,45 @@ void Gpu::rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception
             c->compute_faulted = true;
         if (c && c->gpu_ready && chid == c->copy_ch.chid)
             c->copy_faulted = true;
-        if (c && fault_va && (chid == c->compute_ch.chid || chid == c->copy_ch.chid))
-            c->fault_va = fault_va;
+        if (c && (chid == c->compute_ch.chid || chid == c->copy_ch.chid)) {
+            c->fault = fault ? *fault : gsp_fault{};
+            c->fault_chid = chid;
+        }
     }
+}
+
+// a faulted channel's line, with the MMU fault GSP-RM described and the mappings at and either side of its address
+void Gpu::log_fault(gpu_ctx *c, const char *channel, uint32_t chid)
+{
+    const char *owner = c == &kctx ? "kernel" : c->owner;
+    if (!c->fault.type || c->fault_chid != chid) {
+        log_msg("Malachite: %s's %s channel faulted, making a new one\n", owner, channel);
+        return;
+    }
+    const gsp_fault &f = c->fault;
+    log_msg("Malachite: %s's %s channel faulted: %s fault on a %s at %#llx by %s, making a new one\n", owner, channel,
+            f.type, f.access, (unsigned long long)f.va, f.client);
+    const gpu_mapping *in = nullptr, *before = nullptr, *after = nullptr;
+    for (int i = 0; i < gpu_maps_top; i++) {
+        const gpu_mapping *m = &gpu_maps[i];
+        if (m->ctx != c || !m->va)
+            continue;
+        if (m->va <= f.va && f.va < m->va + m->dma.size)
+            in = m;
+        else if (m->va + m->dma.size <= f.va && (!before || m->va > before->va))
+            before = m;
+        else if (m->va > f.va && (!after || m->va < after->va))
+            after = m;
+    }
+    const gpu_mapping *near[] = { in, before, after };
+    for (const gpu_mapping *m : near)
+        if (m)
+            log_msg("Malachite:   %s the fault at %#llx: %#llx+%#llx %s kind %#x%s%s%s\n",
+                    m == in ? "in" : m == before ? "before" : "after", (unsigned long long)f.va,
+                    (unsigned long long)m->va, (unsigned long long)m->dma.size, m->vram ? "VRAM" : "system", m->kind,
+                    m->compressed ? " compressed" : "", m->shadow ? " shadowed" : "",
+                    !m->vram && sys_flags(m) ? " cached" : "");
+    c->fault = {};
 }
 
 // After the kernel's copy channel was remade: a flip queued behind a copy that was lost waits for its semaphore
@@ -2920,7 +2959,7 @@ void Gpu::recover(gpu_ctx *c)
     }
     if (c->copy_faulted) {
         c->copy_faulted = false;
-        log_msg("Malachite: %s's copy channel faulted, making a new one\n", c == &kctx ? "kernel" : c->owner);
+        log_fault(c, "copy", c->copy_ch.chid);
         uint32_t handle = c->copy_ch.handle, chid = c->copy_ch.chid;
         rm_free(gsp, c->client.client, handle);
         chan_free(&c->copy_ch);
@@ -2943,8 +2982,8 @@ void Gpu::recover(gpu_ctx *c)
     }
     if (c->compute_faulted) {
         c->compute_faulted = false;
-        log_msg("Malachite: %s's graphics channel faulted, making a new one\n", c == &kctx ? "kernel" : c->owner);
-        // which of a launch's addresses its context no longer maps: the fault's address isn't latched
+        log_fault(c, "graphics", c->compute_ch.chid);
+        // which of a launch's addresses its context no longer maps
         auto mapped = [&](uint64_t va) {
             if (!va)
                 return '-';
@@ -2953,29 +2992,6 @@ void Gpu::recover(gpu_ctx *c)
                     return 'm';
             return 'X';
         };
-        if (c->fault_va) {  // the mapping the fault was in, or the ones either side of it
-            const gpu_mapping *in = nullptr, *before = nullptr, *after = nullptr;
-            for (int i = 0; i < gpu_maps_top; i++) {
-                const gpu_mapping *m = &gpu_maps[i];
-                if (m->ctx != c || !m->va)
-                    continue;
-                if (m->va <= c->fault_va && c->fault_va < m->va + m->dma.size)
-                    in = m;
-                else if (m->va + m->dma.size <= c->fault_va && (!before || m->va > before->va))
-                    before = m;
-                else if (m->va > c->fault_va && (!after || m->va < after->va))
-                    after = m;
-            }
-            const gpu_mapping *near[] = { in, before, after };
-            for (const gpu_mapping *m : near)
-                if (m)
-                    log_msg("Malachite:   %s the fault at %#llx: %#llx+%#llx %s kind %#x%s%s%s\n",
-                            m == in ? "in" : m == before ? "before" : "after", (unsigned long long)c->fault_va,
-                            (unsigned long long)m->va, (unsigned long long)m->dma.size, m->vram ? "VRAM" : "system",
-                            m->kind, m->compressed ? " compressed" : "", m->shadow ? " shadowed" : "",
-                            !m->vram && sys_flags(m) ? " cached" : "");
-            c->fault_va = 0;
-        }
         for (const auto &l : c->launches) {
             if (!l.seq || (int32_t)(l.seq - *c->compute_sem) <= 0)
                 continue;
@@ -2989,6 +3005,11 @@ void Gpu::recover(gpu_ctx *c)
                         (unsigned long long)l.params[2], (unsigned long long)l.params[3], (unsigned long long)l.target,
                         (unsigned long long)l.zt, mapped(l.prog), mapped(l.vs), mapped(l.params[0]),
                         mapped(l.params[1]), mapped(l.params[2]), mapped(l.params[3]), mapped(l.target), mapped(l.zt));
+            if (l.vs)
+                log_msg("Malachite:     vs %#llx, index %#llx, streams %#llx %#llx %#llx %#llx\n",
+                        (unsigned long long)l.vs, (unsigned long long)l.index, (unsigned long long)l.streams[0],
+                        (unsigned long long)l.streams[1], (unsigned long long)l.streams[2],
+                        (unsigned long long)l.streams[3]);
             if (l.seq == *c->compute_sem + 1) {
                 log_msg("Malachite:   the first one's code, ps or program then vs\n");
                 log_code(l.prog);
@@ -3590,6 +3611,9 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
     __builtin_memcpy(c->launches[c->compute_seq % 8].params + 2, d->ps_params, 16);
     c->launches[c->compute_seq % 8].target = d->target;
     c->launches[c->compute_seq % 8].zt = d->zt;
+    c->launches[c->compute_seq % 8].index = r.index;
+    for (unsigned s = 0; s < 4; s++)
+        c->launches[c->compute_seq % 8].streams[s] = r.streams[s].addr;
     issued(c);
     c->draw_slot_seq[slot] = c->draw_pending = c->compute_seq;
     return kIOReturnSuccess;
