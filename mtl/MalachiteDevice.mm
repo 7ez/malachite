@@ -1599,6 +1599,10 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
     if (t) {
         t->_owned = self;
         t->_type = type;
+        // the storage asked for too: a view of a texture moved to VRAM answering Private had malachite_depth_kind
+        // compress the memory under data the CPU had already written
+        t->_asked = _asked;
+        t->_moved = _moved;
         t->_swizzled = _swizzled;
         memcpy(t->_swizzle, _swizzle, sizeof(_swizzle));
     }
