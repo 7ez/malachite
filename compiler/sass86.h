@@ -106,6 +106,8 @@ struct sass_insn sass_isetp_or(uint8_t pd, uint8_t ra, uint8_t rb, uint8_t op, u
 struct sass_insn sass_sel(uint8_t rd, uint8_t ra, uint8_t rb, uint8_t pred, uint32_t ctrl);
 // FSETP.<op>.AND Pd, PT, Ra, Rb, PT  -- float compare; op = ISETP_* for the ordered tests, FSETP_* below
 struct sass_insn sass_fsetp(uint8_t pd, uint8_t ra, uint8_t rb, uint8_t op, uint32_t ctrl);
+// an ISETP's or FSETP's result combined with Pc instead of PT: .AND (bop 0), .OR (1) or .XOR (2)
+struct sass_insn sass_setp_bop(struct sass_insn in, uint8_t bop, uint8_t pc);
 // ISETP against a const-bank operand: P0 = (Ra <op> c[bank][off]) -- avoids a register RAW on the operand
 struct sass_insn sass_isetp_cbuf(uint8_t ra, uint8_t bank, uint16_t off, uint8_t op, int is_signed,
                                  uint32_t ctrl);

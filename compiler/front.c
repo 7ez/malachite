@@ -4878,6 +4878,11 @@ static void fdiv(LLVMValueRef in, unsigned n)
                 continue;
             }
         }
+        // a / fast::sqrt(x): one MUFU.RSQ instead of MUFU.SQRT and MUFU.RCP after it, its error no larger
+        if (t == IR_F32 && b->op == IR_MUFU && b->aux == MUFU_SQRT && can_contract(in)) {
+            set(in, l, op2(IR_FMUL, IR_F32, a, mufu(MUFU_RSQ, b->src[0])));
+            continue;
+        }
         set(in, l, narrow(op2(IR_FMUL, IR_F32, widen(a), mufu(MUFU_RCP, widen(b))), t));
     }
 }

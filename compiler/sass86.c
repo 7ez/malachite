@@ -306,6 +306,12 @@ struct sass_insn sass_fsetp(uint8_t pd, uint8_t ra, uint8_t rb, uint8_t op, uint
               0x03f00000 | ((uint32_t)op << 12) | ((uint32_t)pd << 17), ctrl);
 }
 
+struct sass_insn sass_setp_bop(struct sass_insn in, uint8_t bop, uint8_t pc)
+{
+    in.hi = (in.hi & ~(3ull << 10 | 0xfull << 23)) | (uint64_t)bop << 10 | (uint64_t)pc << 23;
+    return in;
+}
+
 struct sass_insn sass_isetp_cbuf(uint8_t ra, uint8_t bank, uint16_t off, uint8_t op, int is_signed,
                                  uint32_t ctrl)
 {
