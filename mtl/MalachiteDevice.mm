@@ -5072,17 +5072,20 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
         if (i)
             ct = d.more[i - 1];
         uint32_t bpp = tex_format_info((enum tex_format)_formats[i]).bytes, bytes = d.width * bpp;
-        uint32_t pitch = (bytes + 255) & ~255u, h = d.height, w = d.width;
-        // the rect cut out when written
+        uint32_t h = d.height, w = d.width;
+        // only the rect copied when there is one: a frame of whole-target copies runs the machine out of memory
         const uint32_t *r = malachite_snap_rect;
         bool cut = r[2] && d.width >= r[0] + r[2] && d.height >= r[1] + r[3];
-        size_t skip = cut ? (size_t)r[1] * pitch + r[0] * bpp : 0;
-        uint32_t keep = cut ? r[2] * bpp : pitch, rows = cut ? r[3] : h;
-        id<MTLBuffer> snap = [((id<MTLCommandBuffer>)_cb).device newBufferWithLength:(NSUInteger)pitch * h
+        uint32_t keep = cut ? r[2] * bpp : bytes, rows = cut ? r[3] : h, pitch = (keep + 255) & ~255u;
+        id<MTLBuffer> snap = [((id<MTLCommandBuffer>)_cb).device newBufferWithLength:(NSUInteger)pitch * rows
                                                                             options:MTLResourceStorageModeShared];
         struct nvgpu_copy2d c = { ct.addr, [(MTLIOAccelBuffer *)snap gpuAddress],
-                                  ct.blocklinear ? (bytes + 63) & ~63u : ct.pitch, pitch, bytes, h,
+                                  ct.blocklinear ? (bytes + 63) & ~63u : ct.pitch, pitch, keep, rows,
                                   ct.blocklinear, 0, ct.blocklinear ? (h + 7) & ~7u : 0, 0 };
+        if (cut && ct.blocklinear)
+            c.src_origin = r[0] * bpp | r[1] << 16;
+        else if (cut)
+            c.src += (uint64_t)r[1] * ct.pitch + r[0] * bpp;
         malachite_record(_cb, MALACHITE_CMD_COPY_2D, &c, sizeof(c));
         MTLPixelFormat f = _attached[i].pixelFormat;
         NSString *label = _pipeline->_label;
@@ -5097,7 +5100,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
             fprintf(o, "%u %u %u %lu %s %s\n", cut ? keep / bpp : w, rows, keep, (unsigned long)f, label.UTF8String,
                     where.UTF8String);
             for (uint32_t y = 0; y < rows; y++)
-                fwrite((const uint8_t *)snap.contents + skip + (size_t)y * pitch, 1, keep, o);
+                fwrite((const uint8_t *)snap.contents + (size_t)y * pitch, 1, keep, o);
             fclose(o);
         }];
     }
