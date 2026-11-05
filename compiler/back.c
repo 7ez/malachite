@@ -46,8 +46,8 @@ enum mkind {
     MK_SHFL,     // def = src0 of another lane, aux = SASS_SHFL_* mode | c << 4; lane imm, or src1 if there is one
     MK_FSWZADD,  // def = quad swizzle add of src0 (neighbour) and src1 (pixel), aux = pattern
     MK_LOP3_IMM,  // def = src0 lut imm (aux = lut) -- for fneg/fabs sign masks
-    MK_ISETP,     // P0 = src0 cond src1 (aux = enum ir_cond | IR_SIGNED)
-    MK_FSETP,     // P0 = src0 fcond src1 (aux = FSETP_*)
+    MK_ISETP,     // P0 = src0 cond src1 (aux = enum ir_cond | IR_SIGNED | SETP_AND or SETP_OR)
+    MK_FSETP,     // P0 = src0 fcond src1 (aux = FSETP_* | SETP_AND or SETP_OR)
     MK_SEL,       // def = P0 ? src0 : src1
     MK_LDG,       // def = [src0 pair + imm], aux bytes (8 or 16: def is a pair or quad)
     MK_ATOM,      // def = the old value at [src0 + imm] (a pair global, RZ or a word shared), src1 data, src2 swapped
@@ -107,6 +107,10 @@ struct mop {
     int narrow;
     int readonly;  // LDG: of memory nothing writes while the kernel runs, through the read-only cache
 };
+
+// ISETP's and FSETP's aux: the compare combined with P0's value before it, rather than taken alone
+#define SETP_AND 64
+#define SETP_OR 128
 
 #define MAX_MOPS (1 << 17)
 static struct mop g_mops[MAX_MOPS];
@@ -539,8 +543,16 @@ static enum mkind binop_kind(struct ir_val *v)
 
 // compares used only as selects' conditions, or as the condition of a branch in their own block: each makes P0 from
 // the compare's operands itself, where a 0/1 register would cost a SEL and an ISETP more (and their latencies, the
-// predicate written twice before the branch can read it). AIRC_NOFUSEBR=1 leaves the branches out.
+// predicate written twice before the branch can read it). An and or or of two predicates read only as such a
+// condition in its own block is made in P0 the same way, the second operand's compare combined with the first's
+// result (SETP.AND/.OR P0, ..., P0), and its compares in its block are fused into it. AIRC_NOFUSEBR=1 leaves the
+// branches out.
 static unsigned char *g_cmp_fused;
+
+static int is_pand_or(const struct ir_val *v)
+{
+    return v->op == IR_PAND || v->op == IR_POR;
+}
 
 static void find_fused_compares(struct ir_func *f)
 {
@@ -553,13 +565,23 @@ static void find_fused_compares(struct ir_func *f)
     g_cmp_fused = calloc(n, 1);
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v; v = v->next)
-            g_cmp_fused[v->id] = v->op == IR_CMP;
+            g_cmp_fused[v->id] = v->op == IR_CMP || is_pand_or(v);
     int branches = !airc_pass_off("AIRC_NOFUSEBR");
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v; v = v->next)
             for (unsigned i = 0; i < v->nsrc; i++) {
                 struct ir_val *c = v->src[i];
+                if (c && is_pand_or(c) &&
+                    !(c->block == b && ((v->op == IR_SEL && i == 0) || (branches && v->op == IR_CBR))))
+                    g_cmp_fused[c->id] = 0;
+            }
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            for (unsigned i = 0; i < v->nsrc; i++) {
+                struct ir_val *c = v->src[i];
                 if (!c || c->op != IR_CMP || (v->op == IR_SEL && i == 0))
+                    continue;
+                if (is_pand_or(v) && g_cmp_fused[v->id] && c->block == b)
                     continue;
                 if (!(branches && v->op == IR_CBR && c->block == b))
                     g_cmp_fused[c->id] = 0;
@@ -1100,7 +1122,7 @@ static int vreg_of_address(struct ir_val *v, unsigned i, struct mop *m)
 }
 
 // P0 = the compare c, the constant side as an immediate (so on the right: its operands swapped if need be)
-static void emit_setp(const struct ir_val *c)
+static struct mop *emit_setp(const struct ir_val *c)
 {
     struct ir_val *a = c->src[0], *b = c->src[1];
     int aux = c->aux;
@@ -1129,6 +1151,48 @@ static void emit_setp(const struct ir_val *c)
         s->src[s->nsrc++] = vreg_of(b);
     }
     s->aux = aux;
+    return s;
+}
+
+// P0 = predicate c, a fused compare made from its operands, a 0/1 register tested otherwise
+static struct mop *emit_test(struct ir_val *c)
+{
+    if (c->op == IR_CMP && g_cmp_fused[c->id])
+        return emit_setp(c);
+    int r = vreg_of(c);  // an and's constant operand is made here, before the ISETP reads it
+    struct mop *s = emit_mop(MK_ISETP);
+    s->src[0] = r;
+    s->src[1] = VREG_RZ;
+    s->nsrc = 2;
+    s->aux = IR_NE;
+    return s;
+}
+
+// P0 = predicate c, where c may also be a fused and or or of two
+static void emit_cond(struct ir_val *c)
+{
+    if (is_pand_or(c) && g_cmp_fused[c->id]) {
+        emit_test(c->src[0]);
+        emit_test(c->src[1])->aux |= c->op == IR_PAND ? SETP_AND : SETP_OR;
+    } else {
+        emit_test(c);
+    }
+}
+
+// the condition the block's last select left in P0, from mop g_p0_at on: a select on the same one after it reads
+// P0 again when nothing between has set it (a vector's lanes, the selects of a flattened if)
+static struct ir_val *g_p0_cond;
+static int g_p0_at;
+
+static void emit_sel_cond(struct ir_val *c)
+{
+    int holds = c == g_p0_cond;
+    for (int k = g_p0_at; k < g_nmops && holds; k++)
+        holds = g_mops[k].k != MK_ISETP && g_mops[k].k != MK_FSETP && g_mops[k].k != MK_CALL;
+    if (!holds)
+        emit_cond(c);
+    g_p0_cond = c;
+    g_p0_at = g_nmops;
 }
 
 static void lower_value(struct ir_val *v)
@@ -1461,16 +1525,7 @@ static void lower_value(struct ir_val *v)
     case IR_SEL: {
         int m[2], wide = v->type == IR_I64;
         v->vreg = wide ? new_cluster(2, 2, m) : new_vreg(1, 1);
-        struct ir_val *c = v->src[0];
-        if (c->op == IR_CMP && g_cmp_fused[c->id]) {  // P0 = the compare itself
-            emit_setp(c);
-        } else {
-            struct mop *s = emit_mop(MK_ISETP);
-            s->src[0] = vreg_of(c);
-            s->src[1] = VREG_RZ;
-            s->nsrc = 2;
-            s->aux = IR_NE;
-        }
+        emit_sel_cond(v->src[0]);
         if (!wide && (is_imm(v->src[1]) || is_imm(v->src[2]))) {  // the constant in the instruction, under !P0 if it is
             int swap = !is_imm(v->src[2]);  // the true value
             struct mop *sel = emit_mop(MK_SEL);
@@ -1509,6 +1564,8 @@ static void lower_value(struct ir_val *v)
     }
     case IR_PAND:
     case IR_POR: {
+        if (g_cmp_fused[v->id])
+            break;
         v->vreg = new_vreg(1, 1);
         struct mop *m = emit_mop(MK_LOP3);
         m->def = v->vreg;
@@ -1990,6 +2047,7 @@ static void lower_block(struct ir_block *b)
 {
     g_block = b->id;
     g_block_mop[b->id] = g_nmops;
+    g_p0_cond = NULL;
     if (b->func && g_fn->subs[b->func - 1] == b)
         lower_entry(b);
     for (int i = 0; i < g_nbsync[b->id]; i++)
@@ -2028,15 +2086,7 @@ static void lower_block(struct ir_block *b)
             }
             break;
         case IR_CBR: {
-            if (v->src[0]->op == IR_CMP && g_cmp_fused[v->src[0]->id]) {
-                emit_setp(v->src[0]);
-            } else {
-                struct mop *s = emit_mop(MK_ISETP);
-                s->src[0] = vreg_of(v->src[0]);
-                s->src[1] = VREG_RZ;
-                s->nsrc = 2;
-                s->aux = IR_NE;
-            }
+            emit_cond(v->src[0]);
             // A loop of one block whose phis nothing reads past it makes its copies before the branch, on both
             // edges: the way round is then the branch alone, not a branch to a stub of copies and one back
             int self = b->succ[0] == b->succ[1] ? -1 : b->succ[0] == b ? 0 : b->succ[1] == b ? 1 : -1;
@@ -2884,7 +2934,9 @@ static int place(int region)
     // the most the same occupancy allows. Taking the lowest free register puts a value where one just died, and the
     // scheduler can't move a write above the reads of the register's last value, nor a load above an earlier
     // load's use when both land in one register. Spread singles can leave a cluster no aligned room below that
-    // budget: then spread in the other order, rather than fall back to the packed placement.
+    // budget: then spread in the other order, rather than fall back to the packed placement. A shader with local
+    // memory spreads down to 40 warps from 48: the path tracer's BVH walk, packed to run 48, was 5% slower than
+    // spread at 40 (a shader without one, the particle simulation, was 10% slower at 40).
     int *best = malloc(g_nvregs * sizeof(*best)), best_count = 0, fitted = 0, best_first = 0, budget = NREGS;
     int *row_end = malloc(NREGS * sizeof(*row_end));
     int spread_fitted = 0;
@@ -2895,7 +2947,10 @@ static int place(int region)
                 break;
             // + 1 for the exit's temporary and + 2 for the program counter (airc_back)
             budget = best_count;
-            while (budget < NREGS && warps_at(budget + 1 + 3) == warps_at(best_count + 3))
+            int target = warps_at(best_count + 3);
+            if (g_info->local_size && target > 40)
+                target = 40;
+            while (budget < NREGS && warps_at(budget + 1 + 3) >= target)
                 budget++;
             if (budget == best_count)
                 break;
@@ -3878,25 +3933,31 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             c = sched(s, 1, 0, d, 1, 0);
             sched_push(m->aux & 1 ? sass_h2f_hi(sass_h2f(d, s[0], c)) : sass_h2f(d, s[0], c), s, 1, d, 0, FIXED_LAT);
             break;
-        case MK_ISETP: {
-            uint8_t op;
-            int sgn;
-            isetp_op(m->aux, &op, &sgn);
-            c = sched(s, m->nsrc, 0, P0_PSEUDO, 1, 0);
-            sched_push(m->immb ? sass_imm(sass_isetp(0, s[0], 0, op, sgn, c), (uint32_t)m->imm)
-                               : sass_isetp(0, s[0], s[1], op, sgn, c),
-                       s, m->nsrc, P0_PSEUDO, 0, PRED_LAT);
+        case MK_ISETP:
+        case MK_FSETP: {
+            int n = m->nsrc;
+            if (m->aux & (SETP_AND | SETP_OR))
+                s[n++] = P0_PSEUDO;
+            c = sched(s, n, 0, P0_PSEUDO, 1, 0);
+            struct sass_insn in;
+            if (m->k == MK_ISETP) {
+                uint8_t op;
+                int sgn;
+                isetp_op(m->aux, &op, &sgn);
+                in = m->immb ? sass_imm(sass_isetp(0, s[0], 0, op, sgn, c), (uint32_t)m->imm)
+                             : sass_isetp(0, s[0], s[1], op, sgn, c);
+            } else {
+                in = m->immb ? with_mods(sass_ftz(sass_imm(sass_fsetp(0, s[0], 0, fsetp_op(m->aux & 15), c),
+                                                           (uint32_t)m->imm)),
+                                         m->mods, SASS_MOD_A, -1, -1)
+                             : with_mods(sass_ftz(sass_fsetp(0, s[0], s[1], fsetp_op(m->aux & 15), c)), m->mods,
+                                         SASS_MOD_A, SASS_MOD_B, -1);
+            }
+            if (m->aux & (SETP_AND | SETP_OR))
+                in = sass_setp_bop(in, m->aux & SETP_OR ? 1 : 0, 0);
+            sched_push(in, s, n, P0_PSEUDO, 0, PRED_LAT);
             break;
         }
-        case MK_FSETP:
-            c = sched(s, m->nsrc, 0, P0_PSEUDO, 1, 0);
-            sched_push(m->immb ? with_mods(sass_ftz(sass_imm(sass_fsetp(0, s[0], 0, fsetp_op(m->aux & 15), c),
-                                                             (uint32_t)m->imm)),
-                                           m->mods, SASS_MOD_A, -1, -1)
-                               : with_mods(sass_ftz(sass_fsetp(0, s[0], s[1], fsetp_op(m->aux & 15), c)), m->mods,
-                                           SASS_MOD_A, SASS_MOD_B, -1),
-                       s, m->nsrc, P0_PSEUDO, 0, PRED_LAT);
-            break;
         case MK_SEL: {
             uint8_t ss[3] = { s[0], s[1], P0_PSEUDO };
             if (m->immb)

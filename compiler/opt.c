@@ -163,6 +163,21 @@ static int fold(struct ir_func *f, struct ir_val *v)
         replace_all(f, v, x->imm ? v->src[1] : v->src[2]);
         return 1;
     }
+    // LLVM's and and or that keep a poison operand from mattering: select c, x, false and select c, true, x
+    if (v->op == IR_SEL && v->type == IR_PRED) {
+        struct ir_val *z = v->src[2];
+        if (z->op == IR_CONST && !z->imm) {
+            v->op = IR_PAND;
+            v->nsrc = 2;
+            return 1;
+        }
+        if (y->op == IR_CONST && y->imm) {
+            v->op = IR_POR;
+            v->src[1] = z;
+            v->nsrc = 2;
+            return 1;
+        }
+    }
     if (v->op == IR_PNOT && x->op == IR_CONST) {
         make_const(v, !x->imm);
         return 1;
