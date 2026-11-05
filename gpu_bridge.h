@@ -33,6 +33,10 @@
 // Runs one linear buffer->buffer copy on the copy engine and blocks until it completes.
 #define NVGPU_FN_COPY "NVGpuCopy"
 
+// As NVGpuCopy, for what the CPU wrote into a Managed buffer: draws in flight don't read a range the app has changed,
+// which is Metal's rule, so it doesn't wait for them. Behind a game's frames that wait is the game's frame time.
+#define NVGPU_FN_UPLOAD "NVGpuUpload"
+
 // rm::queue_copy2d copies a rectangle of rows between pitched surfaces on the copy engine, blocking until it completes.
 
 struct nvgpu_copy2d {
@@ -84,6 +88,9 @@ struct nvgpu_present {
 // scalars) at the offsets airc assigned.
 
 #define NVGPU_PARAM_BYTES 160  // 0x160..0x200
+// a kernel's: 0x160..0x400, the handles' 0x200..0x280 in among them, left 0 there to be written after (Metal binds
+// 31 buffers, 20 fit below 0x200)
+#define NVGPU_COMPUTE_PARAM_BYTES 0x2a0
 #define NVGPU_MAX_TEXTURES 16
 #define NVGPU_HANDLES 32  // at 0x200: texture slots' header indices, then sampler slots' sampler indices << 20
 
@@ -103,7 +110,7 @@ struct nvgpu_dispatch {
     unsigned int samplers[NVGPU_MAX_TEXTURES][8];  // TSC entries (TEXSAMP, 32 bytes)
     unsigned int nheaders, nsamplers;
     unsigned long long prog_va;
-    unsigned char params[NVGPU_PARAM_BYTES];
+    unsigned char params[NVGPU_COMPUTE_PARAM_BYTES];
     unsigned int params_size;
     unsigned int grid_x, grid_y, grid_z;     // CTAs in the grid
     unsigned int block_x, block_y, block_z;  // threads per CTA
@@ -126,6 +133,8 @@ struct nvgpu_dispatch {
 // p1 = context: wait for its draws so far. Draws go to the GPU without waiting for each other, and a command
 // buffer's end is where its memory is read back.
 #define NVGPU_FN_SYNC "NVGpuSync"
+// p1 = context: a command buffer of its starts
+#define NVGPU_FN_CB_BEGIN "NVGpuCommandBufferBegin"
 
 // p1 = unsigned int*, p2 = context: set to the fence of its last draw not yet waited for, 0 when there's none
 // (everything queued so far is done). Hand it to NVGPU_FN_DRAW_DONE.
@@ -134,8 +143,8 @@ struct nvgpu_dispatch {
 // kIOReturnBusy before.
 #define NVGPU_FN_DRAW_DONE "NVGpuDrawDone"
 // p1 = context. kIOReturnSuccess when the task's command buffers complete as their draws do, rather than waiting for
-// them in submit: WindowServer's, whose frames the wait would hold up. Others' completion is not yet as ready for it
-// (OpenGL reads back too soon).
+// them in submit, where a frame would hold up the next by a refresh or more. OpenGL's queues wait all the same
+// (MALACHITE_CMD_OPENGL). *(bool *)p2 = whether the task is an app, not WindowServer.
 #define NVGPU_FN_ASYNC "NVGpuAsync"
 
 // a colour target beside nvgpu_draw's target 0; address 0 for none, as target 0's can be
@@ -170,6 +179,7 @@ struct nvgpu_draw {
     unsigned long long zt;
     unsigned int zt_compress;  // its buffer holds nothing else, so may be mapped compressed
     unsigned int pass_first;  // the first thing of a render pass
+    unsigned int opengl;      // from Apple's GL renderer
     unsigned int zt_format, zt_width, zt_height, zt_size, zt_kind;  // SET_ZT_FORMAT, row stride in pixels, rows
     unsigned int samples;  // per pixel of the targets (0 or 1 for one); the sizes above are then in samples
     unsigned int clear_zs;  // clear depth (bit 0) to clear_depth, stencil (bit 1) to clear_stencil, before drawing

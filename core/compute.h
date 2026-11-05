@@ -8,7 +8,8 @@ struct chan;
 struct gr_ctx;
 
 #define COMPUTE_QMD_BYTES 256  // a QMDV03_00 is 256 bytes, 256-aligned
-#define COMPUTE_CBUF_BYTES 0x280  // the params end at 0x200, the handles at 0x280
+// params at 0x160..0x200, the handles at 0x200..0x280, then the params past the 20th up to 0x400
+#define COMPUTE_CBUF_BYTES 0x400
 
 // Graphics channel on `vm` with the golden context promoted and the 0xc7c0 object bound on subchannel 1, plus the
 // one-time preamble (shared/local windows, cache invalidates). Returns 0 on success.
@@ -27,6 +28,8 @@ void compute_set_tex_pools(struct chan *ch, uint64_t header_va, uint32_t headers
 // A kernel's local memory, bytes a thread, in its QMD; and the buffer every thread's comes out of, as much a TPC
 // (once the channel is idle).
 void compute_qmd_set_local(uint32_t *qmd, uint32_t bytes);
+// once the grid is done: payload and the GPU's time in the 16 bytes at va (kern.malachite_prof)
+void compute_qmd_set_stamp(uint32_t *qmd, uint64_t va, uint32_t payload);
 void compute_set_local_memory(struct chan *ch, uint64_t va, uint64_t per_tpc);
 // Hold back what comes next on the channel until everything before it is done.
 void compute_wait_idle(struct chan *ch);

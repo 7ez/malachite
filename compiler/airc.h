@@ -48,6 +48,14 @@ struct airc_tess_desc {
     struct airc_tess_attr attrs[32];  // by location
 };
 
+// A kernel's stage input (MTLStageInputOutputDescriptor): its attributes by location, format 0 for one it doesn't
+// describe, step as MTLStepFunction (ThreadPositionInGridX 5, Y 6, XIndexed 7, YIndexed 8, or Constant), buffer
+// a [[buffer(n)]] index; and where the indexed step functions read their indices, and an index's bytes
+struct airc_stage_in {
+    struct airc_tess_attr attrs[32];
+    uint32_t index_buffer, index_size;
+};
+
 // the tessellation init stage's params, from 0x160 of its const bank: the factor buffer, the patch index buffer and
 // the control point index buffer (0 for none), the factors' instance stride and scale, then vertex buffers 0..15
 #define AIRC_TESS_FACTORS 0x160
@@ -79,10 +87,11 @@ int airc_compile(const void *air, size_t len, const struct airc_constant *fc, un
                  struct airc_kernel *k);
 // the same, with a call to a function the module only declares (Metal's NAME.MTL_VISIBLE_FN_REF) inlined from
 // the linked modules' NAME, and for a fragment function, its inputs read from the slots of the vertex outputs of
-// their names (vertex: the vertex function's outputs; NULL takes them in order)
+// their names (vertex: the vertex function's outputs; NULL takes them in order), and for a kernel, its stage input
+// fetched from the buffers stage_in describes (NULL: none described)
 int airc_compile_linked(const void *air, size_t len, const struct airc_source *linked, unsigned nlinked,
-                        const struct airc_varyings *vertex, const struct airc_constant *fc, unsigned nfc,
-                        int print_ir, struct airc_kernel *k);
+                        const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
+                        const struct airc_constant *fc, unsigned nfc, int print_ir, struct airc_kernel *k);
 // A tessellated draw's stages before the post-tessellation vertex function, generated (each a vertex a patch):
 // the vertex stage, the same for every pipeline, and the tessellation init stage of d. 0, or -1 with k->error
 // saying why; not reentrant either.

@@ -49,10 +49,6 @@ void log_sysctl_unregister(void);
 // firmware files by name (gsp.bin, bootloader.bin, booter_load.bin, booter_unload.bin)
 const void *fw_get(struct gpu *g, const char *name, size_t *size);
 
-// The nvpm boot-arg (NVPM in the environment on Linux): switches for the power management experiments, off by default
-#define PM_IDLE_CAP 2     // GSP-RM told when the GPU has nothing to do, so it caps the clocks
-#define PM_BOOST_CLEAR 4  // any perf boost released once GSP-RM is up
-uint32_t pm_flags(void);
 
 uint64_t bar_phys(struct gpu *g, int bar);
 int is_boot_vga(struct gpu *g);

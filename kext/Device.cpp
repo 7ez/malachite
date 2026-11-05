@@ -18,6 +18,7 @@
 
 #include "../fbkext/surface.h"
 #include "../gpu_bridge.h"
+#include "../accel/commands.h"
 #include "abi.h"
 #include "plat.h"
 #include "regs.h"
@@ -73,7 +74,7 @@ enum {
     ST_PRESENT, ST_FLIP, ST_DRAW, ST_DISPATCH, ST_COPY2D, ST_COPY, ST_FILL, ST_SYNC, ST_MAP, ST_UNMAP, ST_CURSOR,
     ST_DRAIN_WAITS, ST_DRAIN_US, ST_COPY_US, ST_DRAW_US, ST_COPY2D_US, ST_SYNC_US, ST_MAP_US, ST_UNMAP_US, ST_DRAW_SYS, ST_DRAW_SYS_KPX, ST_DRAW_VRAM, ST_DRAW_VRAM_KPX, ST_LOCKS, ST_LOCK_WAIT_US, ST_LOCK_WAIT_MAX_US,
     ST_LOCK_HOLD_US, ST_LOCK_MAX_US, ST_SLOT_WAIT_US, ST_PUSH_WAIT_US, ST_PRESENT_WAIT_US, ST_PRESENT_TOTAL_US, ST_PRESENT_POST_US, ST_PRESENT_SUBMIT_US,
-    ST_PRESENT_COPY_US, ST_FLIP_PEND_US, ST_PRESENT_HEAD,
+    ST_PRESENT_COPY_US, ST_FLIP_PEND_US, ST_CTXS, ST_CTXS_PEAK, ST_CTXS_REFUSED, ST_PRESENT_HEAD,
     ST_COUNT = ST_PRESENT_HEAD + BAR1_FB_SLOTS
 };
 static const char *const stat_names[ST_COUNT] = {
@@ -81,6 +82,7 @@ static const char *const stat_names[ST_COUNT] = {
     "drain_waits", "drain_us", "copy_us", "draw_us", "copy2d_us", "sync_us", "map_us", "unmap_us", "draw_sys", "draw_sys_kpx", "draw_vram", "draw_vram_kpx", "locks", "lock_wait_us", "lock_wait_max_us",
     "lock_hold_us", "lock_max_us", "slot_wait_us", "push_wait_us", "present_wait_us",
     "present_total_us", "present_post_us", "present_submit_us", "present_copy_us", "flip_pend_us",
+    "ctxs", "ctxs_peak", "ctxs_refused",
     "present_h0", "present_h1", "present_h2", "present_h3",
 };
 static uint64_t stats[ST_COUNT];
@@ -143,6 +145,12 @@ struct gpu_ctx {
     uint32_t draw_slot_seq[DRAW_SLOTS];  // the payload of the slot's last draw, 0 for none
     unsigned draw_next;
     uint32_t draw_pending;  // the last unwaited payload, 0 for none
+    uint32_t draws_queued;  // draws the GPU hasn't been told of
+    // an app's system memory is VMM_CACHED: a command buffer starts by dropping L2's stale lines of it and ends by
+    // writing L2's dirty ones back (l2_sysmem), so the CPU and WindowServer's uncached mappings see them
+    bool cached_sys;
+    uint64_t methods_va;  // the mapping push_run last found a run in
+    uint64_t fault_va;    // where GSP-RM's word of the last fault says it was, for recover()'s log
     uint64_t kind_va;       // the depth target last given its kind
     uint32_t kind_set;
     bool kind_compressed;
@@ -154,6 +162,7 @@ struct gpu_ctx {
     // told to wait for, ce_last the last one queued, and ce_half_seq what the copy pushbuffer's halves last held.
     uint32_t ce_pending, ce_last, ce_half_seq[2];
     int ce_half;
+    uint32_t l2_seq;  // the payload of the last L2 flush (l2_sysmem): with nothing queued since, L2 is clean already
     // the latest launches, their last payload and the GPFIFO entry after them: on a new channel, the ones a fault
     // lost run again (the first of them only once, as it may be what faulted)
     struct {
@@ -179,6 +188,7 @@ struct gpu_ctx {
         uint32_t seq, groups[3], block[3], regs;
         uint64_t prog, vs;  // a draw's vs, and its ps in prog
         uint64_t params[4];  // its first two shader argument words, of the vs then the ps
+        uint64_t target, zt;  // a draw's colour and depth targets
     } launches[8];
     uint64_t busy_since;  // when its outstanding graphics work began (time_us), 0 when none is
     uint64_t busy_unbilled;  // its busy time Accelerator has not yet charged to the task (NVGPU_FN_CTX_BUSY)
@@ -194,7 +204,8 @@ struct gpu_ctx {
 
 // What the draws took on the GPU, by kind, since kern.malachite_prof was last read (kern.malachite_prof_on=1 times them): a draw's
 // share is the time from the one before it finishing to its own finishing, and a longer wait (the GPU idle, or held
-// up by a copy) is counted apart as a gap
+// up by a copy) is counted apart as a gap. Dispatches (flags 0x80, vs their program) are timed the same way, a gap
+// included: one may run longer than any wait
 static int prof_on;
 static struct prof_row {
     uint64_t vs, ps, n, ns, verts, area, max;
@@ -210,7 +221,7 @@ static const uint64_t PROF_GAP_NS = 3000000;
 static void prof_add(const gpu_ctx::prof_draw &d, uint64_t ns)
 {
     prof_draws_total++;
-    if (ns > PROF_GAP_NS) {
+    if (ns > PROF_GAP_NS && !(d.flags & 0x80)) {  // a dispatch may well take longer
         prof_gaps++;
         prof_gap_ns += ns;
         return;
@@ -282,10 +293,8 @@ static int prof_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
 }
 
 SYSCTL_INT(_kern, OID_AUTO, malachite_prof_on, CTLFLAG_RW | CTLFLAG_LOCKED, &prof_on, 0, "time the draws on the GPU");
-static int compress_on = 1, zcull_on = 1;
-SYSCTL_INT(_kern, OID_AUTO, malachite_zcull, CTLFLAG_RW | CTLFLAG_LOCKED, &zcull_on, 0, "cull with zcull in passes from now on");
-SYSCTL_INT(_kern, OID_AUTO, malachite_compress, CTLFLAG_RW | CTLFLAG_LOCKED, &compress_on, 0,
-           "compress targets made from now on");
+static int present_apps = 1;
+SYSCTL_INT(_kern, OID_AUTO, malachite_present_apps, CTLFLAG_RW | CTLFLAG_LOCKED, &present_apps, 0, "test");
 
 // The same layout with compression, without PLC: GA102's PLC has an erratum on some physical addresses.
 static uint8_t compressed_kind(uint8_t kind)
@@ -313,7 +322,7 @@ class Gpu : public IOService
     // the kernel's GPU context: present, the display's surfaces, and work from tasks without one;
     // and each task's that has asked for one (NVGPU_FN_CTX_OPEN), named to Accelerator by slot + 1 and a serial
     gpu_ctx kctx = {};
-    static const int MAX_CTXS = 64;
+    static const int MAX_CTXS = 255;
     gpu_ctx *ctxs[MAX_CTXS] = {};
     uint32_t ctx_serial[MAX_CTXS] = {};
     gpu_ctx *ctx_of(uintptr_t handle);
@@ -331,9 +340,15 @@ class Gpu : public IOService
         uint64_t vram;     // or the VRAM it maps, 0 for none
         uint8_t kind;  // PTE kind its pages are mapped with
         bool compressed;  // as kind's compressed form, in big pages
+        int16_t passes;  // render passes drawn to it, negative while a promotion that found nothing rests
         uint8_t shadow;  // the VRAM copy of a surface (shadows) it maps in place of its pages, 1-based, 0 for none
+        bool uncached;   // an app's pages the channel reads methods from (push_run): not VMM_CACHED after all
         int32_t hnext;   // next slot + 1 in its hash bucket
     };
+    unsigned sys_flags(const gpu_mapping *m) const
+    {
+        return m->ctx->cached_sys && !m->uncached ? VMM_CACHED : 0;
+    }
     // Metal apps read just outside their buffers and Apple's GPUs let them: a page of zeros either side of each
     // mapping, read only, so such a read gets 0 rather than faulting the channel (a write still faults)
     struct dma *zero_page = nullptr;
@@ -532,6 +547,8 @@ class Gpu : public IOService
 
     static const uint32_t TEX_HEADER_POOL = 0x400, TEX_SAMPLER_POOL = 0x800;  // offsets in kctx.compute_cbuf
     IOReturn drain(gpu_ctx *c);
+    IOReturn sync_ctx(uintptr_t handle);
+    int clear_vram(uint64_t vram, uint64_t size);
     IOReturn read_indirect(gpu_ctx *c, uint64_t va, uint32_t *words, unsigned n);
     IOReturn push_room(gpu_ctx *c, uint32_t bytes);
     IOReturn ce_room(gpu_ctx *c, uint32_t bytes);
@@ -544,7 +561,7 @@ class Gpu : public IOService
     {
         c->issued[c->issued_next++ % 128] = { c->compute_seq, c->compute_ch.gp_put };
     }
-    static void rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception);
+    static void rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, uint64_t fault_va);
     void recover(gpu_ctx *c);
     int ring_wait(gpu_ctx *c, int counter, uint32_t payload, int ms);
     void resync_screens();
@@ -570,6 +587,92 @@ class Gpu : public IOService
         if (r == kIOReturnTimeout && c->compute_faulted)
             r = settle(d ? gpu_dispatch(c, d) : gpu_draw(c, w, reject));
         return r;
+    }
+    void kick_draws(gpu_ctx *c)
+    {
+        if (c->draws_queued) {
+            chan_kick(&c->compute_ch);
+            c->draws_queued = 0;
+        }
+    }
+    // A command buffer of a context with VMM_CACHED memory: before its work L2 drops its lines of system memory, which
+    // the CPU may have written since (or another app, before the pages were this one's); after it, L2's dirty lines
+    // go back, and the release its completion waits for comes after that. On the copy channel, an admin one (user
+    // channels may not run MEM_OP's L2 operations), once the work before is done; the next draw or dispatch waits
+    // for it (after_copies).
+    void l2_sysmem(gpu_ctx *c, bool begin)
+    {
+        if (!c->cached_sys || (!begin && !c->draw_pending) || !compute_bridge_init(c) || c->copy_faulted ||
+            ce_room(c, 0x200) != kIOReturnSuccess)
+            return;
+        kick_draws(c);
+        if (!begin && c->draw_pending == c->l2_seq)
+            return;
+        // the copy channel's own work is done in order: only the graphics channel's is waited for
+        if (c->draw_pending && c->draw_pending != c->ce_last)
+            chan_acquire_queue_switch(&c->copy_ch, c->compute_semva, c->draw_pending);
+        chan_l2_sysmem(&c->copy_ch, begin);
+        c->ce_pending = c->ce_last = c->draw_pending = c->l2_seq = ++c->compute_seq;
+        chan_release_queue(&c->copy_ch, c->compute_semva, c->compute_seq);
+    }
+    // A kick is the slowest part of a draw: a read across the bus and a doorbell. Draws share one, a few at a time so
+    // the GPU keeps working, and the end of the command buffer or anything that waits kicks the rest.
+    IOReturn draw(gpu_ctx *c, const struct nvgpu_draw *w, const char **reject)
+    {
+        IOReturn r = launch(c, nullptr, w, reject);
+        if (r != kIOReturnSuccess || c->draws_queued >= 32)
+            kick_draws(c);
+        return r;
+    }
+    // A run of draws the plugin wrote the methods of: after the methods of everything before it, as GPFIFO runs in
+    // order. It isn't run again on a new channel after a fault, as it holds only changes against the state the
+    // draws before it left.
+    // The buffer of methods a run is in, mapped uncached: the channel fetches them ahead of the semaphore wait that
+    // orders it after the L2 invalidate, and a cached line of a block the plugin wrote again is a corrupt stream
+    void uncache_methods(gpu_ctx *c, uint64_t va)
+    {
+        if (!c->cached_sys)
+            return;
+        int last = map_slot(c->methods_va);
+        if (last >= 0 && gpu_maps[last].ctx == c && va >= gpu_maps[last].va &&
+            va < gpu_maps[last].va + gpu_maps[last].dma.size)
+            return;
+        for (int i = 0; i < gpu_maps_top; i++) {
+            gpu_mapping *m = &gpu_maps[i];
+            if (m->ctx != c || !m->va || va < m->va || va >= m->va + m->dma.size)
+                continue;
+            if (!m->uncached && !m->vram && !m->shadow) {
+                m->uncached = true;
+                vmm_map_sys(&c->vm, m->va, &m->dma, 0, m->dma.size, VMM_KINDF(m->kind));
+                vmm_flush(&gpu);
+            }
+            c->methods_va = m->va;
+            return;
+        }
+    }
+    IOReturn push_run(gpu_ctx *c, const struct malachite_push *p)
+    {
+        if (gsp)
+            gsp_poll(gsp);
+        if (!compute_bridge_init(c))
+            return kIOReturnNotReady;
+        uncache_methods(c, p->va);
+        if (after_copies(c) != kIOReturnSuccess)
+            return settle(kIOReturnTimeout);
+        // the release's one slot (push_room(0x200) would count a wrap the release doesn't make)
+        if (push_room(c, 0x100) != kIOReturnSuccess)
+            return settle(kIOReturnTimeout);
+        chan_entry(&c->compute_ch, p->va, p->words);
+        render_mark(&c->compute_ch, c->compute_semva, ++c->compute_seq);
+        // a run takes two GPFIFO entries and one slot of the pushbuffer, whose size is what keeps the GPFIFO from
+        // overrunning (every slot has an entry to itself): so it counts for two
+        c->compute_ch.push_off += 0x100;
+        if (c->compute_ch.push_off > PUSH_SIZE)
+            c->compute_ch.push_off = PUSH_SIZE;
+        c->draws_queued = 0;
+        c->draw_pending = c->compute_seq;
+        issued(c);
+        return kIOReturnSuccess;
     }
     void drain_all()
     {
@@ -610,6 +713,7 @@ class Gpu : public IOService
     IOReturn gpu_dispatch(gpu_ctx *c, const struct nvgpu_dispatch *d);
     IOReturn gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reject);
     IOReturn gpu_present(struct nvgpu_present *p, uint64_t since);
+    void adopt_surface(int i);
     IOReturn present_frame(struct nvgpu_present *p);
 
     // NVGpuPresent: WindowServer cycles three or four framebuffer surfaces per display, so each stays mapped in a
@@ -626,6 +730,8 @@ class Gpu : public IOService
         int count;       // frames shown from it, negative while a promotion that found nothing to move rests
         int shadow;      // its VRAM copy once it has been shown twice, 1-based, 0 for none
     } present[PRESENT_SLOTS] = {};
+    present_slot *oldest_slot();
+    IOReturn fill_slot(present_slot *s, IOMemoryDescriptor *md, size_t size);
     // A surface WindowServer keeps showing is moved to VRAM: its pages' contents are copied there and every mapping
     // of the surface made to map the copy, so it is drawn into at VRAM speed and the head flips to it as it is
     // rather than a copy of it going over PCIe each frame. The CPU's view of the pages is then stale; a demotion
@@ -729,21 +835,7 @@ class Gpu : public IOService
         stats[ST_LOCK_WAIT_US] += held_since - t;
         if (held_since - t > stats[ST_LOCK_WAIT_MAX_US])
             stats[ST_LOCK_WAIT_MAX_US] = held_since - t;
-        if (capped)
-            uncap();
     }
-    // nvpm PM_IDLE_CAP: GSP-RM is told each second whether the GPU did anything, and the cap is lifted as work comes
-    // in, since a GPU held at its lowest clocks would run a frame's draws slowly until the next tick
-    uint32_t pm = 0;
-    bool capped = false;
-    uint64_t cap_mark = 0, cap_work = 0, cap_busy = 0;
-    void uncap()
-    {
-        if (gsp && !suspended)
-            pwr_idle_cap(gsp, 0, 0, 0);
-        capped = false;
-    }
-    void idle_tick();
     void give()
     {
         uint64_t held = time_us() - held_since;
@@ -787,7 +879,7 @@ class Gpu : public IOService
     IOReturn light(screen &sc, int out);
     void check_hotplug();
     IOReturn read_shown(uint64_t addr, uint64_t len, task_t task);
-    IOReturn h264_decode(const uint64_t *args, task_t task);
+    IOReturn decode_stream(const uint64_t *args, task_t task);
     static void poll(OSObject *owner, IOTimerEventSource *sender);
     thread_call_t autostart_call = nullptr;
     thread_call_t pump_call = nullptr;  // queues the flips presents have registered, as the head takes the ones before
@@ -814,6 +906,7 @@ public:
     bool usable();
     IOReturn queue_dispatch(void *ctx, const struct nvgpu_dispatch *d);
     IOReturn queue_draw(void *ctx, const struct nvgpu_draw *d, const char **why);
+    IOReturn queue_push(void *ctx, const struct malachite_push *p);
     IOReturn queue_copy2d(void *ctx, const struct nvgpu_copy2d *p);
     IOReturn queue_compress(void *ctx, uint64_t va);
     // Framebuffer's calls (SURFACE_FN_*) for screen i, through its nub
@@ -822,9 +915,9 @@ public:
     using IOService::newUserClient;
     IOReturn newUserClient(task_t task, void *security, UInt32 type, OSDictionary *props,
                            IOUserClient **handler) override;
-    IOReturn video_open(uintptr_t *ctx, struct video_h264 *h, const uint64_t *args);
-    IOReturn video_decode(uintptr_t ctx, struct video_h264 *h, const uint64_t *args);
-    void video_close(uintptr_t ctx, struct video_h264 *h, uint32_t decoded);
+    IOReturn video_open(uintptr_t *ctx, struct video_dec *h, const uint64_t *args);
+    IOReturn video_decode(uintptr_t ctx, struct video_dec *h, const uint64_t *args);
+    void video_close(uintptr_t ctx, struct video_dec *h, uint32_t decoded);
 
     IOReturn command(uint32_t selector, const uint64_t *args, task_t task);
     size_t power_report(char *out, size_t cap);
@@ -874,8 +967,8 @@ public:
     IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory) override;
 };
 
-// H.264 decoding for any process, VideoToolbox's decoder in apps and in VTDecoderXPCService: a GPU context of its
-// own with the decode buffers in it, all gone with the client
+// H.264 and H.265 decoding for any process, VideoToolbox's decoder in apps and in VTDecoderXPCService: a GPU context
+// of its own with the decode buffers in it, all gone with the client
 class VideoUserClient : public IOUserClient
 {
     OSDeclareDefaultStructors(VideoUserClient)
@@ -884,7 +977,7 @@ public:
     Gpu *owner = nullptr;
     IOLock *busy = nullptr;  // one call at a time
     uintptr_t ctx = 0;
-    struct video_h264 dec = {};
+    struct video_dec dec = {};
     uint32_t decoded = 0;  // pictures, for the log
     bool counted = false;
 
@@ -1080,7 +1173,6 @@ size_t Gpu::power_report(char *out, size_t cap)
     pwr_read(gsp, &p);
     busy_step(0, time_us());
     uint64_t busy = __atomic_load_n(&busy_total, __ATOMIC_RELAXED);
-    n += snprintf(out + n, cap - n, "nvpm %#x capped %d\n", pm, capped);
     if (p.pstate_status)
         n += snprintf(out + n, cap - n, "pstate error %#x\n", p.pstate_status);
     else if (p.pstate == ~0u)
@@ -1124,34 +1216,13 @@ static int power_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req
 SYSCTL_PROC(_kern, OID_AUTO, malachite_power, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, power_sysctl, "S",
             "the GPU's P-state, clocks and busy time");
 
-// Once a second, under the lock: GSP-RM told whether the GPU has had work since the last time
-void Gpu::idle_tick()
-{
-    uint64_t now = time_us();
-    if (!(pm & PM_IDLE_CAP) || !gsp || suspended || now - cap_mark < 500000)
-        return;
-    const uint64_t work = stats[ST_PRESENT] + stats[ST_DRAW] + stats[ST_DISPATCH] + stats[ST_COPY2D] + stats[ST_COPY] +
-                          stats[ST_FILL];
-    busy_step(0, now);
-    const uint64_t busy = __atomic_load_n(&busy_total, __ATOMIC_RELAXED);
-    const bool idle = work == cap_work && busy == cap_busy;
-    uint64_t span = cap_mark ? now - cap_mark : 0, used = busy - cap_busy;
-    if (used > span)
-        used = span;
-    if (!pwr_idle_cap(gsp, idle, span - used, used))
-        capped = idle;
-    cap_mark = now;
-    cap_work = work;
-    cap_busy = busy;
-}
-
 // A start that fails leaves them behind, and a second one registering an oid twice panics (one did, at boot): once
 // each, and an oid keeps the number it got, which may be someone else's by the time it's back.
 static bool sysctls_up;
 
 static struct sysctl_oid *const sysctls[] = {
     &sysctl__kern_malachite_power, &sysctl__kern_malachite_stats, &sysctl__kern_malachite_prof_on,
-    &sysctl__kern_malachite_compress, &sysctl__kern_malachite_zcull, &sysctl__kern_malachite_prof,
+    &sysctl__kern_malachite_prof, &sysctl__kern_malachite_present_apps,
 };
 
 static void sysctls_register()
@@ -1183,9 +1254,6 @@ bool Gpu::start(IOService *provider)
     if (!IOService::start(provider))
         return false;
     power_owner = this;
-    pm = pm_flags();
-    if (pm)
-        log_msg("Malachite: nvpm %#x\n", pm);
     sysctls_register();
     pump_call = thread_call_allocate(pump, this);
 
@@ -1375,7 +1443,6 @@ void Gpu::suspend()
         return;
     uint64_t t0 = time_us();
     suspended = true;
-    capped = false;
     timer->cancelTimeout();
     if (irq)
         irq->disable();
@@ -1571,7 +1638,8 @@ bool Gpu::copy_channel(gpu_ctx *c, uint32_t chid, uint32_t handle)
 {
     uint32_t engine, runlist;
     if (chan_find_engine(gsp, &c->client, CHAN_COPY, &engine, &runlist) ||
-        chan_create(gsp, &c->client, &c->vm, engine, runlist, chid, handle, c == &kctx, &c->copy_ch))
+        chan_create(gsp, &c->client, &c->vm, engine, runlist, chid, handle, c == &kctx ? CHAN_KERNEL : CHAN_ADMIN,
+                    &c->copy_ch))
         return false;
     struct {
         uint32_t version, engineType;
@@ -1649,6 +1717,7 @@ void Gpu::drop_contexts()
         IOFree(c, sizeof(*c));
         c = nullptr;
     }
+    stats[ST_CTXS] = 0;
     ctx_forget(&kctx);
     vmm_destroy(&kctx.vm);
     memset(&kctx, 0, sizeof(kctx));
@@ -1704,7 +1773,6 @@ void Gpu::poll(OSObject *owner, IOTimerEventSource *sender)
             self->disp->hotplug = ~0u;
         }
         self->check_hotplug();
-        self->idle_tick();
         sender->setTimeoutMS(self->irq ? 1000 : 20);
     }
     IOLockUnlock(self->lock);
@@ -1919,7 +1987,10 @@ IOReturn Gpu::gpu_map(gpu_ctx *c, IOMemoryDescriptor *md, uint64_t *outva)
     uint64_t va = map_va(c, size);
     int which = 0;
     uint64_t copy = shadow_at(d->pages, size >> 12, &which);  // a surface already moved to VRAM maps there
-    if (!va || (copy ? vmm_map_vram(&c->vm, va, copy, size, 0) : vmm_map_sys(&c->vm, va, d, 0, size, 0))) {
+    // through L2 for an app (a BVH in a shared buffer read over the bus line by line ran ~15 times slower)
+    unsigned flags = c != &kctx && strcmp(c->owner, "WindowServer") ? VMM_CACHED : 0;
+    c->cached_sys |= flags != 0;
+    if (!va || (copy ? vmm_map_vram(&c->vm, va, copy, size, 0) : vmm_map_sys(&c->vm, va, d, 0, size, flags))) {
         if (va)
             map_va_free(c, va, size);
         mem_free(d->pages);
@@ -1928,6 +1999,7 @@ IOReturn Gpu::gpu_map(gpu_ctx *c, IOMemoryDescriptor *md, uint64_t *outva)
         return kIOReturnError;
     }
     gpu_maps[slot].shadow = (uint8_t)which;
+    gpu_maps[slot].uncached = false;
     map_slack(c, va + size);
     vmm_flush(&gpu);  // invalidate the GPU TLB so the new PTEs are visible (else later copies MMU-fault "not valid")
     md->retain();  // until the unmap, which may come after the buffer's owner is done with it
@@ -2051,6 +2123,7 @@ IOReturn Gpu::gpu_copy2d(gpu_ctx *c, const struct nvgpu_copy2d *cp)
         prof_copy_bytes += (uint64_t)cp->bytes * cp->lines;
     }
     // after the draws queued so far, which it may read, and before the ones that follow (after_copies)
+    kick_draws(c);
     if (c->draw_pending)
         chan_acquire_queue(&c->copy_ch, c->compute_semva, c->draw_pending);
     c->ce_pending = c->ce_last = c->draw_pending = ++c->compute_seq;
@@ -2101,8 +2174,12 @@ IOReturn Gpu::set_kind(gpu_ctx *c, uint64_t va, uint8_t kind, bool compress)
             return kIOReturnSuccess;
         }
         uint8_t packed = 0;
-        if (compress && compress_on && m->vram && !((m->va | m->vram | m->dma.size) & 0xffff))
+        if (compress && m->vram && !((m->va | m->vram | m->dma.size) & 0xffff))
             packed = compressed_kind(kind);
+        // the work queued before may still be using the old PTEs: unmapped for a moment, or small pages beside the
+        // big compressed ones, it faults (PTE not valid, UNSUPPORTED_KIND; Genshin, 1 launch in 4)
+        if (drain(c) != kIOReturnSuccess)
+            return kIOReturnTimeout;
         struct vmm *vm = &m->ctx->vm;
         int failed;
         if (packed) {
@@ -2111,7 +2188,7 @@ IOReturn Gpu::set_kind(gpu_ctx *c, uint64_t va, uint8_t kind, bool compress)
             vmm_unmap(vm, m->va, m->dma.size);  // big pages would hide the small ones
             failed = vmm_map_vram(vm, m->va, m->vram, m->dma.size, VMM_KINDF(kind));
         } else {
-            failed = vmm_map_sys(vm, m->va, &m->dma, 0, m->dma.size, VMM_KINDF(kind));
+            failed = vmm_map_sys(vm, m->va, &m->dma, 0, m->dma.size, VMM_KINDF(kind) | sys_flags(m));
         }
         if (failed)
             return kIOReturnError;
@@ -2231,7 +2308,7 @@ void Gpu::demote(present_slot *s)
     for (int j = 0; j < gpu_maps_top; j++) {
         struct gpu_mapping *m = &gpu_maps[j];
         if (m->va && m->shadow == s->shadow) {
-            vmm_map_sys(&m->ctx->vm, m->va, &m->dma, 0, m->dma.size, 0);
+            vmm_map_sys(&m->ctx->vm, m->va, &m->dma, 0, m->dma.size, sys_flags(m));
             m->shadow = 0;
         }
     }
@@ -2245,6 +2322,77 @@ void Gpu::demote(present_slot *s)
 
 // Busy while the frame before it is still being copied or flipped to, until a bound after `since`: the caller tries
 // again with the lock let go, which the next frame's draws take
+Gpu::present_slot *Gpu::oldest_slot()
+{
+    present_slot *s = &present[0];
+    for (int i = 1; i < PRESENT_SLOTS; i++)
+        if (present[i].used < s->used)
+            s = &present[i];
+    return s;
+}
+
+// slot s for md, of size bytes, its last surface put back
+IOReturn Gpu::fill_slot(present_slot *s, IOMemoryDescriptor *md, size_t size)
+{
+    if (!s->va)
+        s->va = vmm_alloc(&kctx.vm, PRESENT_SLOT_SIZE, 0x10000);
+    if (s->shadow)
+        demote(s);
+    s->count = 0;
+    if (s->md) {
+        vmm_unmap(&kctx.vm, s->va, s->dma.size);
+        mem_free(s->dma.pages);
+        s->md->complete();
+        s->md->release();
+        s->md = nullptr;
+    }
+    if (!s->va || md->prepare() != kIOReturnSuccess)
+        return kIOReturnError;
+    memset(&s->dma, 0, sizeof(s->dma));
+    s->dma.size = size;
+    s->dma.pages = (uint64_t *)mem_alloc((size >> 12) * sizeof(uint64_t));
+    if (!s->dma.pages) {
+        md->complete();
+        return kIOReturnNoMemory;
+    }
+    for (size_t off = 0; off < size; off += 0x1000)
+        s->dma.pages[off >> 12] = md->getPhysicalSegment(off, nullptr, kIOMemoryMapperNone);
+    s->dma.addr = s->dma.pages[0];
+    if (vmm_map_sys(&kctx.vm, s->va, &s->dma, 0, size, 0)) {
+        mem_free(s->dma.pages);
+        md->complete();
+        return kIOReturnError;
+    }
+    vmm_flush(&gpu);
+    md->retain();
+    s->md = md;
+    return kIOReturnSuccess;
+}
+
+// A GL window goes to VRAM like a screen's surface: it is written and read by WindowServer over PCIe otherwise, which
+// holds GL to 120 swaps a second on a faster screen. Only GL's: a Metal app can read its drawable on the CPU, and that
+// would go stale there, for no gain. That it is mapped by another process tells it from GL's own offscreen surfaces.
+void Gpu::adopt_surface(int i)
+{
+    struct gpu_mapping &m = gpu_maps[i];
+    if (m.vram || m.shadow || !m.dma.handle || m.dma.size < (1u << 20) || m.dma.size > PRESENT_SLOT_SIZE)
+        return;
+    if (++m.passes < 30)
+        return;
+    m.passes = -600;
+    bool shared = false;
+    for (int j = 0; j < gpu_maps_top && !shared; j++)
+        shared = gpu_maps[j].va && gpu_maps[j].ctx != m.ctx && gpu_maps[j].dma.pages &&
+                 gpu_maps[j].dma.pages[0] == m.dma.pages[0];
+    if (!shared)
+        return;
+    present_slot *s = oldest_slot();
+    if ((s->fence && !copy_done(s->fence)) || fill_slot(s, (IOMemoryDescriptor *)m.dma.handle, m.dma.size))
+        return;
+    s->used = ++present_frames;
+    s->shadow = promote(s, s->dma.size);
+}
+
 IOReturn Gpu::gpu_present(struct nvgpu_present *p, uint64_t since)
 {
     IOMemoryDescriptor *md = (IOMemoryDescriptor *)p->memory;
@@ -2303,43 +2451,11 @@ IOReturn Gpu::gpu_present(struct nvgpu_present *p, uint64_t since)
     if (s && copying(s))
         return time_us() - since < 2000000 ? kIOReturnBusy : kIOReturnTimeout;
     if (!s) {
-        for (int i = 0; i < PRESENT_SLOTS; i++)
-            if (!s || present[i].used < s->used)
-                s = &present[i];
+        s = oldest_slot();
         if (copying(s))
             return time_us() - since < 2000000 ? kIOReturnBusy : kIOReturnTimeout;
-        if (!s->va)
-            s->va = vmm_alloc(&kctx.vm, PRESENT_SLOT_SIZE, 0x10000);
-        if (s->shadow)
-            demote(s);
-        s->count = 0;
-        if (s->md) {
-            vmm_unmap(&kctx.vm, s->va, s->dma.size);
-            mem_free(s->dma.pages);
-            s->md->complete();
-            s->md->release();
-            s->md = nullptr;
-        }
-        if (!s->va || md->prepare() != kIOReturnSuccess)
-            return kIOReturnError;
-        memset(&s->dma, 0, sizeof(s->dma));
-        s->dma.size = size;
-        s->dma.pages = (uint64_t *)mem_alloc((size >> 12) * sizeof(uint64_t));
-        if (!s->dma.pages) {
-            md->complete();
-            return kIOReturnNoMemory;
-        }
-        for (size_t off = 0; off < size; off += 0x1000)
-            s->dma.pages[off >> 12] = md->getPhysicalSegment(off, nullptr, kIOMemoryMapperNone);
-        s->dma.addr = s->dma.pages[0];
-        if (vmm_map_sys(&kctx.vm, s->va, &s->dma, 0, size, 0)) {
-            mem_free(s->dma.pages);
-            md->complete();
-            return kIOReturnError;
-        }
-        vmm_flush(&gpu);
-        md->retain();
-        s->md = md;
+        if (IOReturn r = fill_slot(s, md, size))
+            return r;
     }
     s->used = ++present_frames;
     if (time_us() - promote_mark > 10000000) {
@@ -2480,7 +2596,7 @@ IOReturn Gpu::present_frame(struct nvgpu_present *p)
     if (kctx.draw_pending && kctx.compute_sem)
         waits[n++] = { &kctx, kctx.draw_pending };
     for (gpu_ctx *c : ctxs)
-        if (c && c->draw_pending && c->compute_sem)
+        if (c && c->draw_pending && c->compute_sem && (present_apps || !strcmp(c->owner, "WindowServer")))
             waits[n++] = { c, c->draw_pending };
     give();
     const uint64_t since = time_us();
@@ -2538,6 +2654,24 @@ IOReturn Gpu::present_frame(struct nvgpu_present *p)
     }
 }
 
+// VRAM from the allocator holds what its last owner left there, another process's pixels: a texture read before it
+// was written showed them (WindowServer's backdrops drew blocks of other windows once render targets were in VRAM).
+// Zeroed by the copy engine through a mapping of the kernel's, as system memory comes zeroed. Nonzero if it isn't.
+int Gpu::clear_vram(uint64_t vram, uint64_t size)
+{
+    uint64_t va = vmm_alloc(&kctx.vm, size, 0x10000);
+    if (!va)
+        return -1;
+    int r = vmm_map_vram(&kctx.vm, va, vram, size, 0);
+    if (!r) {
+        vmm_flush(&gpu);
+        r = gpu_fill(&kctx, va, size, 0) != kIOReturnSuccess;
+        vmm_unmap(&kctx.vm, va, size);
+    }
+    vmm_free(&kctx.vm, va, size);
+    return r;
+}
+
 IOReturn Gpu::gpu_fill(gpu_ctx *c, uint64_t dst, uint64_t size, uint32_t pattern)
 {
     if (!gpu_bridge_init(c))
@@ -2587,7 +2721,9 @@ bool Gpu::compute_bridge_init(gpu_ctx *c)
     if (!c->compute_qmd || !c->compute_cbuf || !c->draw_ring || !c->dispatch_ring)
         return false;
     c->draw_ringva = vmm_alloc(&c->vm, c->draw_ring->size, 0x1000);
-    if (!c->draw_ringva || vmm_map_sys(&c->vm, c->draw_ringva, c->draw_ring, 0, c->draw_ring->size, 0))
+    if (!c->draw_ringva)
+        return false;
+    if (vmm_map_sys(&c->vm, c->draw_ringva, c->draw_ring, 0, c->draw_ring->size, 0))
         return false;
     c->dispatch_ringva = vmm_alloc(&c->vm, c->dispatch_ring->size, 0x1000);
     if (!c->dispatch_ringva || vmm_map_sys(&c->vm, c->dispatch_ringva, c->dispatch_ring, 0, c->dispatch_ring->size, 0))
@@ -2653,7 +2789,14 @@ uintptr_t Gpu::ctx_open()
             return 0;
         proc_selfname(ctxs[i]->owner, sizeof(ctxs[i]->owner));  // called from the task's own thread
         ctx_serial[i] = (ctx_serial[i] + 1) & 0xffffff;
+        if (++stats[ST_CTXS] > stats[ST_CTXS_PEAK])
+            stats[ST_CTXS_PEAK] = stats[ST_CTXS];
         return (uintptr_t)(i + 1) | (uintptr_t)ctx_serial[i] << 8;
+    }
+    if (stats[ST_CTXS_REFUSED]++ % 100 == 0) {
+        char who[32];
+        proc_selfname(who, sizeof(who));
+        log_msg("Malachite: %s gets no GPU context, all %d are taken\n", who, MAX_CTXS);
     }
     return 0;
 }
@@ -2704,11 +2847,12 @@ void Gpu::ctx_close(uintptr_t handle)
     unsigned slot = (unsigned)(handle & 0xff) - 1;
     IOFree(c, sizeof(*c));
     ctxs[slot] = nullptr;
+    stats[ST_CTXS]--;
 }
 
 // GSP-RM's word that a channel faulted and is torn down: GSP-RM stops it and it never runs again, so ours are freed
 // and made anew before their next use (recover()). Called from message handling, which may be inside a wait.
-void Gpu::rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception)
+void Gpu::rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, uint64_t fault_va)
 {
     Gpu *self = (Gpu *)ctx;
     for (int i = -1; i < MAX_CTXS; i++) {
@@ -2717,6 +2861,8 @@ void Gpu::rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception
             c->compute_faulted = true;
         if (c && c->gpu_ready && chid == c->copy_ch.chid)
             c->copy_faulted = true;
+        if (c && fault_va && (chid == c->compute_ch.chid || chid == c->copy_ch.chid))
+            c->fault_va = fault_va;
     }
 }
 
@@ -2798,6 +2944,38 @@ void Gpu::recover(gpu_ctx *c)
     if (c->compute_faulted) {
         c->compute_faulted = false;
         log_msg("Malachite: %s's graphics channel faulted, making a new one\n", c == &kctx ? "kernel" : c->owner);
+        // which of a launch's addresses its context no longer maps: the fault's address isn't latched
+        auto mapped = [&](uint64_t va) {
+            if (!va)
+                return '-';
+            for (int i = 0; i < gpu_maps_top; i++)
+                if (gpu_maps[i].ctx == c && gpu_maps[i].va <= va && va < gpu_maps[i].va + gpu_maps[i].dma.size)
+                    return 'm';
+            return 'X';
+        };
+        if (c->fault_va) {  // the mapping the fault was in, or the ones either side of it
+            const gpu_mapping *in = nullptr, *before = nullptr, *after = nullptr;
+            for (int i = 0; i < gpu_maps_top; i++) {
+                const gpu_mapping *m = &gpu_maps[i];
+                if (m->ctx != c || !m->va)
+                    continue;
+                if (m->va <= c->fault_va && c->fault_va < m->va + m->dma.size)
+                    in = m;
+                else if (m->va + m->dma.size <= c->fault_va && (!before || m->va > before->va))
+                    before = m;
+                else if (m->va > c->fault_va && (!after || m->va < after->va))
+                    after = m;
+            }
+            const gpu_mapping *near[] = { in, before, after };
+            for (const gpu_mapping *m : near)
+                if (m)
+                    log_msg("Malachite:   %s the fault at %#llx: %#llx+%#llx %s kind %#x%s%s%s\n",
+                            m == in ? "in" : m == before ? "before" : "after", (unsigned long long)c->fault_va,
+                            (unsigned long long)m->va, (unsigned long long)m->dma.size, m->vram ? "VRAM" : "system",
+                            m->kind, m->compressed ? " compressed" : "", m->shadow ? " shadowed" : "",
+                            !m->vram && sys_flags(m) ? " cached" : "");
+            c->fault_va = 0;
+        }
         for (const auto &l : c->launches) {
             if (!l.seq || (int32_t)(l.seq - *c->compute_sem) <= 0)
                 continue;
@@ -2805,8 +2983,12 @@ void Gpu::recover(gpu_ctx *c)
                         l.vs ? "draw" : "dispatch", l.seq, (unsigned long long)l.prog, l.vs ? " (vs after)" : "", l.groups[0],
                         l.groups[1], l.groups[2], l.block[0], l.block[1], l.block[2], l.regs);
             if (l.vs)
-                log_msg("Malachite:     vs args %#llx %#llx, ps args %#llx %#llx\n", (unsigned long long)l.params[0],
-                        (unsigned long long)l.params[1], (unsigned long long)l.params[2], (unsigned long long)l.params[3]);
+                log_msg("Malachite:     vs args %#llx %#llx, ps args %#llx %#llx, target %#llx zt %#llx; mapped: ps %c "
+                        "vs %c args %c%c%c%c target %c zt %c\n",
+                        (unsigned long long)l.params[0], (unsigned long long)l.params[1],
+                        (unsigned long long)l.params[2], (unsigned long long)l.params[3], (unsigned long long)l.target,
+                        (unsigned long long)l.zt, mapped(l.prog), mapped(l.vs), mapped(l.params[0]),
+                        mapped(l.params[1]), mapped(l.params[2]), mapped(l.params[3]), mapped(l.target), mapped(l.zt));
             if (l.seq == *c->compute_sem + 1) {
                 log_msg("Malachite:   the first one's code, ps or program then vs\n");
                 log_code(l.prog);
@@ -2832,9 +3014,11 @@ void Gpu::recover(gpu_ctx *c)
         chan_free(&c->compute_ch);
         gr_ctx_free(gsp, &c->compute_ctx);
         c->draw_pending = c->ce_pending = 0;
-        if (!saved) {  // what's lost never releases its slots
+        if (!saved) {  // what's lost never releases its slots, nor the payloads the copy channel may wait on
             memset(c->draw_slot_seq, 0, sizeof(c->draw_slot_seq));
             memset(c->dispatch_slot_seq, 0, sizeof(c->dispatch_slot_seq));
+            if (c->compute_sem)
+                *c->compute_sem = c->compute_seq;
         }
         memset(c->pass_targets, 0, sizeof(c->pass_targets));
         memset(c->half_seq, 0, sizeof(c->half_seq));
@@ -2852,6 +3036,7 @@ void Gpu::recover(gpu_ctx *c)
             return;
         }
         c->issued_next = 0;
+        c->draws_queued = 0;
         if (saved) {
             if (chan_replay(&c->compute_ch, saved, nsaved))
                 log_msg("Malachite: %s's work lost to the fault doesn't fit the new channel\n",
@@ -2874,8 +3059,11 @@ void Gpu::recover(gpu_ctx *c)
 // read here, and a channel it tore down is made anew, rather than the wait running out its time on a dead one.
 int Gpu::ring_wait(gpu_ctx *c, int counter, uint32_t payload, int ms)
 {
+    if ((int32_t)(*c->compute_sem - payload) >= 0)  // nearly always, for a slot the last lap used
+        return 0;
     uint64_t t0 = time_us();
     int r = -1;
+    kick_draws(c);
     for (int t = 0; t < ms / 10 && r; t++) {
         r = render_wait(c->compute_sem, payload, 10);
         if (r && gsp) {
@@ -2982,7 +3170,7 @@ void Gpu::free_local_memory(gpu_ctx *c)
 IOReturn Gpu::gpu_dispatch(gpu_ctx *c, const struct nvgpu_dispatch *d)
 {
     // a CTA gets at most the chip's shared memory and 16 named barriers
-    if (!d || d->params_size > NVGPU_PARAM_BYTES || !d->grid_x || !d->block_x || d->shared_size > gpu.chip->max_shared ||
+    if (!d || d->params_size > NVGPU_COMPUTE_PARAM_BYTES || !d->grid_x || !d->block_x || d->shared_size > gpu.chip->max_shared ||
         d->barriers > 16 || d->nheaders > NVGPU_MAX_TEXTURES || d->nsamplers > NVGPU_MAX_TEXTURES ||
         !heap_ok(&d->heap))
         return kIOReturnBadArgument;
@@ -3049,9 +3237,14 @@ IOReturn Gpu::gpu_dispatch(gpu_ctx *c, const struct nvgpu_dispatch *d)
     compute_build_qmd((uint32_t *)(slot_cpu + 0x1000), d->prog_va, cbva, c->compute_semva, payload, block, grid,
                       d->reg_count, d->shared_size, d->barriers);
     compute_qmd_set_local((uint32_t *)(slot_cpu + 0x1000), d->local_size);
+    if (prof_on && prof_ready(c)) {  // a dispatch's row: its program, flags 0x80, threadgroup width x groups
+        uint32_t i = c->prof_n++;
+        c->prof_draws[i % PROF_RING] = { d->prog_va, 0, grid[0] * grid[1] * grid[2] * block[0] * block[1] * block[2],
+                                         0x80, 0, (uint16_t)block[0], (uint16_t)MIN(grid[0], 65535u) };
+        compute_qmd_set_stamp((uint32_t *)(slot_cpu + 0x1000), c->prof_va + (i % PROF_RING) * 16, i + 1);
+    }
     c->launches[payload % 8] = { payload, { grid[0], grid[1], grid[2] }, { block[0], block[1], block[2] }, d->reg_count,
                                  d->prog_va, 0 };
-    vmm_flush(&gpu);
     compute_launch(&c->compute_ch, qmdva);
     issued(c);
     c->dispatch_slot_seq[slot] = c->draw_pending = payload;
@@ -3171,6 +3364,8 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
         bool vram = gpu_maps[target_map].vram || gpu_maps[target_map].shadow;  // a promoted surface is drawn in its VRAM copy
         stats[vram ? ST_DRAW_VRAM : ST_DRAW_SYS]++;
         stats[vram ? ST_DRAW_VRAM_KPX : ST_DRAW_SYS_KPX] += (uint64_t)d->width * d->height / 1000;
+        if (d->pass_first && d->opengl)
+            adopt_surface(target_map);
     }
     IOReturn lr = d->local_size ? local_memory(c, d->local_size) : kIOReturnSuccess;
     if (lr != kIOReturnSuccess)
@@ -3212,18 +3407,18 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
     r.per_sample = d->per_sample;
     r.ps_depth = d->ps_depth;
     r.layers = d->layers;
-    memcpy(r.layer_pitch, d->layer_pitch, sizeof(r.layer_pitch));
+    __builtin_memcpy(r.layer_pitch, d->layer_pitch, sizeof(r.layer_pitch));
     r.zt_layer_pitch = d->zt_layer_pitch;
     r.shader_layer = d->shader_layer;
     r.nviewports = d->nviewports;
     r.viewports = d->viewports;
     r.scissors = d->scissors;
     r.write_mask = d->write_mask;
-    memcpy(r.blend, d->blend, sizeof(r.blend));
+    __builtin_memcpy(r.blend, d->blend, sizeof(r.blend));
     for (int j = 0; j < 7; j++) {
         const struct nvgpu_target *t = &d->more[j];
         r.more[j] = { t->addr, t->pitch, t->format, t->blocklinear, t->write_mask, {} };
-        memcpy(r.more[j].blend, t->blend, sizeof(t->blend));
+        __builtin_memcpy(r.more[j].blend, t->blend, sizeof(t->blend));
     }
     if (d->target && d->clear) {
         render_clear(&c->compute_ch, &r, 0, d->clear_rgba, nullptr, c->compute_semva, ++c->compute_seq);
@@ -3240,7 +3435,7 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
     for (int j = 0; j < 7; j++)
         targets[2 + j] = d->more[j].addr;
     r.wait_idle = memcmp(targets, c->pass_targets, sizeof(targets)) != 0 || d->serialize;
-    memcpy(c->pass_targets, targets, sizeof(targets));
+    __builtin_memcpy(c->pass_targets, targets, sizeof(targets));
     // and the shader caches start over with it, for other shaders, and once a lap of the draw slots (whose
     // constants this one rewrote)
     r.invalidate = r.wait_idle || d->vs != c->pass_vs || d->ps != c->pass_ps || d->ti != c->pass_ti ||
@@ -3260,7 +3455,7 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
     // A pass that loads what the last one left keeps what zcull learnt: the prepass of a frame, for the pass after it
     if (d->pass_first && !(d->zt && d->zt == c->zcull_zt && d->zt < c->zcull_hi && !(d->clear_zs & 1))) {
         const struct gsp_zcull *z = &gsp_get_info(gsp)->zcull;
-        if (zcull_on && z->subregion_count && d->zt && (d->clear_zs & 1) && d->layers <= 1)
+        if (z->subregion_count && d->zt && (d->clear_zs & 1) && d->layers <= 1)
             zcull = z;
         else if (c->zcull_zt)
             render_zcull_off(&c->compute_ch);
@@ -3326,10 +3521,10 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
     r.depth_write = d->depth_write;
     r.depth_func = d->depth_func;
     r.stencil_test = d->stencil_test;
-    memcpy(r.stencil, d->stencil, sizeof(r.stencil));
+    __builtin_memcpy(r.stencil, d->stencil, sizeof(r.stencil));
     r.stencil_ref = d->stencil_ref;
-    memcpy(r.stencil_read_mask, d->stencil_read_mask, sizeof(r.stencil_read_mask));
-    memcpy(r.stencil_write_mask, d->stencil_write_mask, sizeof(r.stencil_write_mask));
+    __builtin_memcpy(r.stencil_read_mask, d->stencil_read_mask, sizeof(r.stencil_read_mask));
+    __builtin_memcpy(r.stencil_write_mask, d->stencil_write_mask, sizeof(r.stencil_write_mask));
     r.vs = d->vs;
     r.ps = d->ps;
     r.vs_regs = d->vs_regs;
@@ -3364,20 +3559,21 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
     r.window_coords = d->window_coords;
     r.depth_clamp = d->depth_clamp;
     r.fill_lines = d->fill_lines;
-    memcpy(r.depth_bias, d->depth_bias, sizeof(r.depth_bias));
-    memcpy(r.blend_const, d->blend_const, sizeof(r.blend_const));
+    __builtin_memcpy(r.depth_bias, d->depth_bias, sizeof(r.depth_bias));
+    __builtin_memcpy(r.blend_const, d->blend_const, sizeof(r.blend_const));
     r.visibility = d->visibility;
     r.visibility_reset = d->visibility_reset;
-    memcpy(r.viewport, d->viewport, sizeof(r.viewport));
-    memcpy(r.scissor, d->scissor, sizeof(r.scissor));
-    memcpy(r.attributes, d->attributes, sizeof(r.attributes));
+    __builtin_memcpy(r.viewport, d->viewport, sizeof(r.viewport));
+    __builtin_memcpy(r.scissor, d->scissor, sizeof(r.scissor));
+    __builtin_memcpy(r.attributes, d->attributes, sizeof(r.attributes));
     for (int s = 0; s < RENDER_STREAMS; s++) {
         r.streams[s].addr = d->streams[s].addr;
         r.streams[s].stride = d->streams[s].stride;
         r.streams[s].size = d->streams[s].size;
         r.streams[s].divisor = d->streams[s].divisor;
     }
-    render_draw(&c->compute_ch, &r, nullptr, c->compute_semva, ++c->compute_seq);
+    render_draw_queued(&c->compute_ch, &r, c->compute_semva, ++c->compute_seq);
+    c->draws_queued++;
     if (prof_on && prof_ready(c)) {
         uint32_t i = c->prof_n++;
         c->prof_draws[i % PROF_RING] = { r.vs, r.ps, r.count * r.instances,
@@ -3390,8 +3586,10 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
         chan_kick(&c->compute_ch);
     }
     c->launches[c->compute_seq % 8] = { c->compute_seq, { r.count, r.instances, 0 }, {}, d->vs_regs, r.ps, r.vs };
-    memcpy(c->launches[c->compute_seq % 8].params, cb + 0x160, 16);
-    memcpy(c->launches[c->compute_seq % 8].params + 2, cb + 0x1000 + 0x160, 16);
+    __builtin_memcpy(c->launches[c->compute_seq % 8].params, d->vs_params, 16);
+    __builtin_memcpy(c->launches[c->compute_seq % 8].params + 2, d->ps_params, 16);
+    c->launches[c->compute_seq % 8].target = d->target;
+    c->launches[c->compute_seq % 8].zt = d->zt;
     issued(c);
     c->draw_slot_seq[slot] = c->draw_pending = c->compute_seq;
     return kIOReturnSuccess;
@@ -3400,6 +3598,7 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
 IOReturn Gpu::drain(gpu_ctx *c)
 {
     memset(c->pass_targets, 0, sizeof(c->pass_targets));  // a copy, a dispatch or the CPU may write memory next
+    kick_draws(c);
     if (!c->draw_pending)
         return kIOReturnSuccess;
     uint64_t t0 = time_us();
@@ -3419,9 +3618,39 @@ IOReturn Gpu::drain(gpu_ctx *c)
     c->draw_pending = 0;
     stats[ST_DRAIN_US] += time_us() - t0;
     busy_close(c);
+    if (prof_on && !r)  // an app that never presents (OpenCL, a benchmark's offscreen run) is timed here
+        prof_harvest(c);
     if (r)
         log_msg("Malachite: draws never finished (semaphore 0x%x)\n", *c->compute_sem);
     return r ? kIOReturnTimeout : kIOReturnSuccess;
+}
+
+// An app's frame finishing: the wait is the length of its GPU work, and held under the lock it would stop everyone
+// else's, WindowServer's composite with them. drain takes over for the last of it, and for a fault.
+IOReturn Gpu::sync_ctx(uintptr_t handle)
+{
+    uint64_t t0 = time_us();
+    for (bool ended = false;; ended = true) {
+        take();
+        gpu_ctx *c = ctx_of(handle);
+        if (!c || c->refused_until > time_us()) {
+            give();
+            return !c ? kIOReturnNotReady : kIOReturnNotPermitted;
+        }
+        if (!ended)
+            l2_sysmem(c, false);
+        kick_draws(c);
+        if (!c->draw_pending || !c->compute_sem || (int32_t)(*c->compute_sem - c->draw_pending) >= 0 ||
+            c->compute_faulted || c->copy_faulted || time_us() - t0 > 10000) {
+            stats[ST_SYNC]++;
+            IOReturn r = settle(drain(c));
+            stats[ST_SYNC_US] += time_us() - t0;
+            give();
+            return r;
+        }
+        give();
+        delay_us(20);
+    }
 }
 
 bool Gpu::usable()
@@ -3460,7 +3689,16 @@ IOReturn Gpu::queue_draw(void *ctx, const struct nvgpu_draw *d, const char **why
 {
     if (!usable())
         return kIOReturnNotReady;
-    WITH_CTX(ctx, (stats[ST_DRAW]++, busy_open(c, TIMED(ST_DRAW_US, launch(c, nullptr, d, why)))));
+    WITH_CTX(ctx, (stats[ST_DRAW]++, busy_open(c, draw(c, d, why))));
+}
+
+IOReturn Gpu::queue_push(void *ctx, const struct malachite_push *p)
+{
+    if (!usable())
+        return kIOReturnNotReady;
+    if (!p->words || p->words > 0x1fffff || (p->va & 3))
+        return kIOReturnBadArgument;
+    WITH_CTX(ctx, (stats[ST_DRAW] += p->draws, busy_open(c, push_run(c, p))));
 }
 
 IOReturn Gpu::queue_copy2d(void *ctx, const struct nvgpu_copy2d *p)
@@ -3485,6 +3723,11 @@ IOReturn queue_dispatch(IOService *gpu, void *ctx, const struct nvgpu_dispatch *
 IOReturn queue_draw(IOService *gpu, void *ctx, const struct nvgpu_draw *d, const char **why)
 {
     return static_cast<Gpu *>(gpu)->queue_draw(ctx, d, why);
+}
+
+IOReturn queue_push(IOService *gpu, void *ctx, const struct malachite_push *p)
+{
+    return static_cast<Gpu *>(gpu)->queue_push(ctx, p);
 }
 
 IOReturn queue_copy2d(IOService *gpu, void *ctx, const struct nvgpu_copy2d *p)
@@ -3533,7 +3776,13 @@ IOReturn Gpu::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, vo
     if (name->isEqualTo(NVGPU_FN_VRAM_ALLOC)) {
         take();
         uint64_t size = (uint64_t)(uintptr_t)p1;
-        *(uint64_t *)p2 = size && gpu_bridge_init(&kctx) ? vram_alloc(gsp_vram(gsp), size, 0x10000) : 0;
+        uint64_t vram = size && gpu_bridge_init(&kctx) ? vram_alloc(gsp_vram(gsp), size, 0x10000) : 0;
+        static bool told;
+        if (vram && clear_vram(vram, size) && !told) {
+            told = true;
+            log_msg("Malachite: VRAM of %llu bytes not cleared before it was handed out\n", (unsigned long long)size);
+        }
+        *(uint64_t *)p2 = vram;
         give();
         return *(uint64_t *)p2 ? kIOReturnSuccess : kIOReturnNoMemory;
     }
@@ -3578,6 +3827,9 @@ IOReturn Gpu::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, vo
     if (name->isEqualTo(NVGPU_FN_COPY))
         WITH_CTX(p4, (stats[ST_COPY]++, drain(c),
                       gpu_copy(c, (uint64_t)(uintptr_t)p1, (uint64_t)(uintptr_t)p2, (uint64_t)(uintptr_t)p3)));
+    if (name->isEqualTo(NVGPU_FN_UPLOAD))
+        WITH_CTX(p4, (stats[ST_COPY]++, memset(c->pass_targets, 0, sizeof(c->pass_targets)),
+                      gpu_copy(c, (uint64_t)(uintptr_t)p1, (uint64_t)(uintptr_t)p2, (uint64_t)(uintptr_t)p3)));
     if (name->isEqualTo(NVGPU_FN_PIPE_VBL)) {
         uintptr_t i = (uintptr_t)p3;
         if (i >= SCREENS)
@@ -3594,16 +3846,19 @@ IOReturn Gpu::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, vo
         WITH_CTX(p4, (stats[ST_FILL]++, drain(c),
                       gpu_fill(c, (uint64_t)(uintptr_t)p1, (uint64_t)(uintptr_t)p2, (uint32_t)(uintptr_t)p3)));
     if (name->isEqualTo(NVGPU_FN_SYNC))
-        WITH_CTX(p1, (stats[ST_SYNC]++, TIMED(ST_SYNC_US, settle(drain(c)))));
+        return sync_ctx((uintptr_t)p1);
     if (name->isEqualTo(NVGPU_FN_DRAW_FENCE))
         // at the end of a command buffer: the next one's draws start a pass, as the CPU may have written memory
-        WITH_CTX(p2, (*(uint32_t *)p1 = c->draw_pending, memset(c->pass_targets, 0, sizeof(c->pass_targets)),
-                      kIOReturnSuccess));
+        WITH_CTX(p2, (l2_sysmem(c, false), kick_draws(c), *(uint32_t *)p1 = c->draw_pending,
+                      memset(c->pass_targets, 0, sizeof(c->pass_targets)), kIOReturnSuccess));
+    if (name->isEqualTo(NVGPU_FN_CB_BEGIN))
+        WITH_CTX(p1, (l2_sysmem(c, true), kIOReturnSuccess));
     if (name->isEqualTo(NVGPU_FN_ASYNC)) {
         take();
         gpu_ctx *c = ctx_of((uintptr_t)p1);
         bool ws = c && !strcmp(c->owner, "WindowServer");
         give();
+        *(bool *)p2 = !ws;
         return ws ? kIOReturnSuccess : kIOReturnUnsupported;
     }
     if (name->isEqualTo(NVGPU_FN_CTX_BUSY)) {  // no lock, like DRAW_DONE: Accelerator asks as it submits
@@ -3611,24 +3866,27 @@ IOReturn Gpu::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, vo
         *(uint64_t *)p2 = c ? busy_take(c) : 0;
         return kIOReturnSuccess;
     }
-    if (name->isEqualTo(NVGPU_FN_DRAW_DONE)) {  // no lock: a semaphore read
+    if (name->isEqualTo(NVGPU_FN_DRAW_DONE)) {
+        // the semaphore goes with its context, which a WindowServer that died closes under a timer still polling it.
+        // The timer tries again, so a holder busy with the GPU costs it nothing.
+        if (!IOLockTryLock(lock))
+            return kIOReturnBusy;
         gpu_ctx *c = ctx_of((uintptr_t)p2);
         if (c && caught_up(c))
             busy_close(c);
-        if (!c || !c->compute_sem || (int32_t)(*c->compute_sem - (uint32_t)(uintptr_t)p1) >= 0)
-            return kIOReturnSuccess;
-        // still going: unless its channel faulted (word GSP-RM may have sent only now), which has it made anew and
-        // the work lost run again
-        if (gsp && (gsp_pending(gsp) || c->compute_faulted)) {
-            take();
-            if ((c = ctx_of((uintptr_t)p2))) {
+        IOReturn r = kIOReturnSuccess;
+        if (c && c->compute_sem && (int32_t)(*c->compute_sem - (uint32_t)(uintptr_t)p1) < 0) {
+            r = kIOReturnBusy;
+            // still going: unless its channel faulted (word GSP-RM may have sent only now), which has it made anew and
+            // the work lost run again
+            if (gsp && (gsp_pending(gsp) || c->compute_faulted)) {
                 gsp_poll(gsp);
                 if (c->compute_faulted)
                     compute_bridge_init(c);
             }
-            give();
         }
-        return kIOReturnBusy;
+        IOLockUnlock(lock);
+        return r;
     }
 #undef WITH_CTX
     if (name->isEqualTo(NVGPU_FN_STATS))
@@ -4027,7 +4285,7 @@ IOReturn Gpu::read_shown(uint64_t addr, uint64_t len, task_t task)
     return ret;
 }
 
-// where MALACHITE_H264_DECODE puts the pictures in the caller's memory
+// where MALACHITE_VIDEO_DECODE puts the pictures in the caller's memory
 struct frame_sink {
     task_t task;
     uint64_t addr, len, off;
@@ -4038,8 +4296,8 @@ struct frame_sink {
 static int sink_frame(void *arg, const struct video_frame *f)
 {
     frame_sink *o = (frame_sink *)arg;
-    struct malachite_frame h = { f->index, f->idr_count, f->poc, f->width, f->height, 0 };
-    uint64_t bytes = (uint64_t)f->width * f->height * 3 / 2;
+    struct malachite_frame h = { f->index, f->idr_count, f->poc, f->width, f->height, f->bps };
+    uint64_t bytes = (uint64_t)f->width * f->height * 3 / 2 * f->bps;
     if (o->off + sizeof(h) + bytes > o->len)
         return 1;
     if (copy_to_user(o->task, o->addr + o->off, &h, sizeof(h)) ||
@@ -4052,10 +4310,10 @@ static int sink_frame(void *arg, const struct video_frame *f)
     return 0;
 }
 
-IOReturn Gpu::h264_decode(const uint64_t *args, task_t task)
+IOReturn Gpu::decode_stream(const uint64_t *args, task_t task)
 {
     uint64_t len = args[1];
-    if (!len || len > 16u << 20 || args[3] < sizeof(struct malachite_frames))
+    if (!len || len > 16u << 20 || args[3] < sizeof(struct malachite_frames) || args[5] > NVDEC_VP8)
         return kIOReturnBadArgument;
     uint8_t *stream = (uint8_t *)IOMalloc(len);
     if (!stream)
@@ -4063,7 +4321,8 @@ IOReturn Gpu::h264_decode(const uint64_t *args, task_t task)
     frame_sink sink = { task, args[2], args[3], sizeof(struct malachite_frames) };
     IOReturn ret = kIOReturnBadArgument;
     if (!copy_from_user(task, stream, args[0], len)) {
-        int n = video_decode_h264(&kctx.video, stream, len, (uint32_t)args[4], sink_frame, &sink);
+        int n = ::video_decode(&kctx.video, (enum nvdec_codec)args[5], stream, len, (uint32_t)args[4], sink_frame,
+                               &sink);
         // the pictures before a failed one still go out
         struct malachite_frames hdr = { sink.count };
         if (sink.fault || copy_to_user(task, args[2], &hdr, sizeof(hdr)))
@@ -4246,6 +4505,8 @@ IOReturn Gpu::command(uint32_t selector, const uint64_t *args, task_t task)
             gsp = gsp_start(&gpu);
         if (gsp && !fe) {
             setProperty("MalachiteGPUName", gsp_get_info(gsp)->name);
+            // enabled TPCs times SMs per TPC: what OpenCL counts as compute units
+            setProperty("MalachiteSMCount", (unsigned long long)gsp_get_info(gsp)->gr[0x09] * gsp_get_info(gsp)->gr[0x20], 32);
             // the chipset model System Information shows, and the one property a sandboxed process may read; data
             // with its NUL as firmware gives it on real Macs, as Valve's launcher reads its bytes and throws on a string
             const char *name = gsp_get_info(gsp)->name;
@@ -4261,8 +4522,8 @@ IOReturn Gpu::command(uint32_t selector, const uint64_t *args, task_t task)
         }
         ret = gsp ? kIOReturnSuccess : kIOReturnError;
         break;
-    case MALACHITE_H264_DECODE:
-        ret = gsp && video_init(&kctx) ? h264_decode(args, task) : kIOReturnError;
+    case MALACHITE_VIDEO_DECODE:
+        ret = gsp && video_init(&kctx) ? decode_stream(args, task) : kIOReturnError;
         break;
     case MALACHITE_DISP_PROBE:
         if (!gsp) {
@@ -4471,7 +4732,7 @@ IOReturn UserClient::externalMethod(uint32_t selector, IOExternalMethodArguments
             return kIOReturnUnsupported;
         if ((selector == MALACHITE_LOAD_FIRMWARE && args->scalarInputCount < 3) ||
             (selector == MALACHITE_DISP_READ && args->scalarInputCount < 2) ||
-            (selector == MALACHITE_H264_DECODE && args->scalarInputCount < 5))
+            (selector == MALACHITE_VIDEO_DECODE && args->scalarInputCount < 6))
             return kIOReturnBadArgument;
         return owner->command(selector, args->scalarInput, task);
     }
@@ -4537,7 +4798,7 @@ IOReturn Gpu::newUserClient(task_t task, void *security, UInt32 type, OSDictiona
 }
 
 // A video client's context, made the first time, and its decode buffers, made again for each stream size
-IOReturn Gpu::video_open(uintptr_t *ctx, struct video_h264 *h, const uint64_t *args)
+IOReturn Gpu::video_open(uintptr_t *ctx, struct video_dec *h, const uint64_t *args)
 {
     IOLockLock(lock);
     if (!*ctx)
@@ -4549,42 +4810,47 @@ IOReturn Gpu::video_open(uintptr_t *ctx, struct video_h264 *h, const uint64_t *a
         proc_selfname(name, sizeof(name));
         log_msg("video: no %s for %s (pid %d)\n", c ? "NVDEC channel" : "GPU context", name, proc_selfpid());
     } else if (!args[0]) {
-        ret = kIOReturnSuccess;  // the context and channel alone, for the decoder to know it can decode
+        // the context and channel alone, for the decoder to know it can decode its codec
+        ret = args[4] <= NVDEC_VP8 && video_supports(&c->video, (enum nvdec_codec)args[4]) ? kIOReturnSuccess
+                                                                                         : kIOReturnUnsupported;
+    } else if (args[4] > NVDEC_VP8) {
+        ret = kIOReturnBadArgument;
     } else {
         if (h->width_mbs)
-            video_h264_close(&c->video, h);
-        ret = video_h264_open(&c->video, h, (uint32_t)args[0], (uint32_t)args[1], (uint32_t)args[2], args[3])
+            video_dec_close(&c->video, h);
+        ret = video_dec_open(&c->video, h, (enum nvdec_codec)args[4], (uint32_t)args[0], (uint32_t)args[1],
+                             (uint32_t)args[5], (uint32_t)args[2], args[3])
                   ? kIOReturnBadArgument
                   : kIOReturnSuccess;
-        log_msg("video: %s (pid %d) decodes H.264 of %llux%llu macroblocks into %llu surfaces: %#x\n", c->owner,
-                proc_selfpid(), args[0], args[1], args[2], ret);
+        log_msg("video: %s (pid %d) decodes %s of %llux%llu macroblocks into %llu surfaces: %#x\n", c->owner,
+                proc_selfpid(), nvdec_codec_name((enum nvdec_codec)args[4]), args[0], args[1], args[2], ret);
     }
     IOLockUnlock(lock);
     return ret;
 }
 
-IOReturn Gpu::video_decode(uintptr_t ctx, struct video_h264 *h, const uint64_t *args)
+IOReturn Gpu::video_decode(uintptr_t ctx, struct video_dec *h, const uint64_t *args)
 {
     uint32_t index = (uint32_t)args[1], payload;
     IOLockLock(lock);
     gpu_ctx *c = ctx ? ctx_of(ctx) : nullptr;  // 0 would be the kernel's
     bool queued = c && c->video_ready && h->width_mbs &&
-                  !video_h264_queue(&c->video, h, (uint32_t)args[0], index, (uint32_t)args[2], &payload);
+                  !video_dec_queue(&c->video, h, (uint32_t)args[0], index, (uint32_t)args[2], &payload);
     IOLockUnlock(lock);
     if (!queued)
         return kIOReturnBadArgument;
     // on the client's own semaphore, the context staying until the client goes, so others have the GPU meanwhile
-    return video_h264_wait(&c->video, h, payload, index) ? kIOReturnTimeout : kIOReturnSuccess;
+    return video_dec_wait(&c->video, h, payload, index) ? kIOReturnTimeout : kIOReturnSuccess;
 }
 
-void Gpu::video_close(uintptr_t ctx, struct video_h264 *h, uint32_t decoded)
+void Gpu::video_close(uintptr_t ctx, struct video_dec *h, uint32_t decoded)
 {
     IOLockLock(lock);
     gpu_ctx *c = ctx ? ctx_of(ctx) : nullptr;  // 0 would be the kernel's
     if (c)
         log_msg("video: %s decoded %u pictures\n", c->owner, decoded);
     if (c && h->width_mbs)
-        video_h264_close(&c->video, h);
+        video_dec_close(&c->video, h);
     ctx_close(ctx);
     IOLockUnlock(lock);
 }
@@ -4638,7 +4904,7 @@ IOReturn VideoUserClient::clientClose()
 IOReturn VideoUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
                                            IOExternalMethodDispatch *, OSObject *, void *)
 {
-    if (args->scalarInputCount < (selector == NVVIDEO_OPEN ? 4u : 3u))
+    if (args->scalarInputCount < (selector == NVVIDEO_OPEN ? 6u : 3u))
         return kIOReturnBadArgument;
     IOReturn ret;
     IOLockLock(busy);

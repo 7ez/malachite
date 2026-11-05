@@ -8,7 +8,7 @@ CXXFLAGS := $(KFLAGS) -fapple-kext -std=c++17 -fno-rtti -fno-exceptions \
 	-Wno-deprecated-declarations -Wno-inconsistent-missing-override
 CFLAGS := $(KFLAGS) -std=c11
 
-CORE := chip falcon vbios fwsec booter gsp pwr mem bar1 chan gr compute render sph texdesc disp dispmode dispdp video h264 nvdec
+CORE := chip falcon vbios fwsec booter gsp pwr mem bar1 chan gr compute render drawbuild sph texdesc disp dispmode dispdp video bitreader h264 hevc av1 av1cdf av1grain vp9 vp9prob vp8 vp8prob nvdec
 # the RM front end speaks NVK's side of the ABI, from the 610 headers in sdk/
 RMFE := rmfe rmfe_ctrl rmfe_mem rmfe_chan
 SDKINC := -Isdk/610/inc -Isdk/610/unix
@@ -83,9 +83,10 @@ install-kext: $(OUT)/MacOS/Malachite $(OUT)/Info.plist
 # the user-space Metal driver: a loadable bundle Metal.framework pulls in via the kext's MetalPluginName
 MTLBUNDLE := build/MalachiteMetal
 AIRC_SRC := compiler/airc.c compiler/front.c compiler/opt.c compiler/back.c compiler/ir.c compiler/llvm_lite.c \
-	compiler/sass86.c compiler/tessgen.c core/texdesc.c core/sph.c
+	compiler/sass86.c compiler/tessgen.c core/texdesc.c core/sph.c core/drawbuild.c
 $(MTLBUNDLE)/Contents/MacOS/MalachiteMetal: mtl/MalachiteDevice.mm mtl/Info.plist $(AIRC_SRC) compiler/airc.h \
-		compiler/llvm_lite.h compiler/nvk.h compiler/sass86.h core/texdesc.h core/sph.h gpu_bridge.h accel/commands.h
+		compiler/llvm_lite.h compiler/nvk.h compiler/sass86.h core/texdesc.h core/sph.h core/drawbuild.h gpu_bridge.h \
+		accel/commands.h
 	@mkdir -p $(MTLBUNDLE)/Contents/MacOS
 	cp mtl/Info.plist $(MTLBUNDLE)/Contents/Info.plist
 	xcrun clang -bundle -fobjc-arc -fmodules -Wall -Wno-protocol -O2 \
@@ -106,9 +107,12 @@ install-mtl: $(MTLBUNDLE)/Contents/MacOS/MalachiteMetal
 	sudo chown -R root:wheel /Library/GPUBundles/MalachiteMetal.bundle.new
 	sudo rm -rf /Library/GPUBundles/MalachiteMetal.bundle && sudo mv /Library/GPUBundles/MalachiteMetal.bundle.new /Library/GPUBundles/MalachiteMetal.bundle
 
-# the VideoToolbox H.264 decoder, which MalachiteMetal registers from /Library/Video/Plug-Ins
+# the VideoToolbox H.264, H.265, AV1, VP9 and VP8 decoder, which MalachiteMetal registers from /Library/Video/Plug-Ins
 VTBUNDLE := build/NVVideo.bundle
-VTDEPS := core/h264.c core/nvdec.c core/h264.h core/nvdec.h core/plat.h kext/abi.h
+VTSRC := core/bitreader.c core/h264.c core/hevc.c core/av1.c core/av1grain.c core/vp9.c core/vp9prob.c core/vp8.c \
+	core/nvdec.c
+VTDEPS := $(VTSRC) core/bitreader.h core/h264.h core/hevc.h core/av1.h core/av1cdf.h core/av1grain.h core/vp9.h \
+	core/vp9prob.h core/vp8.h core/nvdec.h core/plat.h kext/abi.h
 $(VTBUNDLE)/Contents/MacOS/NVVideo: vt/decoder.c vt/Info.plist $(VTDEPS)
 	@mkdir -p $(VTBUNDLE)/Contents/MacOS
 	cp vt/Info.plist $(VTBUNDLE)/Contents/Info.plist
@@ -116,7 +120,7 @@ $(VTBUNDLE)/Contents/MacOS/NVVideo: vt/decoder.c vt/Info.plist $(VTDEPS)
 	xcrun clang -bundle -arch x86_64 -std=c11 -Wall -O2 \
 		-framework CoreFoundation -framework CoreMedia -framework CoreVideo -framework VideoToolbox -framework IOKit \
 		-Xlinker -undefined -Xlinker dynamic_lookup \
-		vt/decoder.c core/h264.c core/nvdec.c -o $@
+		vt/decoder.c $(VTSRC) -o $@
 	codesign --force --sign - $(VTBUNDLE)
 
 vt: $(VTBUNDLE)/Contents/MacOS/NVVideo

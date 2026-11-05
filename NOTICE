@@ -4,6 +4,14 @@ sdk/, nvrm/, hw/    Headers from NVIDIA's open GPU kernel modules, MIT.
                     https://github.com/NVIDIA/open-gpu-kernel-modules
 core/, compiler/    Parts follow nouveau (Linux, MIT) and Mesa's NVK, NIL and NAK (MIT).
                     https://gitlab.freedesktop.org/mesa/mesa
+core/av1cdf.*       AV1 default probability tables from libaom (BSD-2-Clause and the Alliance for Open Media Patent
+                    License 1.0), in NVDEC's layout as mesa-nova's NVK AV1 decoder has it (MIT,
+                    https://github.com/haiderking1/mesa-nova). core/av1grain.c has the Gaussian sequence of the AV1
+                    specification from dav1d (BSD-2-Clause).
+core/vp9prob.c      VP9 default probability tables and probability adaptation from libvpx (BSD-3-Clause),
+                    https://chromium.googlesource.com/webm/libvpx
+core/vp8prob.c      VP8 default probability tables from libvpx (BSD-3-Clause), the ones RFC 6386 gives.
+core/nvdec.c        The VP9 and VP8 setups follow mickys/nvenc's NVDEC decoders (MIT, https://github.com/mickys/nvenc).
 
 NVIDIA's GSP firmware is not in this repository. It is NVIDIA's, under its own licence, and the release packages carry
 that licence with it.

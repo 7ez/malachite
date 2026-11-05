@@ -17,9 +17,10 @@ enum {
     MALACHITE_DISP_SHOW,   // a test pattern on the first connected display
     MALACHITE_DISP_READ,      // scalars: user address, length; gets struct malachite_shot, then what the head shows
     MALACHITE_PM_CYCLE,       // what system sleep does to the GPU, suspend then resume, without sleeping
-    // scalars: Annex-B H.264 stream address and length, output address and length, most pictures to decode; the
-    // output gets struct malachite_frames, then the pictures that fit, in decoding order
-    MALACHITE_H264_DECODE,
+    // scalars: Annex-B stream (AV1: OBU stream, VP9 and VP8: IVF file) address and length, output address and length,
+    // most pictures to decode, the codec (0 H.264, 1 H.265, 2 AV1, 3 VP9, 4 VP8); the output gets struct
+    // malachite_frames, then the pictures that fit, in decoding order
+    MALACHITE_VIDEO_DECODE,
     MALACHITE_END
 };
 
@@ -39,8 +40,9 @@ enum {
 };
 
 enum {
-    // scalars: width and height in macroblocks, surfaces, bitstream bytes; again for a stream of another size.
-    // Width 0 makes the GPU context and NVDEC channel alone.
+    // scalars: width and height in macroblocks (H.265 and VP9: of the pictures to a multiple of 64 luma samples, AV1:
+    // 128), surfaces, bitstream bytes, the codec (0 H.264, 1 H.265, 2 AV1, 3 VP9, 4 VP8), bytes a sample (1, or 2 for
+    // 10-bit); again for a stream of another size. Width 0 makes the GPU context and NVDEC channel alone.
     NVVIDEO_OPEN,
     // once the picture's setup page and slices are written through the mappings; scalars: its surface, its index in
     // decoding order, the error concealment index. Back when NVDEC is done, its status in the setup page.
@@ -55,11 +57,12 @@ struct malachite_frames {
     uint32_t count, reserved[3];
 };
 
-// in front of each picture's NV12: width * height bytes of luma, then width * height / 2 of interleaved chroma
+// in front of each picture's NV12 (P010 with two bytes a sample): width * height samples of luma, then
+// width * height / 2 of interleaved chroma
 struct malachite_frame {
     uint32_t index, idr_count;  // decoding order; display order is by idr_count, then poc
     int32_t poc;
-    uint32_t width, height, reserved;
+    uint32_t width, height, bps;
 };
 
 enum { MALACHITE_FW_GSP, MALACHITE_FW_BOOTLOADER, MALACHITE_FW_BOOTER_LOAD, MALACHITE_FW_BOOTER_UNLOAD, MALACHITE_FW_COUNT };

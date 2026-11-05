@@ -1,5 +1,6 @@
 // malachitectl <fwdir> [start|stop|disp|show|pmcycle|shot <file>]... -- hand Gpu its firmware and drive it; output goes to the kernel log.
-// "shot <file.ppm>" saves what the lit head shows, "h264 <clip.h264> <dir>" decodes a clip on NVDEC into dir.
+// "shot <file.ppm>" saves what the lit head shows, "h264 <clip.h264> <dir>", "hevc <clip.hevc> <dir>",
+// "av1 <clip.obu> <dir>", "vp9 <clip.ivf> <dir>" and "vp8 <clip.ivf> <dir>" decode a clip on NVDEC into dir.
 #include <IOKit/IOKitLib.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -70,12 +71,14 @@ static void write_ppm(const char *path, const struct malachite_frame *f, const u
         return;
     }
     fprintf(out, "P6\n%u %u\n255\n", f->width, f->height);
-    const uint8_t *uv = nv12 + (size_t)f->width * f->height;
+    // the top byte of a 10-bit sample, which P010 keeps in the high bits
+    const uint8_t *uv = nv12 + (size_t)f->width * f->height * f->bps;
     for (uint32_t y = 0; y < f->height; y++) {
         for (uint32_t x = 0; x < f->width; x++) {
             // BT.601, video range
-            const uint8_t *chroma = uv + (size_t)(y / 2) * f->width + (x & ~1u);
-            int c = 298 * (nv12[(size_t)y * f->width + x] - 16) + 128, d = chroma[0] - 128, e = chroma[1] - 128;
+            const uint8_t *chroma = uv + ((size_t)(y / 2) * f->width + (x & ~1u)) * f->bps + f->bps - 1;
+            int c = 298 * (nv12[((size_t)y * f->width + x) * f->bps + f->bps - 1] - 16) + 128;
+            int d = chroma[0] - 128, e = chroma[f->bps] - 128;
             int rgb[3] = { (c + 409 * e) >> 8, (c - 100 * d - 208 * e) >> 8, (c + 516 * d) >> 8 };
             for (int i = 0; i < 3; i++)
                 fputc(rgb[i] < 0 ? 0 : rgb[i] > 255 ? 255 : rgb[i], out);
@@ -94,9 +97,9 @@ static int by_display(const void *a, const void *b)
 }
 
 // Decode clip on NVDEC, write its pictures in display order to dir as frameNN.ppm and frames.nv12, and check each
-// picture's CRC-32 against the lines of clip with .crc for .h264, if there is one (made from a software decoder's
-// NV12, ffmpeg -i clip.h264 -f rawvideo -pix_fmt nv12)
-static int h264(io_connect_t conn, const char *clip, const char *dir)
+// picture's CRC-32 against the lines of clip with .crc for its extension, if there is one (made from
+// a software decoder's NV12, or P010 for 10-bit, ffmpeg -i clip.h264 -f rawvideo -pix_fmt nv12)
+static int decode(io_connect_t conn, int codec, const char *name, const char *clip, const char *dir)
 {
     size_t len;
     uint8_t *stream = slurp(clip, &len);
@@ -104,19 +107,19 @@ static int h264(io_connect_t conn, const char *clip, const char *dir)
         return -1;
     size_t out_len = 256u << 20;
     uint8_t *out = calloc(1, out_len);
-    uint64_t args[5] = { (uintptr_t)stream, len, (uintptr_t)out, out_len, 300 };
-    kern_return_t kr = IOConnectCallScalarMethod(conn, MALACHITE_H264_DECODE, args, 5, NULL, NULL);
+    uint64_t args[6] = { (uintptr_t)stream, len, (uintptr_t)out, out_len, 300, (uint64_t)codec };
+    kern_return_t kr = IOConnectCallScalarMethod(conn, MALACHITE_VIDEO_DECODE, args, 6, NULL, NULL);
     free(stream);
     const struct malachite_frames *hdr = (const void *)out;
     uint32_t n = hdr->count;  // what the kernel got out, failure or not
     if (kr)
-        fprintf(stderr, "h264: %#x after %u pictures\n", kr, n);
+        fprintf(stderr, "%s: %#x after %u pictures\n", name, kr, n);
 
     const struct malachite_frame **frames = calloc(n + 1, sizeof(*frames));
     size_t off = sizeof(*hdr);
     for (uint32_t i = 0; i < n; i++) {
         frames[i] = (const void *)(out + off);
-        off += sizeof(**frames) + (size_t)frames[i]->width * frames[i]->height * 3 / 2;
+        off += sizeof(**frames) + (size_t)frames[i]->width * frames[i]->height * 3 / 2 * frames[i]->bps;
     }
     qsort(frames, n, sizeof(*frames), by_display);
 
@@ -124,13 +127,14 @@ static int h264(io_connect_t conn, const char *clip, const char *dir)
     mkdir(dir, 0755);
     snprintf(path, sizeof(path), "%s/frames.nv12", dir);
     FILE *raw = fopen(path, "wb");
-    snprintf(path, sizeof(path), "%.*s.crc", (int)(strlen(clip) > 5 ? strlen(clip) - 5 : strlen(clip)), clip);
+    const char *ext = strrchr(clip, '.');
+    snprintf(path, sizeof(path), "%.*s.crc", (int)(ext ? (size_t)(ext - clip) : strlen(clip)), clip);
     FILE *crcs = fopen(path, "r");
     uint32_t matched = 0, checked = 0;
     for (uint32_t i = 0; i < n; i++) {
         const struct malachite_frame *f = frames[i];
         const uint8_t *nv12 = (const uint8_t *)(f + 1);
-        size_t bytes = (size_t)f->width * f->height * 3 / 2;
+        size_t bytes = (size_t)f->width * f->height * 3 / 2 * f->bps;
         uint32_t crc = (uint32_t)crc32(0, nv12, (uInt)bytes);
         unsigned want = 0;
         int have = crcs && fscanf(crcs, "%x", &want) == 1;
@@ -147,7 +151,7 @@ static int h264(io_connect_t conn, const char *clip, const char *dir)
         fclose(raw);
     if (crcs)
         fclose(crcs);
-    printf("h264: %u pictures into %s", n, dir);
+    printf("%s: %u pictures into %s", name, n, dir);
     if (checked)
         printf(", %u of %u match the reference", matched, checked);
     printf("\n");
@@ -209,8 +213,13 @@ int main(int argc, char **argv)
             ret |= shot(conn, argv[++a]) != 0;
             continue;
         }
-        if (!strcmp(argv[a], "h264") && a + 2 < argc) {
-            ret |= h264(conn, argv[a + 1], argv[a + 2]) != 0;
+        // the codec numbers of NVVIDEO_OPEN
+        static const char *const codecs[] = { "h264", "hevc", "av1", "vp9", "vp8" };
+        int codec = 0;
+        while (codec < 5 && strcmp(argv[a], codecs[codec]))
+            codec++;
+        if (codec < 5 && a + 2 < argc) {
+            ret |= decode(conn, codec, argv[a], argv[a + 1], argv[a + 2]) != 0;
             a += 2;
             continue;
         }

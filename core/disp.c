@@ -91,7 +91,7 @@ static struct disp_mode cvt_rb_mode(uint32_t w, uint32_t h, uint32_t hz, uint32_
     if (vblank < 3 + vsync + 6)
         vblank = 3 + vsync + 6;
     struct disp_mode t = { 0 };
-    t.clock = (w + 160) * (h + vblank) * hz / 1000 / 250 * 250;
+    t.clock = (w + 160) * (h + vblank) * hz / 1000;  // no CVT 250 kHz step: it turns 75 Hz into 74.97
     t.hactive = (uint16_t)w;
     t.hblank = 160;
     t.hsync_off = 48;
@@ -104,9 +104,31 @@ static struct disp_mode cvt_rb_mode(uint32_t w, uint32_t h, uint32_t hz, uint32_
     return t;
 }
 
+// a progressive mode by the default GTF, in integers as drm_gtf_mode_complex has it, and clocked for the exact rate as
+// NVIDIA has it; negative hsync, positive vsync
+static struct disp_mode gtf_mode(uint32_t w, uint32_t h, uint32_t hz)
+{
+    uint32_t hfreq = (h + 1) * 2 * 1000 * hz / ((1000000 - 550 * hz) / 500);  // Hz
+    uint32_t sync_bp = (550 * hfreq / 1000 + 500) / 1000;                     // lines of vsync and back porch
+    uint32_t duty = 30000 - 300 * 1000000 / hfreq;                            // blanking, in thousandths of a percent
+    uint32_t hblank = (w * duty / (100000 - duty) + 8) / 16 * 16;
+    uint32_t total = w + hblank, hsync = (8 * total / 100 + 4) / 8 * 8;
+    struct disp_mode t = { 0 };
+    t.clock = total * (h + sync_bp + 1) * hz / 1000;
+    t.hactive = (uint16_t)w;
+    t.hblank = (uint16_t)hblank;
+    t.hsync_off = (uint16_t)(hblank / 2 - hsync);
+    t.hsync_len = (uint16_t)hsync;
+    t.vactive = (uint16_t)h;
+    t.vblank = (uint16_t)(sync_bp + 1);
+    t.vsync_off = 1;
+    t.vsync_len = 3;
+    t.flags = 0x1c;
+    return t;
+}
+
 // a standard timing at the preferred size faster than any detailed one: where a 75 Hz monitor may keep its top rate.
-// One outside DMT on EDID 1.3 means GTF to NVIDIA and Linux, but a VG245 calls GTF's 220 MHz out of range at 75 Hz;
-// the other sizes stay out of the list
+// Before EDID 1.4 one outside DMT means GTF (parseEdidStandardTimingDescriptor); the other sizes stay out of the list
 static void add_standard(struct disp_output *o, const uint8_t *e)
 {
     // 16:10, 4:3, 5:4, 16:9
@@ -124,7 +146,7 @@ static void add_standard(struct disp_output *o, const uint8_t *e)
     for (int i = 38; i < 54; i += 2) {
         uint32_t hz = (e[i + 1] & 0x3f) + 60, width = (e[i] + 31) * 8, aspect = e[i + 1] >> 6;
         if (e[i] > 1 && width == w && width * num[aspect] / den[aspect] == h && hz > top)
-            keep_mode(o, cvt_rb_mode(w, h, hz, vsync[aspect]));
+            keep_mode(o, e[19] >= 4 ? cvt_rb_mode(w, h, hz, vsync[aspect]) : gtf_mode(w, h, hz));
     }
 }
 

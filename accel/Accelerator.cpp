@@ -255,16 +255,17 @@ void Accelerator::writeStamp(int index, uint32_t value)
     IOLockUnlock(stampLock);
 }
 
-void Accelerator::stampEvent(IOAccelEvent *event, uintptr_t ctx)
+void Accelerator::stampEvent(IOAccelEvent *event, uintptr_t ctx, bool app)
 {
     IOAccelEventMachine2 *em = event_machine(this);
     if (!em || !stampLock || !stampBuf)
         return;
+    const int index = app ? kAppStamp : kQueueStamp;
     IOLockLock(stampLock);
-    em->incrementStamp(kQueueStamp);
-    uint32_t value = (uint32_t)em->getStamp(kQueueStamp);
-    em->setEventStamp(kQueueStamp, event);
-    queueStamp(kQueueStamp, value, ctx);
+    em->incrementStamp(index);
+    uint32_t value = (uint32_t)em->getStamp(index);
+    em->setEventStamp(index, event);
+    queueStamp(index, value, ctx);
     IOLockUnlock(stampLock);
 }
 
@@ -276,7 +277,10 @@ void Accelerator::queueStamp(int index, uint32_t value, uintptr_t ctx)
     uint32_t fence = 0;
     if (stampTimer && gGpu)
         gGpu->callPlatformFunction(NVGPU_FN_DRAW_FENCE, true, &fence, (void *)ctx, nullptr, nullptr);
-    if (pendingHead == pendingTail && !fence) {
+    bool behind = false;
+    for (unsigned i = pendingHead; i != pendingTail; i++)
+        behind |= pending[i % kPendingStamps].index == index;
+    if (!behind && !fence) {
         page[index] = value;
         return;
     }
@@ -292,29 +296,41 @@ void Accelerator::queueStamp(int index, uint32_t value, uintptr_t ctx)
         stampTimer->setTimeoutUS(250);
 }
 
-// the stamps whose draws are done, in order, into the page; their waiters told and the fences looked at again
+// the stamps whose draws are done into the page, each timeline in its order; their waiters told and the fences looked
+// at again. Retired ones are left with index -1 until the head passes them.
 unsigned Accelerator::retireStamps()
 {
     volatile uint32_t *page = (volatile uint32_t *)stampBuf->getBytesNoCopy();
     unsigned n = 0;
     for (;;) {
         IOLockLock(stampLock);
-        if (pendingHead == pendingTail) {
+        bool held[2] = { false, false };
+        pending_stamp *next = nullptr;
+        for (unsigned i = pendingHead; i != pendingTail && !next; i++) {
+            pending_stamp &s = pending[i % kPendingStamps];
+            bool app = s.index == kAppStamp;
+            if (s.index < 0 || held[app])
+                continue;
+            if (s.fence && gGpu &&
+                gGpu->callPlatformFunction(NVGPU_FN_DRAW_DONE, true, (void *)(uintptr_t)s.fence, (void *)s.ctx,
+                                            nullptr, nullptr) == kIOReturnBusy)
+                held[app] = true;
+            else
+                next = &s;
+        }
+        if (!next) {
             IOLockUnlock(stampLock);
             break;
         }
-        pending_stamp s = pending[pendingHead % kPendingStamps];
-        if (s.fence && gGpu &&
-            gGpu->callPlatformFunction(NVGPU_FN_DRAW_DONE, true, (void *)(uintptr_t)s.fence, (void *)s.ctx,
-                                        nullptr, nullptr) == kIOReturnBusy) {
-            IOLockUnlock(stampLock);
-            break;
-        }
-        page[s.index] = s.value;
-        pendingHead++;
+        const int index = next->index;
+        const uint32_t value = next->value;
+        page[index] = value;
+        next->index = -1;
+        while (pendingHead != pendingTail && pending[pendingHead % kPendingStamps].index < 0)
+            pendingHead++;
         IOLockUnlock(stampLock);
         if (IOAccelEventMachine2 *em = event_machine(this))
-            em->signalStamp(s.index, s.value);
+            em->signalStamp(index, value);
         n++;
     }
     if (n)

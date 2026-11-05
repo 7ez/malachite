@@ -18,7 +18,20 @@ enum {
     MALACHITE_CMD_DRAW = 0x103,      // payload: struct nvgpu_draw, passed through to NVGpuDraw
     MALACHITE_CMD_COPY_2D = 0x104,   // payload: struct nvgpu_copy2d, passed through to NVGpuCopy2D
     MALACHITE_CMD_COMPRESS = 0x105,  // payload: struct malachite_compress
+    MALACHITE_CMD_UPLOAD = 0x106,    // payload: struct malachite_copy_buf2buf, a copy that doesn't wait for draws
+    MALACHITE_CMD_PUSH = 0x107,      // payload: struct malachite_push
 };
+
+// A run of draws' methods the plugin wrote itself, in a buffer of its own context: the kernel runs them as one GPFIFO entry.
+struct malachite_push {
+    uint64_t va;
+    uint32_t words;
+    uint32_t draws;
+};
+
+// On every opcode from a process with OpenGL's renderer loaded: its queues wait for their draws in submit, as OpenGL
+// reads back sooner than the completion of a command buffer would let it.
+#define MALACHITE_CMD_OPENGL 0x80000000u
 
 // A block-linear colour surface's whole buffer as a compressed kind, before anything is in it: what was written under
 // another kind reads back as garbage.

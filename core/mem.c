@@ -260,7 +260,7 @@ static uint64_t *big_pte_slot(struct vmm *v, uint64_t va)
 static uint64_t pte(uint64_t addr, int aper, unsigned flags)
 {
     uint64_t e = (addr >> 4) | 1 | (uint64_t)aper << 1 | (uint64_t)VMM_KIND(flags) << 56;
-    if (aper == APER_SYS)
+    if (aper == APER_SYS && !(flags & VMM_CACHED))
         e |= 1 << 3;  // VOL
     if (flags & VMM_PRIV)
         e |= 1 << 5;

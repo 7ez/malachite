@@ -10,6 +10,3 @@ struct pwr {
 };
 
 void pwr_read(struct gsp *s, struct pwr *out);
-// the GPU idle (capped to its lowest P-state) or not, with the time it spent busy and idle since the last call
-int pwr_idle_cap(struct gsp *s, int idle, uint64_t idle_us, uint64_t busy_us);
-int pwr_boost_clear(struct gsp *s);

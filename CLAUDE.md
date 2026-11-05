@@ -7,7 +7,7 @@ and drives the card, and the Metal driver compiles Apple AIR straight to SASS. I
 
 - `kext/`, `core/`, `accel/`, `fbkext/`: kernel driver
 - `mtl/`, `compiler/`: Metal driver and shader compiler
-- `vt/`: H.264 decoder
+- `vt/`: H.264, H.265, AV1, VP9 and VP8 decoder
 - `updater/`: the app, which also installs the driver
 - `sdk/`, `nvrm/`, `hw/`: NVIDIA headers, don't edit them by hand
 

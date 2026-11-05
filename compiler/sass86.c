@@ -67,11 +67,11 @@ struct sass_insn sass_isub_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint32_t ctrl)
               0x07ffe0ff, ctrl);
 }
 
-struct sass_insn sass_imad_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint32_t ctrl)
+struct sass_insn sass_imad_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint8_t rc, uint32_t ctrl)
 {
-    // IMAD Rd, Ra, Rb, RZ  -- 32-bit multiply; Rc = RZ (0xff in hi byte 8)
+    // IMAD Rd, Ra, Rb, Rc  -- 32-bit multiply-add; Rc in hi byte 8
     return mk(0x00007224ull | ((uint64_t)rd << 16) | ((uint64_t)ra << 24) | ((uint64_t)rb << 32),
-              0x078e02ff, ctrl);
+              0x078e0200 | rc, ctrl);
 }
 
 struct sass_insn sass_imadhi_rr(uint8_t rd, uint8_t ra, uint8_t rb, int is_signed, uint32_t ctrl)
@@ -85,6 +85,13 @@ struct sass_insn sass_imad_cbuf(uint8_t rd, uint8_t ra, uint8_t bank, uint16_t o
 {
     return mk(0x00007a24ull | ((uint64_t)rd << 16) | ((uint64_t)ra << 24) | cbuf_operand(bank, off),
               0x078e0200 | rc, ctrl);
+}
+
+// PRMT Rd, Ra, sel, Rc -- byte i of Rd is byte (nibble i of sel) of Rc:Ra (0-3 Ra's, 4-7 Rc's), its sign
+// repeated when the nibble's top bit is set
+struct sass_insn sass_prmt(uint8_t rd, uint8_t ra, uint16_t sel, uint8_t rc, uint32_t ctrl)
+{
+    return mk(0x00007816ull | ((uint64_t)rd << 16) | ((uint64_t)ra << 24) | ((uint64_t)sel << 32), rc, ctrl);
 }
 
 struct sass_insn sass_lop3(uint8_t rd, uint8_t ra, uint8_t rb, uint8_t lut, uint32_t ctrl)
@@ -261,6 +268,12 @@ struct sass_insn sass_f2i(uint8_t rd, uint8_t rs, int is_signed, uint32_t ctrl)
               ctrl);
 }
 
+struct sass_insn sass_f2ip_u8(uint8_t rd, uint8_t rs, uint32_t ctrl)
+{
+    // F2IP.U8.F32.TRUNC.NTZ Rd, RZ, Rs, RZ  -- source register in byte 4
+    return mk(0x00007243ull | ((uint64_t)rd << 16) | (0xffull << 24) | ((uint64_t)rs << 32), 0x0000c4ff, ctrl);
+}
+
 struct sass_insn sass_fmul_rz_imm(uint8_t rd, uint8_t ra, uint32_t imm, uint32_t ctrl)
 {
     return mk(0x00007820ull | ((uint64_t)rd << 16) | ((uint64_t)ra << 24) | ((uint64_t)imm << 32), 0x0040c000, ctrl);
@@ -394,6 +407,15 @@ struct sass_insn sass_atom(int op, int shared, int type, uint8_t rd, uint8_t ra,
     return mk(lo, hi, ctrl);
 }
 
+// RED.E.<op>.STRONG.GPU [Ra.64 + off], Rb: the global atomic without its old value, in nvcc's form, through the
+// memory descriptor in UR4 (hi [64:71] 0x84, 64-bit [72], [90:91]); the type and ordering as ATOMG's, the op in
+// [87:89], so no EXCH or CAS
+struct sass_insn sass_red(int op, int type, uint8_t ra, uint32_t off, uint8_t rb, uint32_t ctrl)
+{
+    return mk(0x0000798eull | ((uint64_t)ra << 24) | ((uint64_t)rb << 32) | ((uint64_t)(off & 0xffffff) << 40),
+              0x0c10e184 | (uint32_t)type << 9 | (uint32_t)op << 23, ctrl);
+}
+
 struct sass_insn sass_ldg(uint8_t rd, uint8_t ra, uint32_t off, uint8_t size, uint32_t ctrl)
 {
     // LDG.E Rd, [Ra.64 + off]  -- Ra at byte3, UR4 (the ULDC'd global base) at byte4, 24-bit offset at
@@ -409,6 +431,27 @@ struct sass_insn sass_stg(uint8_t ra, uint32_t off, uint8_t rb, uint8_t size, ui
     return mk(0x00007986ull | ((uint64_t)ra << 24) | ((uint64_t)rb << 32) |
                   ((uint64_t)(off & 0xffffff) << 40),
               0x0c101104 | ((uint32_t)size << 9), ctrl);
+}
+
+// The uniform-base forms are LDG's and STG's without the memory descriptor (bit 76): the uniform register, in the
+// descriptor's place for LDG and at [64:71] for STG, is a 64-bit base [72] added to Ra, which is 64-bit with bit 90
+struct sass_insn sass_ldg_ur(uint8_t rd, uint8_t ra, int wide, uint8_t ur, uint32_t off, uint8_t size, uint32_t ctrl)
+{
+    return mk(0x00007981ull | ((uint64_t)rd << 16) | ((uint64_t)ra << 24) | ((uint64_t)ur << 32) |
+                  ((uint64_t)(off & 0xffffff) << 40),
+              0x081e0100 | ((uint32_t)size << 9) | (uint32_t)wide << 26, ctrl);
+}
+
+struct sass_insn sass_stg_ur(uint8_t ra, int wide, uint8_t ur, uint32_t off, uint8_t rb, uint8_t size, uint32_t ctrl)
+{
+    return mk(0x00007986ull | ((uint64_t)ra << 24) | ((uint64_t)rb << 32) | ((uint64_t)(off & 0xffffff) << 40),
+              0x08100100 | ((uint32_t)size << 9) | (uint32_t)wide << 26 | ur, ctrl);
+}
+
+struct sass_insn sass_ldg_constant(struct sass_insn in)
+{
+    in.hi |= 1ull << 15;  // the memory order [77:80] = 4
+    return in;
 }
 
 // LDS / STS: shared memory at the 32-bit byte address Ra + off (offset and size fields as for LDG/STG)

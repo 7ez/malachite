@@ -1,6 +1,7 @@
 import Foundation
 
 private let logLimit = 10 << 20
+private let traceLimit = 8_000_000
 
 private func logText(_ path: String, _ args: [String]) -> String {
     capture(path, args).text
@@ -22,6 +23,40 @@ private func kernelLog(_ predicate: String, to file: String, last: String = "boo
         capture("/usr/bin/log", ["show", "--last", last, "--style", "compact", "--predicate", predicate], log: handle)
         try? handle.close()
     }
+}
+
+// A file per process, each its first traceLimit bytes: one game's trace in a shared file pushes out the one before it.
+private func splitTraces(_ file: String, into folder: String) {
+    guard let input = FileHandle(forReadingAtPath: file) else { return }
+    defer { try? input.close() }
+    var outputs: [String: FileHandle] = [:]
+    var written: [String: Int] = [:]
+    var rest = Data()
+    while true {
+        let chunk = input.readData(ofLength: 1 << 20)
+        rest.append(chunk)
+        guard let end = chunk.isEmpty ? rest.indices.last : rest.lastIndex(of: 10) else { break }
+        for line in String(decoding: rest[...end], as: UTF8.self).split(separator: "\n") {
+            // date, time, type, then "name[pid:thread] ..."
+            let fields = line.split(separator: " ", maxSplits: 3)
+            guard fields.count == 4, let bracket = fields[3].firstIndex(of: "[") else { continue }
+            let name = String(fields[3][..<bracket]).replacingOccurrences(of: "/", with: "_")
+            guard written[name, default: 0] < traceLimit else { continue }
+            if outputs[name] == nil {
+                let path = "\(folder)/trace-\(name).txt"
+                FileManager.default.createFile(atPath: path, contents: nil)
+                outputs[name] = FileHandle(forWritingAtPath: path)
+            }
+            let bytes = Data((line + "\n").utf8)
+            outputs[name]?.write(bytes)
+            written[name, default: 0] += bytes.count
+        }
+        if chunk.isEmpty {
+            break
+        }
+        rest = Data(rest[(end + 1)...])
+    }
+    outputs.values.forEach { try? $0.close() }
 }
 
 // the last `limit` bytes of a file, as tail -c does
@@ -88,7 +123,15 @@ func collectLogs(into dir: String, say: Say) throws -> String {
     kernelLog("process == \"kernel\" AND (\(words.map { "eventMessage CONTAINS \"\($0)\"" }.joined(separator: " OR ")))",
               to: "\(out)/kernel.txt")
     kernelLog("(eventMessage CONTAINS \"Malachite\" OR eventMessage CONTAINS \"NVMTL\") "
-              + "AND NOT eventMessage CONTAINS \"getMemoryAllocParameter\"", to: "\(out)/metal.txt")
+              + "AND NOT eventMessage CONTAINS \"getMemoryAllocParameter\" "
+              + "AND NOT eventMessage CONTAINS \"Malachite trace\"", to: "\(out)/metal.txt")
+    kernelLog("eventMessage CONTAINS \"Malachite trace\"", to: "\(out)/traces.tmp")
+    splitTraces("\(out)/traces.tmp", into: out)
+    try? fm.removeItem(atPath: "\(out)/traces.tmp")
+    // what the GPU spent its time on, which a report of "runs badly" needs
+    for name in ["stats", "power"] {
+        try capture("/usr/sbin/sysctl", ["-b", "kern.malachite_\(name)"]).data.write(to: URL(fileURLWithPath: "\(out)/\(name).txt"))
+    }
     // why a kext of the driver's did or didn't load (the auxiliary collection's policy, missing approval, dependencies)
     kernelLog("eventMessage CONTAINS \"pl.aochi\" OR eventMessage CONTAINS \"AuxKC\" OR eventMessage CONTAINS \"NVFB\" "
               + "OR (process == \"kernelmanagerd\" AND eventMessage CONTAINS[c] \"aochi\")", to: "\(out)/kexts.txt")

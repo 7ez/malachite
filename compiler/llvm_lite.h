@@ -189,12 +189,13 @@ LLVMValueRef LLVMGetOperand(LLVMValueRef v, unsigned i);
 LLVMIntPredicate LLVMGetICmpPredicate(LLVMValueRef v);
 LLVMRealPredicate LLVMGetFCmpPredicate(LLVMValueRef v);
 LLVMValueRef LLVMGetCalledValue(LLVMValueRef call);
-// function attributes: only noinline is known
+// attributes: only noinline, readonly, noalias and "air-buffer-no-alias" are known
 typedef struct ll_value *LLVMAttributeRef;
 typedef unsigned LLVMAttributeIndex;
 enum { LLVMAttributeFunctionIndex = ~0u };
 unsigned LLVMGetEnumAttributeKindForName(const char *name, size_t len);
 LLVMAttributeRef LLVMGetEnumAttributeAtIndex(LLVMValueRef fn, LLVMAttributeIndex idx, unsigned kind);
+LLVMAttributeRef LLVMGetStringAttributeAtIndex(LLVMValueRef fn, LLVMAttributeIndex idx, const char *key, unsigned len);
 LLVMValueRef LLVMGetCondition(LLVMValueRef br);
 unsigned LLVMGetNumSuccessors(LLVMValueRef term);
 LLVMBasicBlockRef LLVMGetSuccessor(LLVMValueRef term, unsigned i);

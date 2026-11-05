@@ -178,13 +178,6 @@ int is_boot_vga(struct gpu *g)
     return 0;
 }
 
-uint32_t pm_flags(void)
-{
-    uint32_t v = 0;
-    PE_parse_boot_argn("nvpm", &v, sizeof(v));
-    return v;
-}
-
 uint32_t pci_bdf(struct gpu *g)
 {
     IOPCIDevice *pci = g->plat->pci;

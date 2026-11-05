@@ -30,6 +30,8 @@ void vram_flush(struct gpu *g);  // after PRAMIN writes something else will read
 
 #define VMM_PRIV 1
 #define VMM_RO 2
+// system memory the GPU's L2 may keep (no VOL): whoever maps it flushes and invalidates L2 around the work using it
+#define VMM_CACHED 4
 #define VMM_KINDF(k) ((unsigned)(k) << 8)  // PTE kind
 #define VMM_KIND(flags) (((flags) >> 8) & 0xff)
 

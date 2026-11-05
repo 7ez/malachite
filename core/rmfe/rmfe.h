@@ -33,3 +33,4 @@ void rmfe_poll(struct rmfe *fe);
 
 // a scanout surface into one of BAR1's framebuffer slots (bar1.h), for that framebuffer's aperture
 int rmfe_bar1_fb(struct rmfe *fe, int slot, uint64_t vram, uint64_t size);
+// a BAR1 offset onto VRAM, 0 if there's no room, and its end

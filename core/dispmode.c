@@ -401,11 +401,7 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
         log_msg("disp: display %#x: protocol %u on SOR%u, not %u\n", o->id, ori->protocol, ori->index, o->protocol);
         o->protocol = ori->protocol;
     }
-    if (is_tmds(o->protocol) && edid_hdmi(o)) {
-        NV0073_CTRL_SPECIFIC_SET_HDMI_ENABLE_PARAMS he = { .displayId = o->id, .enable = 1 };
-        if (!rm_control(d->s, d->c.client, DISP_COMMON, NV0073_CTRL_CMD_SPECIFIC_SET_HDMI_ENABLE, &he, sizeof(he)))
-            log_msg("disp: display %#x: HDMI not enabled\n", o->id);
-    }
+    int hdmi = is_tmds(o->protocol) && edid_hdmi(o);
     uint64_t centi = (uint64_t)m.clock * 100000 / ((uint64_t)m.htotal * m.vtotal);  // Hz x 100
     log_msg("disp: display %#x on SOR%u protocol %u, head %d: %ux%u at %u.%02u Hz, raster %ux%u at %u kHz\n", o->id,
             sor, o->protocol, head, w, h, (unsigned)(centi / 100), (unsigned)(centi % 100), m.htotal, m.vtotal,
@@ -426,6 +422,21 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
             return DISP_NO_OUTPUT;
     } else if (o->dp) {
         log_msg("disp: display %#x: DisplayPort, but protocol %u on SOR%u\n", o->id, o->protocol, sor);
+    }
+    if (hdmi) {
+        NV0073_CTRL_SPECIFIC_SET_HDMI_ENABLE_PARAMS he = { .displayId = o->id, .enable = 1 };
+        if (!rm_control(d->s, d->c.client, DISP_COMMON, NV0073_CTRL_CMD_SPECIFIC_SET_HDMI_ENABLE, &he, sizeof(he)))
+            log_msg("disp: display %#x: HDMI not enabled\n", o->id);
+        // an AVI infoframe of RGB, IT content and no VIC (gv100_sor_hdmi_infoframe_avi)
+        struct gpu *g = gsp_gpu(d->s);
+        uint32_t avi = 0x6f0000 + head * 0x400;
+        wr32(g, avi, rd32(g, avi) & ~1u);
+        wr32(g, avi + 0x08, 0x000d0282);  // type, version, length
+        wr32(g, avi + 0x0c, 0x800000ef);  // checksum, then bytes 1 to 3
+        wr32(g, avi + 0x10, 0);
+        wr32(g, avi + 0x14, 0);
+        wr32(g, avi + 0x18, 0);
+        wr32(g, avi, rd32(g, avi) | 1);
     }
 
     // core: window bounds and owners, then the head (corec57d_init, headc57d, sorc37d_ctrl)
@@ -531,6 +542,19 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
     }
     log_msg("disp: head %d lit, showing %#llx (SOR%u pwr %#x)\n", head, (unsigned long long)fb, sor,
             rd32(gsp_gpu(d->s), 0x61c004 + sor * 0x800));
+    if (hdmi) {
+        // SET_HDMI_ENABLE leaves the output on DVI signalling, which sinks may refuse above 165 MHz. HDMI proper goes
+        // on with this and the packet that clears AV mute (hdmiPacketWrite9171, tu102_sor_hdmi_gcp)
+        struct gpu *g = gsp_gpu(d->s);
+        NV0073_CTRL_SPECIFIC_CTRL_HDMI_PARAMS ch = { .displayId = o->id, .bEnable = 1 };
+        if (!rm_control(d->s, d->c.client, DISP_COMMON, NV0073_CTRL_CMD_SPECIFIC_CTRL_HDMI, &ch, sizeof(ch)))
+            log_msg("disp: display %#x: HDMI signalling not on\n", o->id);
+        uint32_t gcp = 0x6f00c0 + head * 0x400;
+        wr32(g, gcp, rd32(g, gcp) & ~1u);
+        wr32(g, gcp + 0x0c, 0x10);
+        wr32(g, gcp, rd32(g, gcp) | 1);
+        log_msg("disp: head %d: HDMI ctrl %#x\n", head, rd32(g, 0x6165c0 + head * 0x800));
+    }
     return 0;
 }
 

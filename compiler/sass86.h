@@ -52,12 +52,13 @@ struct sass_insn sass_imadwide_cbuf(uint8_t rd, uint8_t ra, uint8_t rb, uint8_t 
 struct sass_insn sass_iadd3_cbuf(uint8_t rd, uint8_t ra, uint8_t bank, uint16_t off, uint32_t ctrl);
 struct sass_insn sass_iadd3_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint32_t ctrl);   // IADD3 Rd,Ra,Rb,RZ
 struct sass_insn sass_isub_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint32_t ctrl);    // IADD3 Rd,Ra,-Rb,RZ
-struct sass_insn sass_imad_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint32_t ctrl);    // IMAD Rd,Ra,Rb,RZ
+struct sass_insn sass_imad_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint8_t rc, uint32_t ctrl);  // IMAD Rd,Ra,Rb,Rc
 struct sass_insn sass_imadhi_rr(uint8_t rd, uint8_t ra, uint8_t rb, int is_signed,
                                 uint32_t ctrl);  // IMAD.HI[.U32] Rd,Ra,Rb,RZ
 struct sass_insn sass_imad_cbuf(uint8_t rd, uint8_t ra, uint8_t bank, uint16_t off, uint8_t rc,
                                 uint32_t ctrl);  // IMAD Rd,Ra,c[bank][off],Rc
 struct sass_insn sass_lop3(uint8_t rd, uint8_t ra, uint8_t rb, uint8_t lut, uint32_t ctrl);  // LOP3.LUT
+struct sass_insn sass_prmt(uint8_t rd, uint8_t ra, uint16_t sel, uint8_t rc, uint32_t ctrl);  // PRMT Rd,Ra,sel,Rc
 struct sass_insn sass_shf_l(uint8_t rd, uint8_t val, uint8_t sh, uint32_t ctrl);     // SHF.L.U32 Rd,val,sh,RZ
 struct sass_insn sass_shf_r(uint8_t rd, uint8_t val, uint8_t sh, uint32_t ctrl);     // SHF.R.U32.HI Rd,RZ,sh,val
 struct sass_insn sass_shf_r_s(uint8_t rd, uint8_t val, uint8_t sh, uint32_t ctrl);   // SHF.R.S32.HI (arithmetic)
@@ -75,6 +76,8 @@ struct sass_insn sass_flo(uint8_t rd, uint8_t rs, uint32_t ctrl);   // FLO.U32 R
 struct sass_insn sass_vote_any(uint8_t rd, uint8_t pred, uint32_t ctrl);  // VOTE.ANY Rd, PT, Pp
 struct sass_insn sass_i2f(uint8_t rd, uint8_t rs, int is_signed, uint32_t ctrl);  // I2FP.F32.{S32,U32}
 struct sass_insn sass_f2i(uint8_t rd, uint8_t rs, int is_signed, uint32_t ctrl);  // F2I[.U32].TRUNC.NTZ
+// F2IP.U8.F32.TRUNC.NTZ: a float to a byte, saturated (a NaN as 0) and zero-extended; fixed latency, unlike F2I
+struct sass_insn sass_f2ip_u8(uint8_t rd, uint8_t rs, uint32_t ctrl);
 struct sass_insn sass_frnd(uint8_t rd, uint8_t rs, int mode, uint32_t ctrl);       // FRND.FTZ (mode SASS_RND_*)
 struct sass_insn sass_kill(uint8_t pred, uint32_t ctrl);  // @Pp KILL (discard), p 7 = PT
 enum { SASS_SHFL_IDX, SASS_SHFL_UP, SASS_SHFL_DOWN, SASS_SHFL_BFLY };
@@ -120,7 +123,7 @@ enum { SASS_MOD_A, SASS_MOD_B, SASS_MOD_C };
 struct sass_insn sass_src_mod(struct sass_insn in, int slot, int neg, int abs);
 // -Ra (bit 72) on FADD: the first source negated
 struct sass_insn sass_neg_a(struct sass_insn in);
-// .SAT (bit 77) on FADD: the result clamped to [0, 1], a NaN becoming 0
+// .SAT (bit 77) on FADD, FMUL or FFMA: the result clamped to [0, 1], a NaN becoming 0
 struct sass_insn sass_sat(struct sass_insn in);
 // LUT values for LOP3.LUT with operands (a, b): AND/OR/XOR
 #define LOP3_AND 0xc0
@@ -172,6 +175,12 @@ struct sass_insn sass_uldc64_cbuf(uint8_t urd, uint8_t bank, uint16_t off, uint3
 #define SASS_B128 6
 struct sass_insn sass_ldg(uint8_t rd, uint8_t ra, uint32_t off, uint8_t size, uint32_t ctrl);  // LDG.E Rd, [Ra.64+off]
 struct sass_insn sass_stg(uint8_t ra, uint32_t off, uint8_t rb, uint8_t size, uint32_t ctrl);  // STG.E [Ra.64+off], Rb
+// LDG.E Rd, [Ra.U32+URu+off] and STG.E [Ra.U32+URu+off], Rb: a uniform pair as the base, Ra .64 when wide (RZ for
+// none)
+struct sass_insn sass_ldg_ur(uint8_t rd, uint8_t ra, int wide, uint8_t ur, uint32_t off, uint8_t size, uint32_t ctrl);
+struct sass_insn sass_stg_ur(uint8_t ra, int wide, uint8_t ur, uint32_t off, uint8_t rb, uint8_t size, uint32_t ctrl);
+// .CONSTANT on LDG: through the read-only (texture) cache, as __ldg loads; the memory mustn't change meanwhile
+struct sass_insn sass_ldg_constant(struct sass_insn in);
 struct sass_insn sass_lds(uint8_t rd, uint8_t ra, uint32_t off, uint8_t size, uint32_t ctrl);  // LDS Rd, [Ra+off]
 struct sass_insn sass_sts(uint8_t ra, uint32_t off, uint8_t rb, uint8_t size, uint32_t ctrl);  // STS [Ra+off], Rb
 // the thread's local memory: Ra a byte offset into it (RZ for none), off a signed 24-bit one
@@ -189,6 +198,8 @@ enum { SASS_ATOM_ADD, SASS_ATOM_MIN, SASS_ATOM_MAX, SASS_ATOM_INC, SASS_ATOM_DEC
 enum { SASS_ATOM_U32 = 0, SASS_ATOM_I32 = 1, SASS_ATOM_F32 = 3 };
 struct sass_insn sass_atom(int op, int shared, int type, uint8_t rd, uint8_t ra, uint32_t off, uint8_t rb, uint8_t rc,
                            uint32_t ctrl);
+// RED: a global atomic (not EXCH or CAS) that returns nothing, so no write barrier
+struct sass_insn sass_red(int op, int type, uint8_t ra, uint32_t off, uint8_t rb, uint32_t ctrl);
 // texture dimensions (TEX/TLD/TLD4/TXD), and image ones (SUST)
 enum {
     SASS_DIM_1D = 0, SASS_DIM_2D = 1, SASS_DIM_3D = 2, SASS_DIM_CUBE = 3, SASS_DIM_ARRAY_1D = 4,

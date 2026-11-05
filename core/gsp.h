@@ -52,7 +52,7 @@ struct gpu *gsp_gpu(struct gsp *s);
 struct vram *gsp_vram(struct gsp *s);
 
 // called from message processing when GSP-RM recovers a channel; must not send RPCs itself
-typedef void (*gsp_rc_fn)(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception);
+typedef void (*gsp_rc_fn)(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, uint64_t fault_va);
 // Channel IDs, one space for every client of ours: the core keeps 1-5 (copy, its tests, golden context, the
 // kernel's graphics channel), contexts and the frontend's clients take the rest from first on; -1 when all are taken
 #define GSP_CHIDS 2048

@@ -10,6 +10,7 @@ struct airc_info {
     struct nvk_arg args[NVK_MAX_ARGS];
     struct airc_arg_name arg_names[NVK_MAX_ARGS];
     unsigned nargs;
+    uint64_t readonly_args;  // buffer arguments the AIR says are only read and alias no other, a bit each
     unsigned array_count[NVK_MAX_ARGS];  // elements of an argument that's an array of textures or samplers
     unsigned ngeneric;      // vertex outputs after the position
     struct airc_varyings outputs;  // their names
@@ -29,6 +30,7 @@ struct airc_info {
     uint64_t const_samplers[NVK_MAX_CONST_SAMPLERS];
     unsigned nconst_samplers;
     uint32_t compare_samplers, plain_samplers;  // sampler pool slots sampled with a depth compare, and without
+    uint32_t nearest_samplers;  // and those an integer texture is sampled with
     uint32_t face_textures;  // texture slots of cubes read or written by face
     uint32_t level_textures;  // texture slots written at a level that may not be the first
     unsigned shared_size;  // threadgroup memory, bytes
@@ -49,14 +51,22 @@ int airc_pass_off(const char *name);
 
 // LLVM module -> IR in f, the shader's interface in info; calls: noinline functions become subroutines
 void airc_front(void *module, void **linked, const char *const *linked_names, unsigned nlinked,
-                const struct airc_varyings *vertex, const struct airc_constant *fc, unsigned nfc, int calls,
-                struct ir_func *f, struct airc_info *info);
+                const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
+                const struct airc_constant *fc, unsigned nfc, int calls, struct ir_func *f, struct airc_info *info);
+// attribute a of element idx of the buffer at address buffer, in b: its components as the vertex fetch unit gives
+// them (floats for the float and normalised formats, integers otherwise; those the format lacks 0, 0, 0, 1)
+void airc_fetch(struct ir_block *b, const struct airc_tess_attr *a, unsigned loc, struct ir_val *buffer,
+                struct ir_val *idx, struct ir_val *v[4]);
+// n / d in b, for a constant d
+struct ir_val *airc_udiv(struct ir_block *b, struct ir_val *n, uint32_t d);
 void airc_opt(struct ir_func *f);
 // a local array that is only a copy of read-only memory, read from that memory instead; 1 if it changed f (which
 // airc_opt then cleans up)
 int airc_const_locals(struct ir_func *f, struct airc_info *info);
 // values cheap to make again, made in the blocks that read them rather than held in registers from far before
 void airc_remat(struct ir_func *f);
+// adjacent words of threadgroup memory read or written one at a time, as one 64- or 128-bit access where aligned
+void airc_widen_shared(struct ir_func *f, const struct airc_info *info);
 // compile the stage gen builds the IR of from arg, rather than from AIR, into k; 0, or -1 with k->error saying why
 int airc_generate(void (*gen)(const void *arg, struct ir_func *f, struct airc_info *info), const void *arg,
                   struct airc_kernel *k);
