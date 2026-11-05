@@ -46,6 +46,7 @@ struct entry {
         struct ptr p;
         struct ir_block *blocks[2];  // head (where the LLVM block starts), tail (where it ends)
         LLVMBasicBlockRef bb;        // for an IR block that branches on to an LLVM block's successors: that block
+        LLVMValueRef c;              // g_known's constant
     };
 };
 
@@ -55,6 +56,8 @@ static struct entry *g_vals[1 << HASH_BITS], *g_ptrs[1 << HASH_BITS], *g_blocks[
 // the high words of 64-bit integers where they're known (a value itself keeps the low one): loads, extensions,
 // and shifts and bitwise operations of those
 static struct entry *g_highs[1 << HASH_BITS];
+// loads that read a constant (note_known), and lane 1, the allocas they read from
+static struct entry *g_known[1 << HASH_BITS];
 
 static unsigned hash(const void *key, unsigned lane, unsigned scope)
 {
@@ -83,6 +86,66 @@ static struct entry *insert(struct entry **table, const void *key, unsigned lane
     e->next = table[h];
     table[h] = e;
     return e;
+}
+
+static int is_alloca(LLVMValueRef v)
+{
+    return LLVMIsAInstruction(v) && LLVMGetInstructionOpcode(v) == LLVMAlloca;
+}
+
+// Code built without optimisation (Apple's GL compiler's) keeps even a constant array index in an alloca, stores it
+// and loads it straight back. A load from an integer alloca that's only ever loaded from and stored to reads what was
+// last stored to it in the block, when that was a constant: g_known keeps the load's constant, so the index counts as
+// one and the array can stay in registers.
+static void note_known(LLVMValueRef fn)
+{
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb))
+        for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in)) {
+            LLVMOpcode op = LLVMGetInstructionOpcode(in);
+            for (int i = 0; i < LLVMGetNumOperands(in); i++) {
+                LLVMValueRef a = LLVMGetOperand(in, i);
+                if (is_alloca(a) && !(op == LLVMLoad && i == 0) && !(op == LLVMStore && i == 1))
+                    insert(g_known, a, 1, 0);
+            }
+        }
+    for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        struct {
+            LLVMValueRef alloca, c;
+        } last[16];
+        unsigned n = 0;
+        for (LLVMValueRef in = LLVMGetFirstInstruction(bb); in; in = LLVMGetNextInstruction(in)) {
+            LLVMOpcode op = LLVMGetInstructionOpcode(in);
+            LLVMValueRef a = op == LLVMLoad ? LLVMGetOperand(in, 0) : op == LLVMStore ? LLVMGetOperand(in, 1) : NULL;
+            if (!a || !is_alloca(a) || LLVMGetTypeKind(LLVMGetAllocatedType(a)) != LLVMIntegerTypeKind ||
+                find(g_known, a, 1, 0))
+                continue;
+            unsigned k = 0;
+            while (k < n && last[k].alloca != a)
+                k++;
+            if (op == LLVMLoad) {
+                if (k < n && LLVMGetTypeKind(LLVMTypeOf(in)) == LLVMIntegerTypeKind &&
+                    LLVMGetIntTypeWidth(LLVMTypeOf(in)) == LLVMGetIntTypeWidth(LLVMTypeOf(last[k].c)))
+                    insert(g_known, in, 0, 0)->c = last[k].c;
+                continue;
+            }
+            LLVMValueRef v = LLVMGetOperand(in, 0);
+            if (k < n)
+                last[k] = last[--n];
+            if (LLVMIsAConstantInt(v) && n < 16) {
+                last[n].alloca = a;
+                last[n++].c = v;
+            }
+        }
+    }
+}
+
+// v as a constant integer: one, or a load g_known knows the value of. NULL when it's neither.
+static LLVMValueRef const_int(LLVMValueRef v)
+{
+    if (LLVMIsAConstantInt(v))
+        return v;
+    struct entry *e = LLVMIsAInstruction(v) && LLVMGetInstructionOpcode(v) == LLVMLoad ? find(g_known, v, 0, 0) : NULL;
+    return e ? e->c : NULL;
 }
 
 static struct ir_func *g_f;
@@ -508,8 +571,9 @@ static struct ir_val *index_value(LLVMValueRef idx, int *is_signed)
 // count: how many elements the index picks from, 0 if unknown
 static struct ptr add_index(struct ptr p, LLVMValueRef idx, unsigned scale, unsigned count)
 {
-    if (LLVMIsAConstantInt(idx)) {
-        p.off += (int64_t)LLVMConstIntGetZExtValue(idx) * scale;  // wraps right for negative i64 indices
+    LLVMValueRef c = const_int(idx);
+    if (c) {
+        p.off += (int64_t)LLVMConstIntGetZExtValue(c) * scale;  // wraps right for negative i64 indices
         return p;
     }
     int is_signed;
@@ -600,8 +664,8 @@ static int64_t root_offset(LLVMValueRef v)
         LLVMTypeRef t = LLVMGetGEPSourceElementType(v);
         unsigned a;
         for (int i = 1; i < LLVMGetNumOperands(v); i++) {
-            LLVMValueRef idx = LLVMGetOperand(v, i);
-            if (!LLVMIsAConstantInt(idx))
+            LLVMValueRef idx = const_int(LLVMGetOperand(v, i));
+            if (!idx)
                 return 0;
             unsigned shift = 64 - LLVMGetIntTypeWidth(LLVMTypeOf(idx));
             int64_t k = (int64_t)(LLVMConstIntGetZExtValue(idx) << shift) >> shift;
@@ -691,7 +755,7 @@ static int stays_put(LLVMValueRef fn, LLVMValueRef b)
                 if (op != LLVMGetElementPtr)
                     return 0;
                 for (int k = 1; k < LLVMGetNumOperands(in); k++)
-                    if (!LLVMIsAConstantInt(LLVMGetOperand(in, k)))
+                    if (!const_int(LLVMGetOperand(in, k)))
                         return 0;
             }
         }
@@ -744,7 +808,7 @@ static void scan_uses(LLVMValueRef fn, LLVMValueRef root, int64_t base, struct p
                 add_pieces(s, LLVMTypeOf(LLVMGetOperand(in, 0)), base + root_offset(LLVMGetOperand(in, 1)));
             } else if (op == LLVMGetElementPtr && ptr_root(in) == root) {
                 for (int i = 1; i < LLVMGetNumOperands(in); i++)
-                    if (!LLVMIsAConstantInt(LLVMGetOperand(in, i)))
+                    if (!const_int(LLVMGetOperand(in, i)))
                         s->dynamic = 1;
             } else if (op == LLVMPHI && is_ptr(LLVMTypeOf(in))) {  // a pointer walking it, picked when it runs
                 for (unsigned i = 0; i < LLVMCountIncoming(in); i++)
@@ -798,8 +862,7 @@ static int alloca_is_local(LLVMValueRef alloca, LLVMValueRef fn)
         c = ir_alloc(sizeof(*c));
         c->alloca = alloca;
         // what's done through an escaped address isn't seen: different sizes anywhere might overlap there
-        c->local = s.dynamic || pieces_clash(&s) || (s.escapes && (s.sizes & (s.sizes - 1)));
-        c->next = g_local_choices;
+        c->local = s.dynamic || pieces_clash(&s) || (s.escapes && (s.sizes & (s.sizes - 1)));        c->next = g_local_choices;
         g_local_choices = c;
         free(s.p);
     }
@@ -6726,6 +6789,12 @@ void airc_front(void *module, void **linked, const char *const *linked_names, un
     memset(g_blocks, 0, sizeof(g_blocks));
     memset(g_origins, 0, sizeof(g_origins));
     memset(g_highs, 0, sizeof(g_highs));
+    memset(g_known, 0, sizeof(g_known));
+    for (LLVMValueRef fn = LLVMGetFirstFunction(module); fn; fn = LLVMGetNextFunction(fn))
+        note_known(fn);
+    for (unsigned i = 0; i < nlinked; i++)
+        for (LLVMValueRef fn = LLVMGetFirstFunction(linked[i]); fn; fn = LLVMGetNextFunction(fn))
+            note_known(fn);
     g_module = module;
     g_f = f;
     g_info = info;
