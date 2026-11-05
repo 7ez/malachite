@@ -201,7 +201,7 @@ static void write_notifier(struct client *c, struct rmfe_chan *ch, uint32_t valu
     n->status = 0;
 }
 
-void rmfe_rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, uint64_t fault_va)
+void rmfe_rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, const struct gsp_fault *fault)
 {
     struct rmfe *fe = ctx;
     if (fe->rc_n < sizeof(fe->rc) / sizeof(fe->rc[0]))

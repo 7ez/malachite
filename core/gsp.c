@@ -488,6 +488,178 @@ static int run_sequencer(struct gsp *s, rpc_run_cpu_sequencer_v17_00 *seq)
     return 0;
 }
 
+// RmRCCommonJournal_RECORD then RmRcDiag_RECORD (rmcd.h) as GSP-RM lays them out, pNext a 64-bit pointer: what a
+// channel recovery's rcJournalBuffer holds, one after another. data starts at 0x44.
+struct rc_diag {
+    uint8_t group, type;  // NVCD_RECORD; RmRcDiagReport is type 147
+    uint16_t size;        // of the whole record
+    uint32_t gpu_tag;
+    uint64_t cpu_tag, time, state_mask, next;
+    uint16_t idx;
+    uint32_t seconds;
+    uint16_t diag_type;
+    uint32_t flags;
+    uint16_t count;
+    uint32_t owner, pid;
+    struct {
+        uint32_t offset, tag, value, attribute;
+    } data[];
+};
+
+// NV_PFAULT_FAULT_TYPE_*, NV_PFAULT_ACCESS_TYPE_* and NV_PFAULT_CLIENT_HUB_* from open-gpu's
+// hwref/ampere/ga100/dev_fault.h, the nearest published to GA10x
+static const char *const fault_types[] = {
+    "PDE", "PDE size", "PTE", "VA limit", "unbound instance block", "privilege", "read-only", "write-only",
+    "pitch mask", "work creation", "unsupported aperture", "compression", "unsupported kind", "region", "poisoned",
+    "atomic",
+};
+
+static const char *const fault_access[] = {
+    "read", "write", "atomic", "prefetch", "weak atomic", NULL, NULL, NULL,
+    "physical read", "physical write", "physical atomic", "physical prefetch",
+};
+
+static const char *const hub_clients[] = {
+    "VIP", "CE0", "CE1", "DNISO", "FE", "FECS", "HOST", "HOST_CPU",
+    "HOST_CPU_NB", "ISO", "MMU", "NVDEC0", NULL, "NVENC1", "NISO", "P2P",
+    "PD", "PERF", "PMU", "RASTERTWOD", "SCC", "SCC_NB", "SEC", "SSYNC",
+    "CE2", "XV", "MMU_NB", "NVENC0", "DFALCON", "SKED", "AFALCON", "DONT_CARE",
+    "HSCE0", "HSCE1", "HSCE2", "HSCE3", "HSCE4", "HSCE5", "HSCE6", "HSCE7",
+    "HSCE8", "HSCE9", "HSHUB", "PTP_X0", "PTP_X1", "PTP_X2", "PTP_X3", "PTP_X4",
+    "PTP_X5", "PTP_X6", "PTP_X7", "NVENC2", "VPR_SCRUBBER0", "VPR_SCRUBBER1", "DWBIF", "FBFALCON",
+    "CE_SHIM", "GSP", "NVDEC1", "NVDEC2", "NVJPG0", "NVDEC3", "NVDEC4", "OFA0",
+};
+
+static const char *fault_name(const char *const *names, uint32_t n, uint32_t i)
+{
+    return i < n && names[i] ? names[i] : "unknown";
+}
+
+// NV_PFAULT_CLIENT_GPC_*: the unit and, for the per-TPC ones, which (else -1). dev_fault.h names 0x31-0x38
+// LTP_UTLB_8-15 as well; they're taken as the per-TPC units here.
+static const char *gpc_unit(uint32_t c, int *n)
+{
+    *n = -1;
+    if (c < 0x10) {
+        *n = c % 8;
+        return c < 8 ? "T1" : "PE";
+    }
+    if (c >= 0x13 && c <= 0x16) {
+        *n = c - 0x13;
+        return "PROP";
+    }
+    if (c >= 0x18 && c <= 0x1f) {
+        *n = c - 0x18;
+        return "LTP_UTLB";
+    }
+    if (c >= 0x21 && c <= 0x28) {
+        *n = c - 0x21 + 8;
+        return "T1";
+    }
+    if (c >= 0x29 && c <= 0x30) {
+        *n = c - 0x29;
+        return "TPCCS";
+    }
+    if (c >= 0x31 && c <= 0x60) {  // from TPC 8 on, eight per pair of TPCs: PE, PE, TPCCS, TPCCS, then four T1
+        uint32_t pair = (c - 0x31) / 8, k = (c - 0x31) % 8;
+        *n = k < 4 ? 8 + 2 * pair + k % 2 : 16 + 4 * pair + k - 4;
+        return k < 2 ? "PE" : k < 4 ? "TPCCS" : "T1";
+    }
+    if (c >= 0x70 && c <= 0x73) {
+        *n = c - 0x70;
+        return "ROP";
+    }
+    switch (c) {
+    case 0x10: return "RAST";
+    case 0x11: return "GCC";
+    case 0x12: return "GPCCS";
+    case 0x17: return "GPM";
+    case 0x20: return "RGG_UTLB";
+    }
+    return NULL;
+}
+
+static char *put_str(char *p, const char *s)
+{
+    while (*s)
+        *p++ = *s++;
+    *p = 0;
+    return p;
+}
+
+static char *put_num(char *p, uint32_t v)
+{
+    char d[10];
+    int n = 0;
+    do
+        d[n++] = '0' + v % 10;
+    while (v /= 10);
+    while (n)
+        *p++ = d[--n];
+    *p = 0;
+    return p;
+}
+
+// "GPC 1 PE_2", "hub CE0", "hub client 12"; s holds 24
+static void fault_client(char *s, int gpc, uint32_t gpc_id, uint32_t client)
+{
+    int n = -1;
+    const char *unit = gpc ? gpc_unit(client, &n) : client < 0x40 ? hub_clients[client] : NULL;
+    if (gpc) {
+        s = put_str(s, "GPC ");
+        s = put_num(s, gpc_id);
+        s = put_str(s, " ");
+    } else {
+        s = put_str(s, "hub ");
+    }
+    if (!unit) {
+        s = put_str(s, "client ");
+        put_num(s, client);
+        return;
+    }
+    s = put_str(s, unit);
+    if (n >= 0) {
+        s = put_str(s, "_");
+        put_num(s, n);
+    }
+}
+
+// GSP-RM handles a graphics channel's MMU fault itself: it copies to a client's shadow buffer only faults UVM
+// services (copy engine or PBDMA faults of channels with replayable faults on, _kgmmuFaultEntryRmServiceable_GV100),
+// so registering one gets nothing here. What it does pass on is an RC diagnostic record in the recovery's journal:
+// entries at offset 0 tagged 0x22d-0x233 holding FIFO_MMU_EXCEPTION_DATA's addrLo, addrHi, faultType, clientId (with
+// bGpc as its attribute), gpcId, accessType and faultEngineId, in that order. The tags aren't in the open sources;
+// the order and the values (engine 0x40 graphics, GPC 0-2 on GA106) give them away. The last such record wins;
+// 0 when there is none.
+static int rc_fault(const uint8_t *journal, uint32_t size, struct gsp_fault *f)
+{
+    const uint32_t head = offsetof(struct rc_diag, data);
+    uint32_t v[7], gpc = 0, seen = 0;
+    for (uint32_t off = 0; off + head <= size;) {
+        const struct rc_diag *r = (const void *)(journal + off);
+        if (r->size < head || r->size > size - off)
+            break;
+        for (uint32_t i = 0; r->type == 147 && i < r->count && head + (i + 1) * sizeof(r->data[0]) <= r->size; i++) {
+            uint32_t k = r->data[i].tag - 0x22d;
+            if (r->data[i].offset || k >= 7)
+                continue;
+            v[k] = r->data[i].value;
+            seen |= 1u << k;
+            if (k == 3)
+                gpc = r->data[i].attribute & 1;
+        }
+        off += r->size;
+    }
+    if (seen != 0x7f)
+        return 0;
+    f->va = (uint64_t)v[1] << 32 | v[0];
+    f->type = fault_name(fault_types, sizeof(fault_types) / sizeof(fault_types[0]), v[2]);
+    f->access = fault_name(fault_access, sizeof(fault_access) / sizeof(fault_access[0]), v[5]);
+    fault_client(f->client, gpc, v[4], v[3]);
+    f->engine = v[6];
+    return 1;
+}
+
 // returns the function of the message handled, -1 on timeout, -2 when the sequencer failed
 static int msgq_recv(struct gsp *s, int timeout_ms)
 {
@@ -532,25 +704,40 @@ static int msgq_recv(struct gsp *s, int timeout_ms)
         break;
     case NV_VGPU_MSG_EVENT_RC_TRIGGERED: {
         const rpc_rc_triggered_v17_02 *rc = data;
+        uint32_t room = size - (uint32_t)(rc->rcJournalBuffer - buf);
+        uint32_t journal = rc->rcJournalBufferSize < room ? rc->rcJournalBufferSize : room;
         log_msg("gsp: channel recovery: engine %u chid %u exception %u level %u scope %u, fault %#llx type %u\n",
                 rc->nv2080EngineType, rc->chid, rc->exceptType, rc->exceptLevel, rc->scope,
                 (unsigned long long)rc->mmuFaultAddrHi << 32 | rc->mmuFaultAddrLo, rc->mmuFaultType);
-        // GSP-RM keeps an MMU fault's details to itself; its journal may carry the registers it read, as for a class error
-        if (rc->exceptType == 69 || rc->exceptType == 31) {
+        struct gsp_fault fault = { 0 }, *f = NULL;
+        int recorded = rc_fault(rc->rcJournalBuffer, journal, &fault);
+        if (recorded) {
+            f = &fault;
+            log_msg("gsp: MMU fault at %#llx: %s fault on a %s by %s, engine %#x\n", (unsigned long long)f->va,
+                    f->type, f->access, f->client, f->engine);
+        } else if (rc->exceptType == 31) {  // ROBUST_CHANNEL_FIFO_ERROR_MMU_ERR_FLT without a record
+            f = &fault;
+            f->va = (uint64_t)rc->mmuFaultAddrHi << 32 | rc->mmuFaultAddrLo;
+            f->type = fault_name(fault_types, sizeof(fault_types) / sizeof(fault_types[0]), rc->mmuFaultType);
+            f->access = "unknown";
+            put_str(f->client, "unknown");
+        }
+        // the registers GSP-RM read for a class error, and anything else in a journal we couldn't read
+        if (rc->exceptType == 69 || (rc->exceptType == 31 && !recorded)) {
             if (rc->exceptType == 69) {  // the method and data it trapped on, if still latched
                 uint32_t addr = rd32(s->g, 0x400704);
                 log_msg("gsp: class error code %#x subchannel %u method %#x data %#x %#x\n", rd32(s->g, 0x400110),
                         (addr >> 16) & 7, addr & 0x3ffc, rd32(s->g, 0x400708), rd32(s->g, 0x40070c));
             }
-            for (uint32_t i = 0; i < rc->rcJournalBufferSize && i < 512; i += 32) {
+            for (uint32_t i = 0; i < journal && i < 512; i += 32) {
                 const uint32_t *w = (const uint32_t *)(rc->rcJournalBuffer + i);
                 log_msg("gsp: rc journal %03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", i, w[0], w[1], w[2], w[3],
                         w[4], w[5], w[6], w[7]);
             }
         }
         // the journal is binary; its text records are what's worth reading
-        for (uint32_t i = 0, start = 0; i <= rc->rcJournalBufferSize && i < 0x4000; i++) {
-            uint8_t ch = i < rc->rcJournalBufferSize ? rc->rcJournalBuffer[i] : 0;
+        for (uint32_t i = 0, start = 0; i <= journal && i < 0x4000; i++) {
+            uint8_t ch = i < journal ? rc->rcJournalBuffer[i] : 0;
             if (ch >= 0x20 && ch < 0x7f)
                 continue;
             if (i - start >= 12)
@@ -559,21 +746,18 @@ static int msgq_recv(struct gsp *s, int timeout_ms)
         }
         for (int i = 0; i < 2; i++)
             if (s->rc[i].fn)
-                s->rc[i].fn(s->rc[i].ctx, rc->nv2080EngineType, rc->chid, rc->exceptType,
-                            (uint64_t)rc->mmuFaultAddrHi << 32 | rc->mmuFaultAddrLo);
+                s->rc[i].fn(s->rc[i].ctx, rc->nv2080EngineType, rc->chid, rc->exceptType, f);
         break;
     }
     case NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED: {
-        // the last fault as the hub latched it (nouveau's tu102_fault_info_fault)
+        // GSP-RM took a fault off the hub's non-replayable buffer (gmcapiMmuFaultQueued); the channel recovery that
+        // follows carries its details (rc_fault). The hub's own latch (nouveau's tu102_fault_info_fault) only holds
+        // a fault that went to no buffer, otherwise stale bits with valid clear.
         uint32_t lo = rd32(s->g, 0xb83080), hi = rd32(s->g, 0xb83084), info0 = rd32(s->g, 0xb83088),
                  insthi = rd32(s->g, 0xb8308c), info1 = rd32(s->g, 0xb83090);
-        // the hub has often latched nothing by now (valid clear) and these hold stale bits: the channel recovery's
-        // fault address and type are the real ones
-        if (!(info1 & 0x80000000)) {
-            log_msg("gsp: MMU fault queued, none latched\n");
+        if (!(info1 & 0x80000000))
             break;
-        }
-        log_msg("gsp: MMU fault at %#llx, inst %#llx, engine %#x, %s client %#x access %u reason %u\n",
+        log_msg("gsp: hub latched an MMU fault at %#llx, inst %#llx, engine %#x, %s client %#x access %u reason %u\n",
                 (unsigned long long)hi << 32 | lo, (unsigned long long)insthi << 32 | (info0 & 0xfffff000),
                 info0 & 0xff, info1 & 0x100000 ? "hub" : "gpc", (info1 >> 8) & 0x7f, (info1 >> 16) & 0xf, info1 & 0x1f);
         break;

@@ -4179,14 +4179,30 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         memcpy(d.more[j].blend, _pipeline->_blend[j + 1], sizeof(d.more[j].blend));
     }
     memcpy(d.attributes, _pipeline->_attributes, sizeof(d.attributes));
+    id<MTLBuffer> zeros = nil;
+    uint32_t used = 0;  // the streams active attributes read, a constant step function's (stride 0) among them
+    for (int i = 0; i < RENDER_ATTRIBUTES; i++)
+        if (d.attributes[i] && !(d.attributes[i] & ATTR_INACTIVE))
+            used |= 1u << (d.attributes[i] & 0x1f);
     for (int s = 0; s < 16; s++) {
-        if (!_pipeline->_strides[s] && !_pipeline->_divisors[s])
+        if (!_pipeline->_strides[s] && !_pipeline->_divisors[s] && !(used >> s & 1))
             continue;
         unsigned b = _pipeline->_stream_buffer[s];
         d.streams[s].addr = _vbuffers[b];
         d.streams[s].stride = _pipeline->_strides[s];
         d.streams[s].size = _vsizes[b];
         d.streams[s].divisor = _pipeline->_divisors[s];
+        // a stream whose buffer isn't bound would leave its attributes fetching from address 0, which faults the
+        // channel (WindowServer, under load): they read zeros instead
+        if (!d.streams[s].addr) {
+            if (!zeros) {
+                zeros = malachite_zero_buffer(((id<MTLCommandBuffer>)_cb).device);
+                malachite_keep(_cb, zeros);
+            }
+            d.streams[s].addr = [(MTLIOAccelBuffer *)zeros gpuAddress];
+            d.streams[s].size = (uint32_t)zeros.length;
+            d.streams[s].stride = 0;
+        }
     }
     if (_pipeline->_zero_stream) {
         id<MTLBuffer> zeros = malachite_zero_buffer(((id<MTLCommandBuffer>)_cb).device);

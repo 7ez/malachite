@@ -86,5 +86,6 @@ void rmfe_release_chan(struct rmfe *fe, struct obj *o);
 int rmfe_chan_control(struct rmfe *fe, struct client *c, struct obj *o, uint32_t cmd, void *params, uint32_t size,
                       NV_STATUS *st);
 int client_rm(struct client *c, struct rm_client *rc);
-void rmfe_rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, uint64_t fault_va);
+struct gsp_fault;
+void rmfe_rc_event(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception, const struct gsp_fault *fault);
 void rmfe_drain_rc(struct rmfe *fe);
