@@ -401,8 +401,9 @@ static size_t malachite_gob_offset(uint32_t pitch, size_t x, size_t y)
 
 // a region of one surface (in blocks) to or from rows of bytes on the CPU; block-linear ones 16 bytes (a sector's
 // run) at a time
-// one buffer's bytes over another's, by the GPU, waited for: how the CPU reaches a texture kept in VRAM
-static bool malachite_gpu_copy(id<MTLBuffer> from, id<MTLBuffer> to)
+// a range of one buffer's bytes over another's, by the GPU, waited for: how the CPU reaches a texture kept in VRAM
+static bool malachite_gpu_copy(id<MTLBuffer> from, NSUInteger from_off, id<MTLBuffer> to, NSUInteger to_off,
+                               NSUInteger size)
 {
     static id<MTLCommandQueue> queue;
     static dispatch_once_t once;
@@ -411,7 +412,7 @@ static bool malachite_gpu_copy(id<MTLBuffer> from, id<MTLBuffer> to)
     });
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-    [blit copyFromBuffer:from sourceOffset:0 toBuffer:to destinationOffset:0 size:MIN(from.length, to.length)];
+    [blit copyFromBuffer:from sourceOffset:from_off toBuffer:to destinationOffset:to_off size:size];
     [blit endEncoding];
     [cb commit];
     [cb waitUntilCompleted];
@@ -1736,12 +1737,26 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
 - (void)copyRegion:(MTLRegion)region level:(NSUInteger)level slice:(NSUInteger)slice bytes:(uint8_t *)bytes
             stride:(NSUInteger)stride image:(NSUInteger)image in:(bool)in
 {
-    // a texture in VRAM: through a copy of its memory the GPU makes, and puts back after a write
+    // a texture in VRAM: through a copy the GPU makes of the surfaces the region is in, put back after a write. A
+    // private buffer can still have pages the CPU maps, which the GPU never reads: GL's textures written there (all
+    // of Unigine's and Source's) were sampled as zeros
     id<MTLBuffer> backing = _backing, staging = nil;
     uint8_t *pixels = (uint8_t *)backing.contents;
-    if (!pixels) {
-        staging = [backing.device newBufferWithLength:backing.length options:MTLResourceStorageModeShared];
-        if (!staging || !malachite_gpu_copy(backing, staging))
+    NSUInteger lo = 0, hi = 0;
+    if (!pixels || backing.storageMode == MTLStorageModePrivate) {
+        lo = backing.length;
+        for (NSUInteger z = 0; z < region.size.depth; z++) {
+            struct malachite_sub s;
+            if (!malachite_sub(self, level, slice, region.origin.z + z, &s))
+                break;
+            lo = MIN(lo, s.offset);
+            hi = MAX(hi, s.offset + (NSUInteger)s.pitch * (s.rows ? s.rows : s.height));
+        }
+        hi = MIN(hi, backing.length);
+        if (lo >= hi)
+            return;
+        staging = [backing.device newBufferWithLength:hi - lo options:MTLResourceStorageModeShared];
+        if (!staging || !malachite_gpu_copy(backing, lo, staging, 0, hi - lo))
             return;
         pixels = (uint8_t *)staging.contents;
     }
@@ -1749,12 +1764,13 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
         struct malachite_sub s;
         if (!malachite_sub(self, level, slice, region.origin.z + z, &s))
             break;
+        s.offset -= lo;
         malachite_copy_sub(pixels, &s, region.origin.x / s.block, region.origin.y / s.block,
                        (region.size.width + s.block - 1) / s.block, (region.size.height + s.block - 1) / s.block,
                        bytes + z * image, stride, in);
     }
     if (staging && in)
-        malachite_gpu_copy(staging, backing);
+        malachite_gpu_copy(staging, 0, backing, lo, hi - lo);
 }
 
 - (void)replaceRegion:(MTLRegion)region
