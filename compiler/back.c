@@ -4228,6 +4228,9 @@ static int is_fence(const struct mop *m)
     case MK_CALL:
     case MK_ENTRY:
     case MK_RET:
+    // the exit reads the colours from where the outputs found them, so they stay next to it: moved up, the second
+    // allocation would end the colours' ranges there and give their registers to later values
+    case MK_OUTPUT:
         return 1;
     default:
         return 0;
