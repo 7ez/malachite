@@ -136,12 +136,13 @@ static int compile_once(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct air
 }
 
 // A shader the optional passes can't get through compiles without them: a pipeline that fails takes WindowServer down.
+// AIRC_NOFALLBACK=1 leaves it failed, so a test sees a pass that breaks it.
 static int compile_stage(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct airc_source *linked, unsigned nlinked,
                          const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
                          const struct airc_constant *fc, unsigned nfc, int print_ir, int remat, struct airc_kernel *k)
 {
     int ret = compile_once(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, remat, k);
-    if (ret) {
+    if (ret && !getenv("AIRC_NOFALLBACK")) {
         g_passes_off = 1;
         ret = compile_once(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, remat, k);
         g_passes_off = 0;
