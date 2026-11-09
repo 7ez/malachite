@@ -1901,7 +1901,9 @@ LLVMValueRef LLVMGetAggregateElement(LLVMValueRef c, unsigned i)
     e->m = c->m;
     e->type = t->elem;
     e->undef = c->undef;
-    e->kind = c->undef ? V_CONST : type(c->m, t->elem)->kind == T_FP ? V_CFP : V_CINT;
+    enum tkind k = type(c->m, t->elem)->kind;
+    e->zero = !c->undef && (k == T_ARRAY || k == T_VECTOR || k == T_STRUCT);  // a row of a zeroinitializer
+    e->kind = c->undef || e->zero ? V_CONST : k == T_FP ? V_CFP : V_CINT;
     return e;
 }
 
