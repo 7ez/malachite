@@ -1656,6 +1656,13 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
                           swizzle);
 }
 
+- (id)newTextureViewWithDescriptor:(MTLTextureViewDescriptor *)descriptor
+{
+    return [self newTextureViewWithPixelFormat:descriptor.pixelFormat textureType:descriptor.textureType
+                                        levels:descriptor.levelRange slices:descriptor.sliceRange
+                                       swizzle:descriptor.swizzle];
+}
+
 - (NSUInteger)width
 {
     return _image ? MAX(_width >> _view_min, 1u) : [super width];
@@ -2126,6 +2133,16 @@ static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
 }
 @end
 @implementation MalachiteDepthStencilState
+// the object's address, as the base sampler state answers
+- (uint64_t)uniqueIdentifier
+{
+    return (uint64_t)(__bridge void *)self;
+}
+
+- (MTLResourceID)gpuResourceID
+{
+    return (MTLResourceID){ [self uniqueIdentifier] };
+}
 @end
 
 // Build a TIC from a bound texture's buffer backing and its descriptor. A 1D texture is a 2D one a row high, a 1D
@@ -6358,6 +6375,11 @@ static MTLSizeAndAlign malachite_range_in_heap(uint64_t bytes)
     return _desc.size;
 }
 
+- (NSUInteger)allocatedSize
+{
+    return _desc.size;
+}
+
 - (NSUInteger)maxAvailableSizeWithAlignment:(NSUInteger)alignment
 {
     NSUInteger best = 0, align = MAX(alignment, vm_page_size);
@@ -8282,6 +8304,14 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
 - (BOOL)supportsCounterSampling:(MTLCounterSamplingPoint)point
 {
     return NO;
+}
+
+- (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
+                      iosurface:(IOSurfaceRef)surface
+                          plane:(NSUInteger)plane
+                          slice:(NSUInteger)slice
+{
+    return slice ? nil : [self newTextureWithDescriptor:descriptor iosurface:surface plane:plane];
 }
 
 @end
