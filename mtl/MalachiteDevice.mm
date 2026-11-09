@@ -6764,6 +6764,11 @@ static void malachite_nothing(const char *cls, const char *protocol, NSArray<NSS
         @"drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
         @"drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"
     ]);
+    // every allocation is resident from when it's made, so a residency set has nothing to add
+    malachite_nothing("MalachiteCommandBuffer", "MTLCommandBuffer", @[ @"useResidencySet:", @"useResidencySets:count:" ]);
+    malachite_nothing("MalachiteCommandQueue", "MTLCommandQueue", @[
+        @"addResidencySet:", @"addResidencySets:count:", @"removeResidencySet:", @"removeResidencySets:count:"
+    ]);
 }
 
 // MTLDeviceSPI methods the base MTLIOAccelDevice leaves abstract; _MTLDevice initLimits queries them.
