@@ -5653,10 +5653,11 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
 @end
 
 // An MTLVertexFormat as SET_VERTEX_ATTRIBUTE_A's component widths (26:21), numerical type (29:27) and R/B swap
-// (31) fields; 0 for one we don't handle.
-static uint32_t malachite_vertex_format(MTLVertexFormat f)
+// (31) fields; 0 for one we don't handle. as_float: read by a shader as floats, which integers convert to by value
+// (Apple's GL renderer passes GL's attributes that aren't normalised so).
+static uint32_t malachite_vertex_format(MTLVertexFormat f, bool as_float)
 {
-    enum { SNORM = 1, UNORM = 2, SINT = 3, UINT = 4, FLOAT = 7 };
+    enum { SNORM = 1, UNORM = 2, SINT = 3, UINT = 4, USCALED = 5, SSCALED = 6, FLOAT = 7 };
     enum { R32x4 = 0x01, R32x3 = 0x02, R16x4 = 0x03, R32x2 = 0x04, R16x3 = 0x05, R8x4 = 0x0a, R16x2 = 0x0f,
            R32 = 0x12, R8x3 = 0x13, R8x2 = 0x18, R16 = 0x1b, R8 = 0x1d, A2B10G10R10 = 0x30, B10G11R11 = 0x31 };
     uint32_t w, t;
@@ -5715,6 +5716,8 @@ static uint32_t malachite_vertex_format(MTLVertexFormat f)
     case MTLVertexFormatFloatRG11B10: w = B10G11R11, t = FLOAT; break;
     default: return 0;  // RGB9E5: the fetch unit has no such format
     }
+    if (as_float && (t == SINT || t == UINT))
+        t = t == SINT ? SSCALED : USCALED;
     return w << 21 | t << 27;
 }
 
@@ -7519,7 +7522,7 @@ static const struct airc_stage_in *malachite_stage_in(MTLStageInputOutputDescrip
         if (a.format == MTLAttributeFormatInvalid)
             continue;
         MTLBufferLayoutDescriptor *l = sd.layouts[a.bufferIndex];
-        uint32_t f = malachite_vertex_format((MTLVertexFormat)a.format);
+        uint32_t f = malachite_vertex_format((MTLVertexFormat)a.format, false);
         if (!f) {
             *why = [NSString stringWithFormat:@"stage input attribute %u: format %lu", loc, (unsigned long)a.format];
             return NULL;
@@ -7814,7 +7817,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
         MTLVertexAttributeDescriptor *a = vd.attributes[i];
         if (a.format == MTLVertexFormatInvalid)
             continue;
-        uint32_t f = malachite_vertex_format(a.format);
+        uint32_t f = malachite_vertex_format(a.format, vh.float_inputs >> i & 1);
         if (f && stream_of[a.bufferIndex] < 0 && taken != 0xffff) {
             stream_of[a.bufferIndex] = __builtin_ctz(~taken);
             taken |= 1u << stream_of[a.bufferIndex];
@@ -7882,7 +7885,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
             continue;
         MTLVertexAttributeDescriptor *a = vd.attributes[loc];
         MTLVertexBufferLayoutDescriptor *l = vd.layouts[a.bufferIndex];
-        uint32_t f = malachite_vertex_format(a.format);
+        uint32_t f = malachite_vertex_format(a.format, false);
         if (!f || a.bufferIndex >= AIRC_TESS_BUFFERS || l.stepFunction == MTLVertexStepFunctionPerVertex)
             why = [NSString stringWithFormat:@"attribute %u: format %lu, buffer %lu, step function %lu", loc,
                                              (unsigned long)a.format, (unsigned long)a.bufferIndex,
