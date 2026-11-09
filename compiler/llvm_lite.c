@@ -839,7 +839,9 @@ static void parse_constants(struct ll_module *m, struct bits *b)
             v->nops = 1;
             v->ops = zalloc(m, 2 * sizeof(*v->ops));
             v->ops[0] = val_slot(m, (unsigned)r.ops[2], (int)r.ops[1]);
-        } else if (r.code == 22 && (t->kind == T_VECTOR || t->kind == T_ARRAY)) {  // DATA [raw elements]
+        } else if ((r.code == 22 || r.code == 8 || r.code == 9) && (t->kind == T_VECTOR || t->kind == T_ARRAY)) {
+            // DATA [raw elements], and an i8 array's STRING and CSTRING (which leaves out the 0 it ends with, read
+            // as the missing element)
             struct ll_type *et = type(m, t->elem);
             v = define_value(m, V_CONST, cur);
             v->nops = r.n;
