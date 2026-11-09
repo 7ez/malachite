@@ -110,6 +110,8 @@ struct nvk_header {
     // leaves the count to the draw), and the [[attribute(n)]] locations it reads per control point and per patch
     uint32_t patch_domain, patch_points;
     uint32_t point_inputs, patch_inputs;
+    // a vertex function's [[attribute(n)]] locations it reads as floats, which Metal converts integer formats to
+    uint32_t float_inputs;
     // the sampler pool slots its samples with a depth compare use, and those its other samples and gathers use
     uint32_t compare_samplers, plain_samplers;
     uint32_t nearest_samplers;  // those an integer texture is sampled with: Apple's GPUs never filter those

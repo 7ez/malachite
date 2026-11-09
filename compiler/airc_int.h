@@ -24,6 +24,7 @@ struct airc_info {
     unsigned targets;     // colour targets a fragment function writes, a bit each
     uint32_t vertex_inputs;  // [[attribute(n)]] locations read (a post-tessellation function's per control point)
     uint32_t patch_inputs;   // and per patch
+    uint32_t float_inputs;   // a vertex function's read as floats
     unsigned patch_domain, patch_points;  // a post-tessellation function's patch, a tessellation init stage's threads
     uint32_t point_outputs;  // a tessellation init stage's: its control point's generic outputs, a bit each
     unsigned patch_outputs;  // and its patch's

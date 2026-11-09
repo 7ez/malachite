@@ -6804,8 +6804,11 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
             k = NVK_ARG_THREADGROUP;
         if (k == NVK_ARG_CONTROL_POINTS)
             control_points(nodes[i]);
-        if (k == NVK_ARG_VERTEX_INPUT)
+        if (k == NVK_ARG_VERTEX_INPUT) {
             g_info->vertex_inputs |= 1u << index;
+            if (ir_type_of(lane_type(LLVMTypeOf(LLVMGetParam(fn, i)), 0)) != IR_I32)
+                g_info->float_inputs |= 1u << index;
+        }
         if (k == NVK_ARG_PATCH_INPUT)
             g_info->patch_inputs |= 1u << index;
         if (k == NVK_ARG_SAMPLE_ID)

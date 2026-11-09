@@ -94,6 +94,7 @@ static void finish(struct ir_func *f, struct airc_info *info, int print_ir, int 
     k->h.patch_points = info->patch_points;
     k->h.point_inputs = info->stage == NVK_TESS_EVAL ? info->vertex_inputs : 0;
     k->h.patch_inputs = info->patch_inputs;
+    k->h.float_inputs = info->float_inputs;
     k->h.flags = info->flags;
     k->outputs = info->outputs;
     k->h.nconst_samplers = info->nconst_samplers;
