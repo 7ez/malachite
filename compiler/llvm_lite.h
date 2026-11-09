@@ -155,6 +155,7 @@ LLVMOpcode LLVMGetConstOpcode(LLVMValueRef v);
 LLVMBool LLVMIsUndef(LLVMValueRef v);
 LLVMBool LLVMIsPoison(LLVMValueRef v);
 LLVMValueRef LLVMGetInitializer(LLVMValueRef g);
+LLVMBool LLVMIsGlobalConstant(LLVMValueRef g);
 LLVMTypeRef LLVMGetAllocatedType(LLVMValueRef alloca);
 LLVMTypeRef LLVMInt32Type(void);
 LLVMTypeRef LLVMInt8Type(void);

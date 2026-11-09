@@ -34,6 +34,7 @@ struct ptr {
     unsigned stride, count;
     unsigned bytes;  // private memory: the size of the alloca or constant table it's in, 0 when not known
     struct sub_param *param;  // a subroutine's texture or sampler parameter: base is its handle
+    LLVMValueRef table;  // a constant table's global, whether in variables (private) or in memory (global)
 };
 
 // value, pointer and block maps, keyed by LLVM object and the inlined instance (scope) it belongs to
@@ -174,6 +175,18 @@ static struct ir_val *g_point_map;
 static const struct airc_stage_in *g_stage_in;
 static unsigned g_region_off, g_stage_in_buffer[31];
 static struct ir_val *g_region[6];
+static unsigned g_param_end;  // past the last param of const bank 0 given out
+
+// constant tables read from memory: each one's address, made in the prologue, and where the bytes of them all are
+// (airc_info.data, the param at g_data_param pointing at them); the buffer is kept from one compile to the next
+static struct table {
+    LLVMValueRef g;
+    struct ir_val *base;
+    struct table *next;
+} *g_tables;
+static unsigned g_data_param;
+static unsigned char *g_data;
+static unsigned g_data_cap;
 
 // threadgroup variables, laid out one after another (16-byte aligned) from shared address 0
 static struct {
@@ -568,6 +581,8 @@ static struct ir_val *index_value(LLVMValueRef idx, int *is_signed)
     return get(idx, 0);
 }
 
+static struct ptr in_memory(struct ptr p);
+
 // count: how many elements the index picks from, 0 if unknown
 static struct ptr add_index(struct ptr p, LLVMValueRef idx, unsigned scale, unsigned count)
 {
@@ -579,6 +594,12 @@ static struct ptr add_index(struct ptr p, LLVMValueRef idx, unsigned scale, unsi
     int is_signed;
     struct ir_val *i = index_value(idx, &is_signed);
     if (p.space == SP_GLOBAL) {
+        if (p.table && !count && scale && p.bytes > p.off)
+            count = (unsigned)(p.bytes - p.off) / scale;
+        if (p.table && count) {  // a read past the kernel's data faults the channel: past a table's end, its last
+            i = op2(IR_MIN, IR_I32, i, konst(IR_I32, count - 1));
+            i->aux = 0;
+        }
         struct ir_val *a = op2(IR_ADDR, IR_I64, p.base, i);
         a->imm = scale;
         a->aux = is_signed;
@@ -600,6 +621,8 @@ static struct ptr add_index(struct ptr p, LLVMValueRef idx, unsigned scale, unsi
             p.count *= count;
             return p;
         }
+        if ((p.base || !count || count > 64) && p.table)
+            return add_index(in_memory(p), idx, scale, count);
         if (p.base || !count || count > 64)
             airc_fail("a private array indexed by a variable");
         p.base = i;
@@ -887,12 +910,20 @@ static struct ptr ptr_of(LLVMValueRef v)
         } else if (as == 2 && name && !strncmp(name, "__air_sampler_state", 19)) {
             p.space = SP_SAMPLER;
             p.slot = const_sampler(v);
-        } else if (as == 2 && LLVMGetInitializer(v)) {  // a constant table: variables that hold it from the start
+        } else if (as == 2 && LLVMGetInitializer(v)) {
+            // a constant table: variables that hold it from the start, or for a bigger one than their offsets reach
+            // (private_var), memory. One the static initialiser writes (a function constant's) stays in variables.
             unsigned a;
             p.space = SP_PRIVATE;
             p.slot = ++g_nallocas;
             p.bytes = layout(LLVMGlobalGetValueType(v), &a);
-            const_table(p, LLVMGetInitializer(v));
+            p.table = LLVMIsGlobalConstant(v) ? v : NULL;
+            if (p.bytes > 0xfff && !p.table)
+                airc_fail("a global of more than 4 KB the shader writes");
+            if (p.bytes > 0xfff)
+                p = in_memory(p);
+            else
+                const_table(p, LLVMGetInitializer(v));
         } else {
             airc_fail("unsupported global %s", name ? name : "?");
         }
@@ -1007,6 +1038,7 @@ static struct ir_val *handle_of_ptr(struct ptr p, enum space space);
 // texture's or sampler's handle
 static struct ir_val *ptr_value(struct ptr p)
 {
+    p = in_memory(p);
     if (p.space == SP_GLOBAL)
         return p.off ? add_offset(p.base, p.off) : p.base;
     if (p.space == SP_SHARED || p.space == SP_LOCAL) {
@@ -4292,12 +4324,110 @@ static void private_write(unsigned var, struct ir_val *v)
 // a constant global's lanes as the values its variables hold where the shader starts
 static void const_table(struct ptr p, LLVMValueRef init)
 {
-    unsigned a;
     LLVMTypeRef t = LLVMTypeOf(init);
-    if (layout(t, &a) > 0xfff)
-        airc_fail("a constant table of more than 4 KB");
     for (unsigned l = 0; l < nlanes(t); l++)
         insert(g_defs, g_prologue, private_var(p, lane_offset(t, l)), 0)->v = const_lane(init, l);
+}
+
+// a scalar constant of type t as memory holds it, at at; undefined is left as it is (0)
+static void put_scalar(unsigned char *at, LLVMValueRef c, LLVMTypeRef t)
+{
+    if (LLVMIsAConstantInt(c)) {
+        uint64_t bits = LLVMConstIntGetZExtValue(c);
+        memcpy(at, &bits, scalar_bytes(t));
+    } else if (LLVMIsAConstantFP(c)) {
+        LLVMBool lost;
+        float f = (float)LLVMConstRealGetDouble(c, &lost);
+        uint32_t bits;
+        memcpy(&bits, &f, 4);
+        if (LLVMGetTypeKind(t) == LLVMHalfTypeKind)
+            bits = half_bits(f);
+        else if (LLVMGetTypeKind(t) == LLVMBFloatTypeKind)
+            bits >>= 16;
+        memcpy(at, &bits, scalar_bytes(t));
+    } else if (LLVMIsAGlobalVariable(c) || LLVMIsAConstantExpr(c) || LLVMIsAFunction(c)) {
+        airc_fail("a pointer in a constant table");
+    }
+}
+
+static void put_const(unsigned char *at, LLVMValueRef c)
+{
+    LLVMTypeRef t = LLVMTypeOf(c);
+    LLVMTypeKind k = LLVMGetTypeKind(t);
+    if (LLVMIsUndef(c) || LLVMIsPoison(c))
+        return;
+    if (k == LLVMVectorTypeKind && (LLVMIsAConstantInt(c) || LLVMIsAConstantFP(c))) {  // a splat
+        LLVMTypeRef e = LLVMGetElementType(t);
+        for (unsigned i = 0; i < LLVMGetVectorSize(t); i++)
+            put_scalar(at + i * scalar_bytes(e), c, e);
+    } else if (k == LLVMVectorTypeKind || k == LLVMArrayTypeKind || k == LLVMStructTypeKind) {
+        unsigned a, n = k == LLVMVectorTypeKind ? LLVMGetVectorSize(t)
+                        : k == LLVMArrayTypeKind ? (unsigned)LLVMGetArrayLength2(t)
+                                                 : LLVMCountStructElementTypes(t);
+        for (unsigned i = 0; i < n; i++) {
+            LLVMValueRef e = LLVMGetAggregateElement(c, i);
+            if (!e)
+                continue;
+            unsigned off = k == LLVMStructTypeKind  ? field_offset(t, i)
+                           : k == LLVMArrayTypeKind ? i * layout(LLVMGetElementType(t), &a)
+                                                    : i * scalar_bytes(LLVMGetElementType(t));
+            put_const(at + off, e);
+        }
+    } else {
+        put_scalar(at, c, t);
+    }
+}
+
+static unsigned hidden_arg(enum nvk_arg_kind kind, unsigned index, unsigned *off);
+
+// the address of constant table g's copy in the kernel's data, which it's added to the first time
+static struct ir_val *table_base(LLVMValueRef g)
+{
+    struct table *t = g_tables;
+    while (t && t->g != g)
+        t = t->next;
+    if (t)
+        return t->base;
+    unsigned a, bytes = layout(LLVMGlobalGetValueType(g), &a);
+    unsigned at = (g_info->data_size + 15) & ~15u;  // as aligned as any access to it needs
+    if (bytes > (16u << 20) - at)
+        airc_fail("more than 16 MB of constant tables");
+    if (at + bytes > g_data_cap) {
+        g_data_cap = at + bytes > 2 * g_data_cap ? at + bytes : 2 * g_data_cap;
+        g_data = realloc(g_data, g_data_cap);
+    }
+    memset(g_data + g_info->data_size, 0, at + bytes - g_info->data_size);
+    put_const(g_data + at, LLVMGetInitializer(g));
+    g_info->data = g_data;
+    g_info->data_size = at + bytes;
+    if (!g_data_param)
+        g_data_param = hidden_arg(NVK_ARG_DATA, 0, &g_param_end);
+    struct ir_block *cur = g_cur;
+    g_cur = g_prologue;
+    t = ir_alloc(sizeof(*t));
+    t->g = g;
+    t->base = at ? add_offset(cbuf(IR_I64, g_data_param), at) : cbuf(IR_I64, g_data_param);
+    t->next = g_tables;
+    g_tables = t;
+    g_cur = cur;
+    return t->base;
+}
+
+// A pointer into a constant table, for what the table's variables can't do (an index into more elements than
+// selects pick from, an address taken), as one into its copy in memory; any other as it is.
+static struct ptr in_memory(struct ptr p)
+{
+    if (p.space != SP_PRIVATE || !p.table)
+        return p;
+    struct ptr q = { .space = SP_GLOBAL, .base = table_base(p.table), .off = p.off, .bytes = p.bytes,
+                     .table = p.table };
+    if (p.base) {  // already indexed: like add_index, kept inside the table
+        struct ir_val *i = op2(IR_MIN, IR_I32, p.base, konst(IR_I32, p.count - 1));
+        i->aux = 0;
+        q.base = op2(IR_ADDR, IR_I64, q.base, i);
+        q.base->imm = p.stride;
+    }
+    return q;
 }
 
 static struct ir_val *private_read(unsigned var, enum ir_type t)
@@ -6043,7 +6173,7 @@ static void instruction(LLVMValueRef in)
     case LLVMSelect: {
         LLVMValueRef c = LLVMGetOperand(in, 0);
         if (is_ptr(t)) {
-            struct ptr a = ptr_of(LLVMGetOperand(in, 1)), b = ptr_of(LLVMGetOperand(in, 2));
+            struct ptr a = in_memory(ptr_of(LLVMGetOperand(in, 1))), b = in_memory(ptr_of(LLVMGetOperand(in, 2)));
             if (a.space != b.space)
                 airc_fail("a select of pointers into different memory");
             struct ptr q = { .space = a.space, .base = sel(get(c, 0), ptr_value(a), ptr_value(b)),
@@ -6549,10 +6679,10 @@ static unsigned param_slot(unsigned *off)
     return *off - 8;
 }
 
-static unsigned stage_in_arg(enum nvk_arg_kind kind, unsigned index, unsigned *off)
+static unsigned hidden_arg(enum nvk_arg_kind kind, unsigned index, unsigned *off)
 {
     if (g_info->nargs == NVK_MAX_ARGS)
-        airc_fail("more than %d arguments with the stage input's", NVK_MAX_ARGS);
+        airc_fail("more than %d arguments with the hidden ones", NVK_MAX_ARGS);
     struct nvk_arg *a = &g_info->args[g_info->nargs++];
     a->kind = (uint8_t)kind;
     a->index = (uint8_t)index;
@@ -6564,7 +6694,7 @@ static unsigned stage_in_arg(enum nvk_arg_kind kind, unsigned index, unsigned *o
 // indices
 static void stage_in_args(unsigned *off)
 {
-    g_region_off = stage_in_arg(NVK_ARG_STAGE_IN_REGION, 0, off);
+    g_region_off = hidden_arg(NVK_ARG_STAGE_IN_REGION, 0, off);
     for (unsigned loc = 0; g_stage_in && loc < 32; loc++) {
         const struct airc_tess_attr *a = &g_stage_in->attrs[loc];
         if (!(g_info->vertex_inputs >> loc & 1) || !a->format)
@@ -6574,7 +6704,7 @@ static void stage_in_args(unsigned *off)
             if (buffers[i] >= 31)
                 airc_fail("stage input attribute %u: buffer %u", loc, buffers[i]);
             if (!g_stage_in_buffer[buffers[i]])
-                g_stage_in_buffer[buffers[i]] = stage_in_arg(NVK_ARG_STAGE_IN_BUFFER, buffers[i], off);
+                g_stage_in_buffer[buffers[i]] = hidden_arg(NVK_ARG_STAGE_IN_BUFFER, buffers[i], off);
         }
     }
 }
@@ -6730,6 +6860,7 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
     free(nodes);
     if (g_info->stage == NVK_COMPUTE && (stage_in || g_info->vertex_inputs))
         stage_in_args(&off);
+    g_param_end = off;
     // Metal binds textures and samplers at indices up to 127, the pools have 16 slots: one past them (MPS binds its
     // sources at 64) takes a free low slot, kept in its cbuf_off for the dispatcher, clear of the constant samplers'
     // and render targets' slots at the top
@@ -6816,6 +6947,8 @@ void airc_front(void *module, void **linked, const char *const *linked_names, un
     g_private_ptrs = NULL;
     g_local_choices = NULL;
     g_picked = NULL;
+    g_tables = NULL;
+    g_data_param = 0;
 
     LLVMValueRef arglist;
     g_entry_fn = stage_function(&arglist);
