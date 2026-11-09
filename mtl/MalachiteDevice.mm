@@ -2166,19 +2166,21 @@ static int malachite_fill_texture_header(uint32_t out[8], id texture, id cb)
     return 0;
 }
 
-// A function's buffer arguments go to const bank 0 at the offsets airc gave them: params + (cbuf_off - 0x160).
+// A function's buffer arguments go to const bank 0 at the offsets airc gave them: params + (cbuf_off - 0x160), and
+// so does the address of its constant data, after its code at code.
 // The size can come out past capacity bytes (a draw's 20 buffers), which aren't written: the caller refuses it.
-static uint32_t malachite_fill_params(const struct nvk_header *h, const uint64_t buffers[31], uint8_t *params,
-                                  uint32_t capacity)
+static uint32_t malachite_fill_params(const struct nvk_header *h, const uint64_t buffers[31], uint64_t code,
+                                  uint8_t *params, uint32_t capacity)
 {
     uint32_t size = 0;
+    uint64_t data = code + h->sass_size;
     for (uint32_t i = 0; i < h->nargs; i++) {
         const struct nvk_arg *a = &h->args[i];
-        if (a->kind != NVK_ARG_BUFFER && a->kind != NVK_ARG_STAGE_IN_BUFFER)
+        if (a->kind != NVK_ARG_BUFFER && a->kind != NVK_ARG_STAGE_IN_BUFFER && a->kind != NVK_ARG_DATA)
             continue;
         uint32_t at = a->cbuf_off - 0x160;
         if (at + 8 <= capacity)
-            memcpy(params + at, &buffers[a->index], 8);
+            memcpy(params + at, a->kind == NVK_ARG_DATA ? &data : &buffers[a->index], 8);
         if (at + 8 > size)
             size = at + 8;
     }
@@ -2993,7 +2995,7 @@ static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, c
     d.shared_size = pipeline->_kernel.shared_size;
     d.local_size = pipeline->_kernel.local_size;
     d.barriers = pipeline->_kernel.barriers;
-    d.params_size = malachite_fill_params(&pipeline->_kernel, buffers, d.params, sizeof(d.params));
+    d.params_size = malachite_fill_params(&pipeline->_kernel, buffers, d.prog_va, d.params, sizeof(d.params));
     // [[threadgroup(n)]] memory after the kernel's own threadgroup variables, each at the offset its param says
     for (uint32_t i = 0; i < pipeline->_kernel.nargs; i++) {
         const struct nvk_arg *a = &pipeline->_kernel.args[i];
@@ -4210,13 +4212,13 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     d.ps = [(MTLIOAccelBuffer *)_pipeline->_fcode gpuAddress];
     d.vs_regs = _pipeline->_vertex.reg_count;
     d.ps_regs = _pipeline->_fragment.reg_count;
-    d.vs_params_size = malachite_fill_params(&_pipeline->_vertex, _vbuffers, d.vs_params, sizeof(d.vs_params));
+    d.vs_params_size = malachite_fill_params(&_pipeline->_vertex, _vbuffers, d.vs, d.vs_params, sizeof(d.vs_params));
     if (malachite_trace)
         for (uint32_t i = 0; i < _pipeline->_vertex.nargs; i++)
             os_log(OS_LOG_DEFAULT, "Malachite trace:   vertex argument %u: kind %u index %u at %#x", i,
                    _pipeline->_vertex.args[i].kind, _pipeline->_vertex.args[i].index,
                    _pipeline->_vertex.args[i].cbuf_off);
-    d.ps_params_size = malachite_fill_params(&_pipeline->_fragment, _fbuffers, d.ps_params, sizeof(d.ps_params));
+    d.ps_params_size = malachite_fill_params(&_pipeline->_fragment, _fbuffers, d.ps, d.ps_params, sizeof(d.ps_params));
     if (_pipeline == _pools_pipeline && !memcmp(_pools_bound[0], _textures, sizeof(_textures)) &&
         !memcmp(_pools_bound[1], _samplers, sizeof(_samplers)) && !memcmp(_pools_bound[2], _vtextures, sizeof(_vtextures)) &&
         !memcmp(_pools_bound[3], _vsamplers, sizeof(_vsamplers))) {
@@ -7166,12 +7168,13 @@ static void malachite_cache_name(char name[2 * CC_SHA256_DIGEST_LENGTH + 1], con
 // a compile as the cache keeps it
 static NSData *malachite_cache_entry(const struct airc_kernel *k)
 {
-    NSMutableData *entry = [NSMutableData dataWithLength:sizeof(struct malachite_compiled) + k->h.sass_size];
+    size_t bytes = (size_t)k->h.sass_size + k->h.data_size;
+    NSMutableData *entry = [NSMutableData dataWithLength:sizeof(struct malachite_compiled) + bytes];
     struct malachite_compiled *c = (struct malachite_compiled *)entry.mutableBytes;
     c->h = k->h;
     memcpy(c->arg_names, k->arg_names, sizeof(c->arg_names));
     c->outputs = k->outputs;
-    memcpy(c + 1, k->sass, k->h.sass_size);
+    memcpy(c + 1, k->sass, bytes);
     return entry;
 }
 
@@ -7179,7 +7182,8 @@ static NSData *malachite_cache_entry(const struct airc_kernel *k)
 static bool malachite_cache_entry_ok(NSData *entry)
 {
     const struct malachite_compiled *c = (const struct malachite_compiled *)entry.bytes;
-    if (entry.length < sizeof(*c) || c->h.magic != NVK_MAGIC || entry.length - sizeof(*c) != c->h.sass_size ||
+    if (entry.length < sizeof(*c) || c->h.magic != NVK_MAGIC ||
+        entry.length - sizeof(*c) != (size_t)c->h.sass_size + c->h.data_size ||
         c->h.nargs > NVK_MAX_ARGS || c->h.nconst_samplers > NVK_MAX_CONST_SAMPLERS || c->h.stage > NVK_TESS_INIT ||
         c->outputs.n > sizeof(c->outputs.names) / sizeof(c->outputs.names[0]))
         return false;
@@ -7445,10 +7449,10 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
                                  OBJC_ASSOCIATION_RETAIN);
     *h = failed ? (struct nvk_header){} : c->h;
     // the SMs prefetch instructions past a program's end: a page of slack keeps that inside the buffer (with none it
-    // reads the next mapping, and faults once that one is freed)
-    id<MTLBuffer> code = failed ? nil : [self newBufferWithLength:h->sass_size + 4096 options:0];
+    // reads the next mapping, and faults once that one is freed). The constant data goes between the two.
+    id<MTLBuffer> code = failed ? nil : [self newBufferWithLength:h->sass_size + h->data_size + 4096 options:0];
     if (code)
-        memcpy(code.contents, c + 1, h->sass_size);
+        memcpy(code.contents, c + 1, h->sass_size + h->data_size);
 
     // the AIR, for build/airc to reproduce a failure with; with the trace on, every shader's (not an override)
     // (in /tmp, or for a sandboxed process that can't write there, its own temporary directory)
