@@ -2719,6 +2719,12 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
     malachite_keep(_cb, heap);
 }
 
+- (void)useHeaps:(const id __unsafe_unretained *)heaps count:(NSUInteger)count
+{
+    for (NSUInteger i = 0; i < count; i++)
+        malachite_keep(_cb, heaps[i]);
+}
+
 // the sampler's own LOD clamps apply, not these
 - (void)setSamplerState:(id)sampler lodMinClamp:(float)lodMin lodMaxClamp:(float)lodMax atIndex:(NSUInteger)index
 {
@@ -3770,6 +3776,18 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 - (void)useHeap:(id)heap stages:(MTLRenderStages)stages
 {
     malachite_keep(_cb, heap);
+}
+
+- (void)useHeaps:(const id __unsafe_unretained *)heaps count:(NSUInteger)count
+{
+    for (NSUInteger i = 0; i < count; i++)
+        malachite_keep(_cb, heaps[i]);
+}
+
+- (void)useHeaps:(const id __unsafe_unretained *)heaps count:(NSUInteger)count stages:(MTLRenderStages)stages
+{
+    for (NSUInteger i = 0; i < count; i++)
+        malachite_keep(_cb, heaps[i]);
 }
 
 - (void)textureBarrier
