@@ -1086,12 +1086,16 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     return self;
 }
 
-// commands run to completion in the order they were encoded: a fence has nothing to order
+// commands run to completion in the order they were encoded: a fence or barrier has nothing to order
 - (void)updateFence:(id)fence
 {
 }
 
 - (void)waitForFence:(id)fence
+{
+}
+
+- (void)barrierAfterQueueStages:(MTLStages)after beforeStages:(MTLStages)before
 {
 }
 
@@ -2684,12 +2688,24 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
     return self;
 }
 
-// as on the blit encoder: dispatches already run in order
+// as on the blit encoder: dispatches already run in order, each after the work before it is done
 - (void)updateFence:(id)fence
 {
 }
 
 - (void)waitForFence:(id)fence
+{
+}
+
+- (void)memoryBarrierWithScope:(MTLBarrierScope)scope
+{
+}
+
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained *)resources count:(NSUInteger)count
+{
+}
+
+- (void)barrierAfterQueueStages:(MTLStages)after beforeStages:(MTLStages)before
 {
 }
 
@@ -3894,6 +3910,19 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 }
 
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before
+{
+    _barrier = true;
+}
+
+- (void)memoryBarrierWithResources:(const id<MTLResource> __unsafe_unretained *)resources
+                             count:(NSUInteger)count
+                       afterStages:(MTLRenderStages)after
+                      beforeStages:(MTLRenderStages)before
+{
+    _barrier = true;
+}
+
+- (void)barrierAfterQueueStages:(MTLStages)after beforeStages:(MTLStages)before
 {
     _barrier = true;
 }
