@@ -1084,6 +1084,15 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     return self;
 }
 
+// commands run to completion in the order they were encoded: a fence has nothing to order
+- (void)updateFence:(id)fence
+{
+}
+
+- (void)waitForFence:(id)fence
+{
+}
+
 - (void)copyFromBuffer:(id)src sourceOffset:(NSUInteger)srcOff
               toBuffer:(id)dst destinationOffset:(NSUInteger)dstOff
                   size:(NSUInteger)size
@@ -2648,6 +2657,15 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
     if (self)
         _cb = cb;
     return self;
+}
+
+// as on the blit encoder: dispatches already run in order
+- (void)updateFence:(id)fence
+{
+}
+
+- (void)waitForFence:(id)fence
+{
 }
 
 - (void)setComputePipelineState:(id)state
