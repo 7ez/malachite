@@ -6681,10 +6681,89 @@ static id malachite_exc_pre(id e)
     return malachite_prev_pre ? malachite_prev_pre(e) : e;
 }
 
+static id malachite_none(id self, SEL _cmd)
+{
+    return nil;
+}
+
+// each of names on the class answering nil, 0 or NO, or doing nothing
+static void malachite_nothing(const char *cls, const char *protocol, NSArray<NSString *> *names)
+{
+    Class c = objc_getClass(cls);
+    Protocol *p = objc_getProtocol(protocol);
+    for (NSString *name in names) {
+        SEL s = NSSelectorFromString(name);
+        class_addMethod(c, s, (IMP)malachite_none, protocol_getMethodDescription(p, s, YES, YES).types);
+    }
+}
+
 + (void)load
 {
     os_log(OS_LOG_DEFAULT, "MalachiteDriver: bundle loaded, MalachiteDevice registered");
     malachite_prev_pre = objc_setExceptionPreprocessor(malachite_exc_pre);
+
+    // What the device doesn't do and says it doesn't: ray tracing, function pointers and their tables, mesh and
+    // object stages, indirect command buffers, counters, tensors, more than one view, Metal 4's attachment maps,
+    // OpenCL's doubles and halves, Metal's assertions. The bases leave these to the driver, throwing (or calling
+    // themselves) if it doesn't answer.
+    malachite_nothing("MalachiteDevice", "MTLDeviceSPI", @[
+        @"newIntersectionFunctionTableWithDescriptor:", @"newVisibleFunctionTableWithDescriptor:",
+        @"functionHandleWithFunction:", @"functionHandleWithFunction:resourceIndex:",
+        @"newIndirectCommandBufferWithDescriptor:maxCount:options:", @"newIndirectComputeCommandEncoderWithBuffer:",
+        @"newIndirectRenderCommandEncoderWithBuffer:", @"supportsPlacementSparse", @"doubleFPConfig", @"halfFPConfig",
+        @"metalAssertionsEnabled", @"setMetalAssertionsEnabled:"
+    ]);
+    malachite_nothing("MalachiteDepthStencilState", "MTLDepthStencilStateSPI", @[ @"resourceIndex" ]);
+    malachite_nothing("MalachiteHeap", "MTLHeap", @[
+        @"newAccelerationStructureWithSize:", @"newAccelerationStructureWithSize:offset:",
+        @"newAccelerationStructureWithDescriptor:", @"newAccelerationStructureWithDescriptor:offset:"
+    ]);
+    malachite_nothing("MalachiteBuffer", "MTLBuffer", @[ @"newTensorWithDescriptor:offset:error:", @"sparseBufferTier" ]);
+    malachite_nothing("MalachiteTexture", "MTLTexture", @[ @"sparseTextureTier" ]);
+    malachite_nothing("MalachiteComputePipelineState", "MTLComputePipelineState", @[
+        @"functionHandleWithFunction:", @"functionHandleWithBinaryFunction:", @"functionHandleWithName:",
+        @"newComputePipelineStateWithAdditionalBinaryFunctions:error:", @"newComputePipelineStateWithBinaryFunctions:error:"
+    ]);
+    malachite_nothing("MalachiteRenderPipelineState", "MTLRenderPipelineState", @[
+        @"functionHandleWithFunction:stage:", @"functionHandleWithBinaryFunction:stage:", @"functionHandleWithName:stage:",
+        @"newVisibleFunctionTableWithDescriptor:stage:", @"newIntersectionFunctionTableWithDescriptor:stage:",
+        @"newRenderPipelineStateWithAdditionalBinaryFunctions:error:", @"newRenderPipelineStateWithBinaryFunctions:error:",
+        @"newRenderPipelineDescriptorForSpecialization"
+    ]);
+    malachite_nothing("MalachiteBlitCommandEncoder", "MTLBlitCommandEncoder", @[
+        @"sampleCountersInBuffer:atSampleIndex:withBarrier:", @"resolveCounters:inRange:destinationBuffer:destinationOffset:",
+        @"copyFromTensor:sourceOrigin:sourceDimensions:toTensor:destinationOrigin:destinationDimensions:"
+    ]);
+    malachite_nothing("MalachiteComputeCommandEncoder", "MTLComputeCommandEncoder", @[
+        @"sampleCountersInBuffer:atSampleIndex:withBarrier:", @"setAccelerationStructure:atBufferIndex:",
+        @"setIntersectionFunctionTable:atBufferIndex:", @"setIntersectionFunctionTables:withBufferRange:",
+        @"setVisibleFunctionTable:atBufferIndex:", @"setVisibleFunctionTables:withBufferRange:"
+    ]);
+    malachite_nothing("MalachiteRenderCommandEncoder", "MTLRenderCommandEncoder", @[
+        @"sampleCountersInBuffer:atSampleIndex:withBarrier:", @"executeCommandsInBuffer:withRange:",
+        @"executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:", @"setVertexAmplificationCount:viewMappings:",
+        @"setColorAttachmentMap:",
+        @"setVertexAccelerationStructure:atBufferIndex:", @"setFragmentAccelerationStructure:atBufferIndex:",
+        @"setTileAccelerationStructure:atBufferIndex:", @"setVertexIntersectionFunctionTable:atBufferIndex:",
+        @"setFragmentIntersectionFunctionTable:atBufferIndex:", @"setTileIntersectionFunctionTable:atBufferIndex:",
+        @"setVertexIntersectionFunctionTables:withBufferRange:", @"setFragmentIntersectionFunctionTables:withBufferRange:",
+        @"setTileIntersectionFunctionTables:withBufferRange:", @"setVertexVisibleFunctionTable:atBufferIndex:",
+        @"setFragmentVisibleFunctionTable:atBufferIndex:", @"setTileVisibleFunctionTable:atBufferIndex:",
+        @"setVertexVisibleFunctionTables:withBufferRange:", @"setFragmentVisibleFunctionTables:withBufferRange:",
+        @"setTileVisibleFunctionTables:withBufferRange:",
+        @"setObjectBytes:length:atIndex:", @"setObjectBuffer:offset:atIndex:", @"setObjectBufferOffset:atIndex:",
+        @"setObjectBuffers:offsets:withRange:", @"setObjectTexture:atIndex:", @"setObjectTextures:withRange:",
+        @"setObjectSamplerState:atIndex:", @"setObjectSamplerStates:withRange:",
+        @"setObjectSamplerState:lodMinClamp:lodMaxClamp:atIndex:",
+        @"setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:", @"setObjectThreadgroupMemoryLength:atIndex:",
+        @"setMeshBytes:length:atIndex:", @"setMeshBuffer:offset:atIndex:", @"setMeshBufferOffset:atIndex:",
+        @"setMeshBuffers:offsets:withRange:", @"setMeshTexture:atIndex:", @"setMeshTextures:withRange:",
+        @"setMeshSamplerState:atIndex:", @"setMeshSamplerStates:withRange:",
+        @"setMeshSamplerState:lodMinClamp:lodMaxClamp:atIndex:", @"setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:",
+        @"drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
+        @"drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:",
+        @"drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"
+    ]);
 }
 
 // MTLDeviceSPI methods the base MTLIOAccelDevice leaves abstract; _MTLDevice initLimits queries them.
@@ -8192,6 +8271,12 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
                           sparsePageSize:(MTLSparsePageSize)pageSize
 {
     return MTLSizeMake(0, 0, 0);
+}
+
+// the base answers yes at draw, dispatch and blit boundaries, but has no counter set to sample
+- (BOOL)supportsCounterSampling:(MTLCounterSamplingPoint)point
+{
+    return NO;
 }
 
 @end
