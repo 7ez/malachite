@@ -37,6 +37,8 @@ struct airc_info {
     unsigned local_size;   // local memory a thread uses, bytes
     unsigned max_threads;  // threads a threadgroup may have at most, as the kernel declares (0: not said)
     unsigned barriers;
+    const unsigned char *data;  // the constant tables read from memory, data_size bytes
+    unsigned data_size;
 };
 
 // a function constant's specialised value, by its [[function_constant(index)]]

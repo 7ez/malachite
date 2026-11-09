@@ -1,9 +1,9 @@
-// Compiled-kernel bundle airc writes and the Metal plugin loads: this header, then sass_size bytes of SASS.
-// The plugin finds a function's bundle by its AIR bitCodeHash.
+// Compiled-kernel bundle airc writes and the Metal plugin loads: this header, then sass_size bytes of SASS, then
+// data_size bytes of constant data. The plugin finds a function's bundle by its AIR bitCodeHash.
 #pragma once
 #include <stdint.h>
 
-#define NVK_MAGIC 0x314b564e  // "NVK1"
+#define NVK_MAGIC 0x324b564e  // "NVK2"
 #define NVK_MAX_ARGS 64
 #define NVK_MAX_CONST_SAMPLERS 4
 #define NVK_CONST_SAMPLER_SLOT(i) (15 - (i))
@@ -70,6 +70,9 @@ enum nvk_arg_kind {
     // input reads ([[buffer(index)]]), filled like a buffer argument's
     NVK_ARG_STAGE_IN_REGION,
     NVK_ARG_STAGE_IN_BUFFER,
+    // a param at cbuf_off the loader points at the kernel's constant data (the constant tables it reads from
+    // memory), which it puts right after the code, sass_size bytes (a multiple of 16) into the code's buffer
+    NVK_ARG_DATA,
 };
 
 // a post-tessellation vertex function is the tessellation stage; the tessellation init stage before it is generated
@@ -113,6 +116,7 @@ struct nvk_header {
     uint32_t face_textures;  // the texture slots of cubes it reads or writes texels of, as layers of their faces
     uint32_t level_textures;  // those it writes texels of at a level that may not be the first (handle + level)
     uint32_t flags;  // NVK_FLAG_*
+    uint32_t data_size;
 };
 
 #define NVK_FLAG_PER_SAMPLE 1  // fragment: runs once a sample, reading [[sample_id]] or an input at the sample

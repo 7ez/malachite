@@ -75,6 +75,11 @@ static void finish(struct ir_func *f, struct airc_info *info, int print_ir, int 
         airc_remat(f);
     unsigned regs, size;
     k->sass = airc_back(f, info, &size, &regs);
+    if (info->data_size) {
+        k->sass = realloc(k->sass, size + info->data_size);
+        memcpy(k->sass + size, info->data, info->data_size);
+    }
+    k->h.data_size = info->data_size;
     k->h.magic = NVK_MAGIC;
     k->h.reg_count = regs;
     k->h.nargs = info->nargs;

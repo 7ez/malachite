@@ -38,6 +38,7 @@ struct ll_value {
     enum vkind kind;
     unsigned char undef;  // constant: 1 undef, 2 poison
     unsigned char zero;   // constant: an all-zero vector/aggregate
+    unsigned char constant;  // global variable: declared constant
     int type;
     int elty;  // a GEP's source element type, a global variable's value type; -1 otherwise
     LLVMOpcode op;
@@ -1550,6 +1551,7 @@ static void parse_module(struct ll_module *m, struct bits *b)
             v = define_value(m, V_GLOBAL, flags & 2 ? ptr_type(m, as) : ptr_to(m, elty, as));
             v->elty = elty;
             v->init = r.n > s + 2 ? (unsigned)r.ops[s + 2] : 0;
+            v->constant = flags & 1;
             add_global(m, v, &r);
             break;
         }
@@ -1884,6 +1886,11 @@ LLVMBool LLVMIsPoison(LLVMValueRef v)
 LLVMValueRef LLVMGetInitializer(LLVMValueRef g)
 {
     return g->kind == V_GLOBAL && g->init && g->init <= g->m->nvals ? g->m->vals[g->init - 1] : NULL;
+}
+
+LLVMBool LLVMIsGlobalConstant(LLVMValueRef g)
+{
+    return g->kind == V_GLOBAL && g->constant;
 }
 
 LLVMValueRef LLVMGetAggregateElement(LLVMValueRef c, unsigned i)

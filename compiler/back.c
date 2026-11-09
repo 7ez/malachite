@@ -1029,7 +1029,8 @@ static void find_uniform_bases(struct ir_func *f)
 // Each global address is followed back to the buffer argument it points into: a load qualifies when the AIR says
 // its buffer is only read and aliases no other argument, and no store or atomic here goes into it or anywhere not
 // traced to one buffer. A texture written may be a view of a buffer, so a kernel that writes one gets none. Kernels
-// only: every launch empties the cache, while draws in a pass may not.
+// only: every launch empties the cache, while draws in a pass may not. The shader's constant data is written once,
+// before it ever runs: its loads qualify in every stage.
 #define ROOT_NONE (-1)  // no address seen yet (a null pointer)
 #define ROOT_ANY (-2)   // one from memory or a parameter, or from more than one buffer
 static unsigned char *g_readonly_load;  // by IR id
@@ -1057,7 +1058,11 @@ static void find_readonly_loads(struct ir_func *f)
                 n = v->id + 1;
     free(g_readonly_load);
     g_readonly_load = calloc(n, 1);
-    if (g_info->stage != NVK_COMPUTE || !g_info->readonly_args)
+    int data = -1, buffers = g_info->stage == NVK_COMPUTE && g_info->readonly_args;
+    for (unsigned i = 0; i < g_info->nargs; i++)
+        if (g_info->args[i].kind == NVK_ARG_DATA)
+            data = g_info->args[i].cbuf_off;
+    if (!buffers && data < 0)
         return;
     int *root = malloc(n * sizeof(*root));
     for (int i = 0; i < n; i++)
@@ -1102,10 +1107,11 @@ static void find_readonly_loads(struct ir_func *f)
             else
                 written |= 1ull << a;
         }
-    for (struct ir_block *b = f->entry; b && !anywhere; b = b->next)
+    for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v; v = v->next) {
-            int a = v->op == IR_LDG && root[v->src[0]->id] >= 0 ? buffer_arg_at(root[v->src[0]->id]) : -1;
-            g_readonly_load[v->id] = a >= 0 && (g_info->readonly_args & ~written) >> a & 1;
+            int r = v->op == IR_LDG ? root[v->src[0]->id] : ROOT_ANY;
+            int a = r >= 0 && buffers && !anywhere ? buffer_arg_at(r) : -1;
+            g_readonly_load[v->id] = (r >= 0 && r == data) || (a >= 0 && (g_info->readonly_args & ~written) >> a & 1);
         }
     free(root);
 }

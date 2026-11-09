@@ -20,7 +20,7 @@ struct airc_arg_name {
 struct airc_kernel {
     struct nvk_header h;
     struct airc_arg_name arg_names[NVK_MAX_ARGS];  // beside h.args
-    unsigned char *sass;  // a graphics stage's SPH, then its code; malloc'd, the caller frees it
+    unsigned char *sass;  // a graphics stage's SPH, then its code, then its constant data; malloc'd, the caller frees it
     char name[64];
     char error[160];
     struct airc_varyings outputs;  // a vertex function's
