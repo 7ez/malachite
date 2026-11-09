@@ -1236,6 +1236,27 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
         destinationBytesPerImage:dstImage options:MTLBlitOptionNone];
 }
 
+// whole levels, each the source's size
+- (void)copyFromTexture:(id)src
+            sourceSlice:(NSUInteger)srcSlice
+            sourceLevel:(NSUInteger)srcLevel
+              toTexture:(id)dst
+       destinationSlice:(NSUInteger)dstSlice
+       destinationLevel:(NSUInteger)dstLevel
+             sliceCount:(NSUInteger)sliceCount
+             levelCount:(NSUInteger)levelCount
+{
+    id<MTLTexture> a = src;
+    for (NSUInteger l = 0; l < levelCount; l++) {
+        NSUInteger at = srcLevel + l;
+        MTLSize size = MTLSizeMake(MAX(a.width >> at, 1u), MAX(a.height >> at, 1u), MAX(a.depth >> at, 1u));
+        for (NSUInteger s = 0; s < sliceCount; s++)
+            [self copyFromTexture:src sourceSlice:srcSlice + s sourceLevel:at sourceOrigin:(MTLOrigin){ 0, 0, 0 }
+                       sourceSize:size toTexture:dst destinationSlice:dstSlice + s destinationLevel:dstLevel + l
+                destinationOrigin:(MTLOrigin){ 0, 0, 0 }];
+    }
+}
+
 // every level and slice the two have in common
 - (void)copyFromTexture:(id)src toTexture:(id)dst
 {
@@ -1243,11 +1264,8 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     NSUInteger levels = MIN(a.mipmapLevelCount, b.mipmapLevelCount);
     NSUInteger slices = MIN(((MalachiteTexture *)src)->_image ? ((MalachiteTexture *)src)->_layers : a.arrayLength,
                             ((MalachiteTexture *)dst)->_image ? ((MalachiteTexture *)dst)->_layers : b.arrayLength);
-    for (NSUInteger l = 0; l < levels; l++)
-        for (NSUInteger s = 0; s < slices; s++)
-            [self copyFromTexture:src sourceSlice:s sourceLevel:l sourceOrigin:(MTLOrigin){ 0, 0, 0 }
-                       sourceSize:MTLSizeMake(MAX(a.width >> l, 1u), MAX(a.height >> l, 1u), MAX(a.depth >> l, 1u))
-                        toTexture:dst destinationSlice:s destinationLevel:l destinationOrigin:(MTLOrigin){ 0, 0, 0 }];
+    [self copyFromTexture:src sourceSlice:0 sourceLevel:0 toTexture:dst destinationSlice:0 destinationLevel:0
+               sliceCount:slices levelCount:levels];
 }
 
 // a 3D region's slices are bytesPerImage apart in the buffer
