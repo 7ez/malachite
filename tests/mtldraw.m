@@ -146,10 +146,37 @@ int main(int argc, char **argv)
         for (int i = 0; i < H * (int)pitch; i++)
             if (abs(((const uint8_t *)rtbuf.contents)[i] - first[i]) > 1 && abad++ < 4)
                 printf("stage_in byte %d: got %d want %d\n", i, ((const uint8_t *)rtbuf.contents)[i], first[i]);
-        free(first);
         printf("stage_in %s (%d bytes differ from the first draw)\n", abad ? "MISMATCH" : "ok", abad);
-        pd.vertexDescriptor = nil;
         bad |= abad;
+
+        // and with the stride given as the buffer is bound, the vertices 24 bytes apart
+        id<MTLBuffer> spread = [dev newBufferWithLength:3 * 24 options:MTLResourceStorageModeShared];
+        for (int i = 0; i < 3; i++)
+            memcpy((uint8_t *)spread.contents + i * 24, &verts[i], sizeof verts[i]);
+        vd.layouts[0].stride = MTLBufferLayoutStrideDynamic;
+        pd.vertexDescriptor = vd;
+        id<MTLRenderPipelineState> wps = [dev newRenderPipelineStateWithDescriptor:pd error:&err];
+        if (!wps) {
+            printf("dynamic stride: no pipeline: %s\n", err.localizedDescription.UTF8String);
+            return 1;
+        }
+        memset(rtbuf.contents, 0xee, pitch * H);
+        cmd = [q commandBuffer];
+        enc = [cmd renderCommandEncoderWithDescriptor:rp];
+        [enc setRenderPipelineState:wps];
+        [enc setVertexBuffer:spread offset:0 attributeStride:24 atIndex:0];
+        [enc drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        int wbad = 0;
+        for (int i = 0; i < H * (int)pitch; i++)
+            if (abs(((const uint8_t *)rtbuf.contents)[i] - first[i]) > 1 && wbad++ < 4)
+                printf("dynamic stride byte %d: got %d want %d\n", i, ((const uint8_t *)rtbuf.contents)[i], first[i]);
+        free(first);
+        printf("dynamic stride %s (%d bytes differ from the first draw)\n", wbad ? "MISMATCH" : "ok", wbad);
+        pd.vertexDescriptor = nil;
+        bad |= wbad;
 
         // a fullscreen pass whose fragment shader copies a pattern texture by its pixel position
         pd.vertexFunction = [lib newFunctionWithName:@"vfull"];

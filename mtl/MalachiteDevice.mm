@@ -1452,6 +1452,8 @@ enum { MALACHITE_CL_FIRST = 3 };  // the buffer index OpenCL's renderer binds a 
 - (instancetype)initWithDevice:(id)device pipelineStateDescriptor:(id)descriptor;
 @end
 
+#define MALACHITE_DYNAMIC_STRIDE UINT32_MAX  // a layout's MTLBufferLayoutStrideDynamic
+
 @interface MalachiteRenderPipelineState : _MTLRenderPipelineState {
 @public
     struct nvk_header _vertex, _fragment;
@@ -1459,7 +1461,8 @@ enum { MALACHITE_CL_FIRST = 3 };  // the buffer index OpenCL's renderer binds a 
     uint32_t _write_mask[8], _blend[8][7];  // each colour attachment's, as nvgpu_draw carries them
     uint32_t _alpha_control;                // alpha to coverage and to one, as nvgpu_draw carries them
     uint32_t _attributes[32];         // the vertex descriptor's attributes, as nvgpu_draw carries them
-    uint32_t _strides[16];            // its layouts: the stride of the vertex buffer each stream reads, or 0
+    uint32_t _strides[16];            // its layouts: the stride of the vertex buffer each stream reads, or 0, or
+                                      // MALACHITE_DYNAMIC_STRIDE for the one it's bound with
     uint32_t _divisors[16];           // and the instances per step, 0 for a buffer read per vertex
     uint8_t _stream_buffer[16];       // the vertex buffer each stream reads
     int _zero_stream;                 // 1 + the stream that reads zeros for attributes it can't fetch, 0 for none
@@ -2719,6 +2722,30 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
         [self setBuffer:buffers[i] offset:offsets[i] atIndex:range.location + i];
 }
 
+// the strides are compiled into a stage-in kernel, which refuses a layout whose stride is dynamic
+- (void)setBuffer:(id)buffer offset:(NSUInteger)offset attributeStride:(NSUInteger)stride atIndex:(NSUInteger)index
+{
+    [self setBuffer:buffer offset:offset atIndex:index];
+}
+
+- (void)setBufferOffset:(NSUInteger)offset attributeStride:(NSUInteger)stride atIndex:(NSUInteger)index
+{
+    [self setBufferOffset:offset atIndex:index];
+}
+
+- (void)setBuffers:(const id __unsafe_unretained *)buffers
+           offsets:(const NSUInteger *)offsets
+  attributeStrides:(const NSUInteger *)strides
+         withRange:(NSRange)range
+{
+    [self setBuffers:buffers offsets:offsets withRange:range];
+}
+
+- (void)setBytes:(const void *)bytes length:(NSUInteger)length attributeStride:(NSUInteger)stride atIndex:(NSUInteger)index
+{
+    [self setBytes:bytes length:length atIndex:index];
+}
+
 - (void)enableNullBufferBinds:(BOOL)enable
 {
 }
@@ -3322,6 +3349,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     uint64_t _vbuffers[31], _fbuffers[31];
     uint32_t _vsizes[31];  // bytes from each vertex buffer's offset to its end
     uint32_t _fsizes[31];  // and fragment buffer's, for the recorder
+    uint32_t _vstrides[31];  // each vertex buffer's stride as bound, for a layout whose stride is dynamic
     __unsafe_unretained id _vbound[31], _fbound[31];  // the buffers, for set*BufferOffset (kept by the command buffer)
     MTLRenderPassDescriptor *_rpd;  // the recorder's: the pass as asked for
     __unsafe_unretained id _textures[MALACHITE_BINDINGS];  // the fragment stage's, by Metal index
@@ -3615,6 +3643,36 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 {
     for (NSUInteger i = 0; i < range.length; i++)
         [self setVertexBuffer:buffers[i] offset:offsets[i] atIndex:range.location + i];
+}
+
+- (void)setVertexBuffer:(id)buffer offset:(NSUInteger)offset attributeStride:(NSUInteger)stride atIndex:(NSUInteger)index
+{
+    if (index < 31)
+        _vstrides[index] = (uint32_t)stride;
+    [self setVertexBuffer:buffer offset:offset atIndex:index];
+}
+
+- (void)setVertexBufferOffset:(NSUInteger)offset attributeStride:(NSUInteger)stride atIndex:(NSUInteger)index
+{
+    if (index < 31)
+        [self setVertexBuffer:_vbound[index] offset:offset attributeStride:stride atIndex:index];
+}
+
+- (void)setVertexBuffers:(const id __unsafe_unretained *)buffers
+                 offsets:(const NSUInteger *)offsets
+        attributeStrides:(const NSUInteger *)strides
+               withRange:(NSRange)range
+{
+    for (NSUInteger i = 0; i < range.length; i++)
+        [self setVertexBuffer:buffers[i] offset:offsets[i] attributeStride:strides[i] atIndex:range.location + i];
+}
+
+- (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length attributeStride:(NSUInteger)stride
+               atIndex:(NSUInteger)index
+{
+    if (index < 31)
+        _vstrides[index] = (uint32_t)stride;
+    [self setVertexBytes:bytes length:length atIndex:index];
 }
 
 - (void)setFragmentBuffers:(const id __unsafe_unretained *)buffers
@@ -4270,7 +4328,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
             continue;
         unsigned b = _pipeline->_stream_buffer[s];
         d.streams[s].addr = _vbuffers[b];
-        d.streams[s].stride = _pipeline->_strides[s];
+        d.streams[s].stride = _pipeline->_strides[s] == MALACHITE_DYNAMIC_STRIDE ? _vstrides[b] : _pipeline->_strides[s];
         d.streams[s].size = _vsizes[b];
         d.streams[s].divisor = _pipeline->_divisors[s];
         // a stream whose buffer isn't bound would leave its attributes fetching from address 0, which faults the
@@ -7545,6 +7603,10 @@ static const struct airc_stage_in *malachite_stage_in(MTLStageInputOutputDescrip
             *why = [NSString stringWithFormat:@"stage input attribute %u: format %lu", loc, (unsigned long)a.format];
             return NULL;
         }
+        if (l.stride == MTLBufferLayoutStrideDynamic) {
+            *why = [NSString stringWithFormat:@"stage input buffer %lu: dynamic stride", (unsigned long)a.bufferIndex];
+            return NULL;
+        }
         out->attrs[loc] = (struct airc_tess_attr){ f, (uint32_t)a.bufferIndex, (uint32_t)a.offset, (uint32_t)l.stride,
                                                    (uint32_t)l.stepFunction, (uint32_t)l.stepRate };
         any = true;
@@ -7850,7 +7912,8 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
         state->_attributes[i] = (uint32_t)stream | (uint32_t)a.offset << 7 | f;
         MTLVertexBufferLayoutDescriptor *l = vd.layouts[a.bufferIndex];
         state->_stream_buffer[stream] = (uint8_t)a.bufferIndex;
-        state->_strides[stream] = (uint32_t)l.stride;
+        state->_strides[stream] =
+            l.stride == MTLBufferLayoutStrideDynamic ? MALACHITE_DYNAMIC_STRIDE : (uint32_t)l.stride;
         // a constant buffer is a per-instance one that never steps
         state->_divisors[stream] = l.stepFunction == MTLVertexStepFunctionPerInstance ? (uint32_t)l.stepRate
                                    : l.stepFunction == MTLVertexStepFunctionConstant ? UINT32_MAX
