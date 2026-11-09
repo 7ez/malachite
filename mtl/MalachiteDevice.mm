@@ -6020,6 +6020,18 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
     return [self computeCommandEncoder];
 }
 
+// The base's would make its own encoders, whose segments in the command storage ours don't expect: Chromium's GPU
+// process crashed at its first commit. Counter sample attachments are dropped: the device samples no counters.
+- (id)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)descriptor
+{
+    return [self computeCommandEncoder];
+}
+
+- (id)blitCommandEncoderWithDescriptor:(MTLBlitPassDescriptor *)descriptor
+{
+    return [self blitCommandEncoder];
+}
+
 - (id)renderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)descriptor
 {
     if (malachite_snap_gate) {
