@@ -66,6 +66,8 @@
 - (void)presentDrawable:(id<MTLDrawable>)drawable atTime:(CFTimeInterval)time;
 - (void)presentDrawable:(id<MTLDrawable>)drawable afterMinimumDuration:(CFTimeInterval)duration;
 - (void)getCurrentKernelCommandBufferPointer:(void **)cur end:(void **)end;
+- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value;
+- (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value;
 @end
 
 @interface MalachiteCommandBuffer : MTLIOAccelCommandBuffer <MTLCommandBuffer> {
@@ -5937,6 +5939,22 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
         malachite_upload_managed(self);
     }
     [super commit];
+}
+
+// The base writes its own commands for these and ends the storage's segment, which left ours to end a segment that
+// was gone (Chromium's GPU process crashed at commit): the draws before go first, in a segment closed here.
+- (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value
+{
+    malachite_run_flush(self);
+    malachite_end_segment(self);
+    [super encodeSignalEvent:event value:value];
+}
+
+- (void)encodeWaitForEvent:(id<MTLEvent>)event value:(uint64_t)value
+{
+    malachite_run_flush(self);
+    malachite_end_segment(self);
+    [super encodeWaitForEvent:event value:value];
 }
 
 // WindowServer's every frame. The base enqueues before it commits, which would send the upload to the queue that's
