@@ -221,6 +221,16 @@ private func copyPayload(_ pkg: String, efi: String?, legacy: Bool, saved: [Stri
     say("  Malachite.kext (rebuilding the kext collection, takes a minute)")
     try rebuildCollection(steps, say: say)
 
+    // the driver works without it, so a failure here doesn't stop the install
+    if rootPatchState()["on"] != "0" {
+        do {
+            try patchRoot(steps: steps, say: say)
+        } catch {
+            say("  ! System volume not patched, so browsers draw WebGL, video and canvas on the CPU. "
+                + ((error as? Failure)?.message ?? error.localizedDescription))
+        }
+    }
+
     if let efi, o.editEFI {
         try editOpenCore(efi: efi, o, keepBar: legacy, steps: steps, say: say)
     }
@@ -351,6 +361,10 @@ func uninstall(_ o: UninstallOptions, say: @escaping Say) -> Bool {
     let efi = found?.path
     let steps = Steps(dry: o.dryRun, say: say)
     do {
+        // first, so a failure leaves everything in place to try again
+        if exists(systemBundle) || rootPatchState()["patched"] != nil {
+            try unpatchRoot(steps: steps, say: say)
+        }
         var paths = [
             "/Library/GPUBundles/MalachiteMetal.bundle", "/Library/GPUBundles/MalachiteMetal.bundle.new",
             "/Library/Video/Plug-Ins/NVVideo.bundle", "/Library/Video/Plug-Ins/NVVideo.bundle.new",

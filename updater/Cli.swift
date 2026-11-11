@@ -81,6 +81,28 @@ private func uninstallMode(_ args: [String]) -> Int32 {
     return uninstall(o, say: say) ? 0 : 1
 }
 
+// --root-patch puts the Metal driver on the system volume for browsers again, after a macOS update or once turned
+// off; --remove-root-patch takes it away, and installs leave it off from then on
+private func rootPatchMode(_ flag: String, _ args: [String]) -> Int32 {
+    guard requireRoot(flag, say: say) else { return 1 }
+    var dry = false
+    for arg in args {
+        guard arg == "--dry-run" else { return usage("unknown option \(arg)") }
+        dry = true
+    }
+    let steps = Steps(dry: dry, say: say)
+    do {
+        let changed = flag == "--root-patch" ? try patchRoot(steps: steps, say: say) : try unpatchRoot(steps: steps, say: say)
+        if changed {
+            say("Restart to finish.")
+        }
+        return 0
+    } catch {
+        say((error as? Failure)?.message ?? error.localizedDescription)
+        return 1
+    }
+}
+
 private func collectMode(_ dir: String) -> Int32 {
     do {
         _ = try collectLogs(into: dir, say: say)
@@ -133,6 +155,7 @@ func cli(_ args: [String]) -> Int32? {
     switch args[1] {
     case "--install": return installMode(rest)
     case "--uninstall": return uninstallMode(rest)
+    case "--root-patch", "--remove-root-patch": return rootPatchMode(args[1], rest)
     case "--check": return runChecks(say: say) ? 0 : 1
     // the app that installs is often a copy in Downloads, and a login item has to be registered by the app it launches
     case "--login-item": return (try? SMAppService.mainApp.register()) == nil ? 1 : 0
