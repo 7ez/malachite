@@ -112,6 +112,101 @@ static int stats_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req
 SYSCTL_PROC(_kern, OID_AUTO, malachite_stats, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, nullptr, 0, stats_sysctl, "S",
             "what the NVIDIA driver's GPU calls cost");
 
+// What the primitive engine fetches for a draw, as the methods last set it: each attribute's SET_VERTEX_ATTRIBUTE_A,
+// each stream's format (on with bit 12), address and size, and the index buffer. A stream turned off keeps its
+// address, and one never set reads from 0. PE_UNKNOWN marks a stream whose state the log doesn't know.
+struct pe_state {
+    uint32_t attributes[RENDER_ATTRIBUTES];
+    uint32_t format[RENDER_STREAMS], size[RENDER_STREAMS];
+    uint64_t addr[RENDER_STREAMS];
+    uint64_t index;
+    uint32_t index_size;
+};
+static const uint32_t PE_UNKNOWN = ~0u;
+static const uint32_t PE_STREAM_ON = 1u << 12;
+
+static void pe_unknown(pe_state *s)
+{
+    for (uint32_t i = 0; i < RENDER_ATTRIBUTES; i++)
+        s->attributes[i] = ATTR_INACTIVE;
+    for (uint32_t j = 0; j < RENDER_STREAMS; j++) {
+        s->format[j] = PE_UNKNOWN;
+        s->size[j] = 0;
+        s->addr[j] = 0;
+    }
+    s->index = ~0ull;
+    s->index_size = 0;
+}
+
+// as build_draw (core/render.c) sets it
+static void pe_draw(pe_state *s, const struct render_draw *r)
+{
+    pe_unknown(s);
+    for (uint32_t i = 0; i < RENDER_ATTRIBUTES; i++)
+        s->attributes[i] = r->attributes[i] ? r->attributes[i] : ATTR_INACTIVE | ATTR_R32G32B32A32_FLOAT;
+    for (uint32_t j = 0; j < RENDER_STREAMS; j++) {
+        s->format[j] = r->streams[j].addr ? r->streams[j].stride | PE_STREAM_ON : 0;
+        s->addr[j] = r->streams[j].addr;
+        s->size[j] = r->streams[j].size;
+    }
+    s->index = r->index;
+    s->index_size = r->index_size;
+}
+
+// a method of a run applied to s: 1 for a draw of vertices, 2 for an indexed one, else 0
+static int pe_method(pe_state *s, uint32_t m, uint32_t v)
+{
+    if (m >= R_SET_VERTEX_ATTRIBUTE_A(0) && m < R_SET_VERTEX_ATTRIBUTE_A(RENDER_ATTRIBUTES)) {
+        s->attributes[(m - R_SET_VERTEX_ATTRIBUTE_A(0)) / 4] = v;
+    } else if (m >= R_SET_VERTEX_STREAM_A_FORMAT(0) && m < R_SET_VERTEX_STREAM_A_FORMAT(RENDER_STREAMS)) {
+        uint32_t j = (m - R_SET_VERTEX_STREAM_A_FORMAT(0)) / 16, k = m % 16 / 4;
+        if (k == 0)
+            s->format[j] = v;
+        else if (k == 1)
+            s->addr[j] = (uint64_t)v << 32 | (uint32_t)s->addr[j];
+        else if (k == 2)
+            s->addr[j] = (s->addr[j] & ~0xffffffffull) | v;
+    } else if (m >= R_SET_VERTEX_STREAM_SIZE_A(0) && m < R_SET_VERTEX_STREAM_SIZE_A(RENDER_STREAMS)) {
+        if (m % 8)
+            s->size[(m - R_SET_VERTEX_STREAM_SIZE_A(0)) / 8] = v;
+    } else if (m == R_SET_INDEX_BUFFER_A) {
+        s->index = (uint64_t)v << 32 | (uint32_t)s->index;
+    } else if (m == R_SET_INDEX_BUFFER_A + 4) {
+        s->index = (s->index & ~0xffffffffull) | v;
+    } else if (m == R_SET_INDEX_BUFFER_SIZE_A + 4) {
+        s->index_size = v;
+    } else if (m == R_DRAW_VERTEX_ARRAY_BEGIN_END_A + 4) {
+        return 1;
+    } else if (m == R_DRAW_INDEX_BUFFER_BEGIN_END_A + 4) {
+        return 2;
+    }
+    return 0;
+}
+
+// what makes a draw from s fetch from nowhere, in a few words; false when nothing does
+static bool pe_wrong(const pe_state *s, bool indexed, char *why, size_t n)
+{
+    for (uint32_t i = 0; i < RENDER_ATTRIBUTES; i++) {
+        uint32_t a = s->attributes[i], j = a & 0x1f;
+        if (a & ATTR_INACTIVE)
+            continue;
+        if (j >= RENDER_STREAMS || !(s->format[j] & PE_STREAM_ON)) {
+            snprintf(why, n, "attribute %u reads stream %u, which is off", i, j);
+            return true;
+        }
+    }
+    for (uint32_t j = 0; j < RENDER_STREAMS; j++)
+        if (s->format[j] != PE_UNKNOWN && (s->format[j] & PE_STREAM_ON) && s->addr[j] < 0x1000) {
+            snprintf(why, n, "stream %u is on at %#llx", j, (unsigned long long)s->addr[j]);
+            return true;
+        }
+    if (indexed && s->index < 0x1000) {
+        snprintf(why, n, "its index buffer is at %#llx", (unsigned long long)s->index);
+        return true;
+    }
+    return false;
+}
+
 // A GPU context: an RM client with an address space of its own, and on it a copy channel and a graphics channel
 // (3D and compute) with the memory their launches use. Each is made when first wanted.
 struct gpu_ctx {
@@ -184,14 +279,17 @@ struct gpu_ctx {
     uint64_t pass_vs, pass_ps, pass_ti, pass_ts;  // and its shaders
     volatile uint32_t *compute_sem;
     uint32_t compute_seq;
-    // the last launches, for the log when the channel faults
+    // the last launches and runs, oldest first from launch_next, for the log when the channel faults
     struct launch_log {
         uint32_t seq, groups[3], block[3], regs;
         uint64_t prog, vs;  // a draw's vs, and its ps in prog
         uint64_t params[4];  // its first two shader argument words, of the vs then the ps
         uint64_t target, zt;  // a draw's colour and depth targets
-        uint64_t index, streams[4];  // and what its primitive engine fetches: index buffer, first vertex streams
-    } launches[8];
+        pe_state pe;  // what a draw's primitive engine fetches
+        uint64_t run_va;  // a run of the plugin's: its methods, words and draws (run_words 0 for anything else)
+        uint32_t run_words, run_draws;
+    } launches[16];
+    unsigned launch_next;
     uint64_t busy_since;  // when its outstanding graphics work began (time_us), 0 when none is
     uint64_t busy_unbilled;  // its busy time Accelerator has not yet charged to the task (NVGPU_FN_CTX_BUSY)
     bool compute_ready;
@@ -402,6 +500,62 @@ class Gpu : public IOService
                         w[2], w[3], w[4], w[5], w[6], w[7]);
             }
             return;
+        }
+    }
+    // A run of the plugin's applied to s from the methods in its memory: the first of its draws that fetches from
+    // nowhere, as "draw n of it: why" in out, or what kept it from being read; empty when none does
+    void decode_run(gpu_ctx *c, uint64_t va, uint32_t words, pe_state *s, char *out, size_t n)
+    {
+        *out = 0;
+        const gpu_mapping *m = nullptr;
+        for (int j = 0; j < gpu_maps_top && !m; j++)
+            if (gpu_maps[j].ctx == c && gpu_maps[j].va && gpu_maps[j].va <= va &&
+                va + words * 4ull <= gpu_maps[j].va + gpu_maps[j].dma.size && gpu_maps[j].dma.handle)
+                m = &gpu_maps[j];
+        if (!m) {
+            pe_unknown(s);
+            snprintf(out, n, "its methods aren't in a mapping of system memory");
+            return;
+        }
+        uint32_t w[64], left = 0, op = 0, mthd = 0, draws = 0;
+        for (uint32_t i = 0; i < words; i++) {
+            if (i % 64 == 0) {
+                uint32_t k = words - i < 64 ? words - i : 64;
+                if (((IOMemoryDescriptor *)m->dma.handle)->readBytes(va - m->va + i * 4ull, w, k * 4) != k * 4) {
+                    pe_unknown(s);
+                    snprintf(out, n, "word %u can't be read", i);
+                    return;
+                }
+            }
+            uint32_t v = w[i % 64];
+            int drawn = 0;
+            if (!left) {
+                // INC_METHOD, NON_INC_METHOD, IMMD_DATA_METHOD and ONE_INC as the host class has them
+                op = v >> 29;
+                mthd = (v & 0xfff) << 2;
+                if (op == 4)
+                    drawn = pe_method(s, mthd, v >> 16 & 0x1fff);
+                else if (op == 1 || op == 3 || op == 5)
+                    left = v >> 16 & 0x1fff;
+                else {
+                    pe_unknown(s);
+                    snprintf(out, n, "word %u is no method header: %#x", i, v);
+                    return;
+                }
+            } else {
+                drawn = pe_method(s, mthd, v);
+                left--;
+                if (op == 1 || op == 5)
+                    mthd += 4;
+                if (op == 5)
+                    op = 3;
+            }
+            if (!drawn)
+                continue;
+            draws++;
+            char why[64];
+            if (!*out && pe_wrong(s, drawn == 2, why, sizeof(why)))
+                snprintf(out, n, "draw %u of it: %s", draws, why);
         }
     }
     // Every context's mappings, in a table that doubles when full (a Metal process can hold tens of thousands of
@@ -674,6 +828,12 @@ class Gpu : public IOService
             c->compute_ch.push_off = PUSH_SIZE;
         c->draws_queued = 0;
         c->draw_pending = c->compute_seq;
+        gpu_ctx::launch_log &l = c->launches[c->launch_next++ % 16];
+        l = {};
+        l.seq = c->compute_seq;
+        l.run_va = p->va;
+        l.run_words = p->words;
+        l.run_draws = p->draws;
         issued(c);
         return kIOReturnSuccess;
     }
@@ -2992,8 +3152,23 @@ void Gpu::recover(gpu_ctx *c)
                     return 'm';
             return 'X';
         };
-        for (const auto &l : c->launches) {
-            if (!l.seq || (int32_t)(l.seq - *c->compute_sem) <= 0)
+        // oldest first, with what the primitive engine fetches carried from each draw through the runs after it
+        pe_state pe;
+        pe_unknown(&pe);
+        for (unsigned k = c->launch_next > 16 ? c->launch_next - 16 : 0; k < c->launch_next; k++) {
+            const auto &l = c->launches[k % 16];
+            bool pending = l.seq && (int32_t)(l.seq - *c->compute_sem) > 0;
+            char why[96];
+            if (l.run_words) {
+                decode_run(c, l.run_va, l.run_words, &pe, why, sizeof(why));
+                if (pending)
+                    log_msg("Malachite:   not done: run %u of %u draws, %u words at %#llx%s%s\n", l.seq, l.run_draws,
+                            l.run_words, (unsigned long long)l.run_va, *why ? ": " : "", why);
+                continue;
+            }
+            if (l.vs)
+                pe = l.pe;
+            if (!pending)
                 continue;
             log_msg("Malachite:   not done: %s %u of program %#llx%s, %ux%ux%u groups of %ux%ux%u, %u regs\n",
                         l.vs ? "draw" : "dispatch", l.seq, (unsigned long long)l.prog, l.vs ? " (vs after)" : "", l.groups[0],
@@ -3005,11 +3180,22 @@ void Gpu::recover(gpu_ctx *c)
                         (unsigned long long)l.params[2], (unsigned long long)l.params[3], (unsigned long long)l.target,
                         (unsigned long long)l.zt, mapped(l.prog), mapped(l.vs), mapped(l.params[0]),
                         mapped(l.params[1]), mapped(l.params[2]), mapped(l.params[3]), mapped(l.target), mapped(l.zt));
-            if (l.vs)
-                log_msg("Malachite:     vs %#llx, index %#llx, streams %#llx %#llx %#llx %#llx\n",
-                        (unsigned long long)l.vs, (unsigned long long)l.index, (unsigned long long)l.streams[0],
-                        (unsigned long long)l.streams[1], (unsigned long long)l.streams[2],
-                        (unsigned long long)l.streams[3]);
+            if (l.vs) {
+                // each stream on as stream:address/stride/size, and the streams the active attributes read
+                char streams[200] = "";
+                uint32_t reads = 0;
+                for (uint32_t j = 0, n = 0; j < RENDER_STREAMS && n < sizeof(streams); j++)
+                    if (l.pe.format[j] & PE_STREAM_ON)
+                        n += snprintf(streams + n, sizeof(streams) - n, " %u:%#llx/%u/%#x", j,
+                                      (unsigned long long)l.pe.addr[j], l.pe.format[j] & 0xfff, l.pe.size[j]);
+                for (uint32_t a : l.pe.attributes)
+                    if (!(a & ATTR_INACTIVE))
+                        reads |= 1u << (a & 0x1f);
+                bool wrong = pe_wrong(&l.pe, l.pe.index != 0, why, sizeof(why));
+                log_msg("Malachite:     vs %#llx, index %#llx+%#x, streams%s, attributes read streams %#x%s%s\n",
+                        (unsigned long long)l.vs, (unsigned long long)l.pe.index, l.pe.index_size,
+                        *streams ? streams : " none", reads, wrong ? ": " : "", wrong ? why : "");
+            }
             if (l.seq == *c->compute_sem + 1) {
                 log_msg("Malachite:   the first one's code, ps or program then vs\n");
                 log_code(l.prog);
@@ -3264,8 +3450,8 @@ IOReturn Gpu::gpu_dispatch(gpu_ctx *c, const struct nvgpu_dispatch *d)
                                          0x80, 0, (uint16_t)block[0], (uint16_t)MIN(grid[0], 65535u) };
         compute_qmd_set_stamp((uint32_t *)(slot_cpu + 0x1000), c->prof_va + (i % PROF_RING) * 16, i + 1);
     }
-    c->launches[payload % 8] = { payload, { grid[0], grid[1], grid[2] }, { block[0], block[1], block[2] }, d->reg_count,
-                                 d->prog_va, 0 };
+    c->launches[c->launch_next++ % 16] = { payload, { grid[0], grid[1], grid[2] }, { block[0], block[1], block[2] },
+                                           d->reg_count, d->prog_va, 0 };
     compute_launch(&c->compute_ch, qmdva);
     issued(c);
     c->dispatch_slot_seq[slot] = c->draw_pending = payload;
@@ -3606,14 +3792,13 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
         render_stamp(&c->compute_ch, c->prof_va + (i % PROF_RING) * 16, i + 1);
         chan_kick(&c->compute_ch);
     }
-    c->launches[c->compute_seq % 8] = { c->compute_seq, { r.count, r.instances, 0 }, {}, d->vs_regs, r.ps, r.vs };
-    __builtin_memcpy(c->launches[c->compute_seq % 8].params, d->vs_params, 16);
-    __builtin_memcpy(c->launches[c->compute_seq % 8].params + 2, d->ps_params, 16);
-    c->launches[c->compute_seq % 8].target = d->target;
-    c->launches[c->compute_seq % 8].zt = d->zt;
-    c->launches[c->compute_seq % 8].index = r.index;
-    for (unsigned s = 0; s < 4; s++)
-        c->launches[c->compute_seq % 8].streams[s] = r.streams[s].addr;
+    gpu_ctx::launch_log &l = c->launches[c->launch_next++ % 16];
+    l = { c->compute_seq, { r.count, r.instances, 0 }, {}, d->vs_regs, r.ps, r.vs };
+    __builtin_memcpy(l.params, d->vs_params, 16);
+    __builtin_memcpy(l.params + 2, d->ps_params, 16);
+    l.target = d->target;
+    l.zt = d->zt;
+    pe_draw(&l.pe, &r);
     issued(c);
     c->draw_slot_seq[slot] = c->draw_pending = c->compute_seq;
     return kIOReturnSuccess;
