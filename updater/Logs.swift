@@ -95,6 +95,12 @@ func collectLogs(into dir: String, say: Say) throws -> String {
     system += logText("/usr/sbin/nvram", ["boot-args"])
     system += logText("/usr/bin/csrutil", ["status"])
     system += "\n"
+    system += logText("/usr/bin/csrutil", ["authenticated-root", "status"])
+    system += keep(logText("/usr/sbin/diskutil", ["info", "/"]), containing: ["Device Identifier", "Snapshot", "Sealed"])
+    system += logText("/bin/ls", ["-ld", gpuBundle, systemBundle])
+    system += "\(rootPatchFile):\n" + ((try? String(contentsOfFile: rootPatchFile, encoding: .utf8)) ?? "none\n")
+    system += keep(logText("/usr/sbin/ioreg", ["-l", "-w0", "-r", "-c", "IOAccelerator"]), containing: ["MetalPluginName"])
+    system += rootPatchSummary() + "\n\n"
     system += keep(logText("/usr/sbin/kextstat", []), containing: ["pl.aochi", "IOAccelerator", "IOGraphics"])
     system += "\n"
     system += keep(logText("/usr/bin/kmutil", ["showloaded", "--collection", "aux"]), first: 40)
