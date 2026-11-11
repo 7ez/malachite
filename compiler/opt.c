@@ -160,6 +160,15 @@ static int fold(struct ir_func *f, struct ir_val *v)
             return 1;
         }
     }
+    // a global access at a constant element (an unrolled loop's): its offset in the access, as the front end has it
+    if ((v->op == IR_LDG || v->op == IR_STG) && x->op == IR_ADDR && x->src[1]->op == IR_CONST) {
+        int64_t k = x->aux ? (int32_t)x->src[1]->imm : (uint32_t)x->src[1]->imm, imm = v->imm + k * x->imm;
+        if (imm >= -(1 << 23) && imm < (1 << 23) - 256) {
+            v->src[0] = x->src[0];
+            v->imm = imm;
+            return 1;
+        }
+    }
     if (v->op == IR_SEL && x->op == IR_CONST) {
         replace_all(f, v, x->imm ? v->src[1] : v->src[2]);
         return 1;
