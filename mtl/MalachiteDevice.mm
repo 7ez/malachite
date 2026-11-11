@@ -987,7 +987,9 @@ static void malachite_image_added(const struct mach_header *mh, intptr_t slide)
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             malachite_register_video();
         });
-    if (malachite_ends_with(name, "/libGLESv2.dylib") || malachite_ends_with(name, "/libEGL.dylib"))
+    // libANGLE-shared is the system web engine's copy, in its GPU process
+    if (malachite_ends_with(name, "/libGLESv2.dylib") || malachite_ends_with(name, "/libEGL.dylib") ||
+        malachite_ends_with(name, "/libANGLE-shared.dylib"))
         malachite_angle_override();
 }
 
