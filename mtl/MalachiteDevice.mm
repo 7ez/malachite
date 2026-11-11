@@ -403,24 +403,6 @@ static size_t malachite_gob_offset(uint32_t pitch, size_t x, size_t y)
 
 // a region of one surface (in blocks) to or from rows of bytes on the CPU; block-linear ones 16 bytes (a sector's
 // run) at a time
-// a range of one buffer's bytes over another's, by the GPU, waited for: how the CPU reaches a texture kept in VRAM
-static bool malachite_gpu_copy(id<MTLBuffer> from, NSUInteger from_off, id<MTLBuffer> to, NSUInteger to_off,
-                               NSUInteger size)
-{
-    static id<MTLCommandQueue> queue;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        queue = [from.device newCommandQueue];
-    });
-    id<MTLCommandBuffer> cb = [queue commandBuffer];
-    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-    [blit copyFromBuffer:from sourceOffset:from_off toBuffer:to destinationOffset:to_off size:size];
-    [blit endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
-    return cb.status == MTLCommandBufferStatusCompleted;
-}
-
 static void malachite_copy_sub(uint8_t *pixels, const struct malachite_sub *s, size_t x0, size_t y0, size_t w, size_t h,
                            uint8_t *bytes, NSUInteger stride, bool in)
 {
@@ -1065,6 +1047,8 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
         w = dw;
         h = dh;
     }
+    // the levels went in by blits, which mark them as an app's own
+    objc_setAssociatedObject(t->_backing, &malachite_mips_key, nil, OBJC_ASSOCIATION_RETAIN);
     free(cur);
     free(next);
 }
@@ -1780,40 +1764,54 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
 - (void)copyRegion:(MTLRegion)region level:(NSUInteger)level slice:(NSUInteger)slice bytes:(uint8_t *)bytes
             stride:(NSUInteger)stride image:(NSUInteger)image in:(bool)in
 {
-    // a texture in VRAM: through a copy the GPU makes of the surfaces the region is in, put back after a write. A
-    // private buffer can still have pages the CPU maps, which the GPU never reads: GL's textures written there (all
-    // of Unigine's and Source's) were sampled as zeros
-    id<MTLBuffer> backing = _backing, staging = nil;
+    id<MTLBuffer> backing = _backing;
     uint8_t *pixels = (uint8_t *)backing.contents;
-    NSUInteger lo = 0, hi = 0;
-    if (!pixels || backing.storageMode == MTLStorageModePrivate) {
-        lo = backing.length;
-        for (NSUInteger z = 0; z < region.size.depth; z++) {
-            struct malachite_sub s;
-            if (!malachite_sub(self, level, slice, region.origin.z + z, &s))
-                break;
-            lo = MIN(lo, s.offset);
-            hi = MAX(hi, s.offset + (NSUInteger)s.pitch * (s.rows ? s.rows : s.height));
-        }
-        hi = MIN(hi, backing.length);
-        if (lo >= hi)
-            return;
-        staging = [backing.device newBufferWithLength:hi - lo options:MTLResourceStorageModeShared];
-        if (!staging || !malachite_gpu_copy(backing, lo, staging, 0, hi - lo))
-            return;
-        pixels = (uint8_t *)staging.contents;
+    struct malachite_sub s;
+    if (!malachite_sub(self, level, slice, region.origin.z, &s))
+        return;
+    NSUInteger w = (region.size.width + s.block - 1) / s.block, h = (region.size.height + s.block - 1) / s.block;
+    if (pixels && backing.storageMode != MTLStorageModePrivate) {
+        for (NSUInteger z = 0; z < region.size.depth && malachite_sub(self, level, slice, region.origin.z + z, &s); z++)
+            malachite_copy_sub(pixels, &s, region.origin.x / s.block, region.origin.y / s.block, w, h,
+                               bytes + z * image, stride, in);
+        return;
     }
-    for (NSUInteger z = 0; z < region.size.depth; z++) {
-        struct malachite_sub s;
-        if (!malachite_sub(self, level, slice, region.origin.z + z, &s))
-            break;
-        s.offset -= lo;
-        malachite_copy_sub(pixels, &s, region.origin.x / s.block, region.origin.y / s.block,
-                       (region.size.width + s.block - 1) / s.block, (region.size.height + s.block - 1) / s.block,
-                       bytes + z * image, stride, in);
-    }
-    if (staging && in)
-        malachite_gpu_copy(staging, 0, backing, lo, hi - lo);
+    // A texture in VRAM: the region alone, through a buffer the GPU copies it to or from. A private buffer can still
+    // have pages the CPU maps, which the GPU never reads (GL's textures written there were sampled as zeros). Taking
+    // the whole surface and putting it back undid the tiles other threads uploaded meanwhile. It also wrote a render
+    // target before its first use gave the memory a compressed kind, which then read those bytes as garbage; the blit
+    // asks for the kind before it copies.
+    NSUInteger row = w * (malachite_aspect(self, MTLBlitOptionNone) == MALACHITE_ASPECT_STENCIL ? 1 : s.bpp);
+    NSUInteger size = row * h;
+    id<MTLBuffer> staging = [backing.device newBufferWithLength:MAX(size * region.size.depth, 1u)
+                                                        options:MTLResourceStorageModeShared];
+    if (!staging)
+        return;
+    uint8_t *rows = (uint8_t *)staging.contents;
+    for (NSUInteger z = 0; in && z < region.size.depth; z++)
+        for (NSUInteger y = 0; y < h; y++)
+            memcpy(rows + z * size + y * row, bytes + z * image + y * stride, row);
+    static id<MTLCommandQueue> queue;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        queue = [backing.device newCommandQueue];
+    });
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    if (in)
+        [blit copyFromBuffer:staging sourceOffset:0 sourceBytesPerRow:row sourceBytesPerImage:size
+                  sourceSize:region.size toTexture:self destinationSlice:slice destinationLevel:level
+           destinationOrigin:region.origin];
+    else
+        [blit copyFromTexture:self sourceSlice:slice sourceLevel:level sourceOrigin:region.origin
+                     sourceSize:region.size toBuffer:staging destinationOffset:0 destinationBytesPerRow:row
+        destinationBytesPerImage:size];
+    [blit endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    for (NSUInteger z = 0; !in && z < region.size.depth; z++)
+        for (NSUInteger y = 0; y < h; y++)
+            memcpy(bytes + z * image + y * stride, rows + z * size + y * row, row);
 }
 
 - (void)replaceRegion:(MTLRegion)region
