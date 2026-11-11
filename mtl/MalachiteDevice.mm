@@ -7352,11 +7352,11 @@ static void malachite_cache_hash(CC_SHA256_CTX *c, const void *p, size_t n)
 
 static void malachite_cache_key(uint8_t key[CC_SHA256_DIGEST_LENGTH], NSData *air, NSArray<NSData *> *bitcode,
                             NSArray<NSString *> *names, const struct airc_varyings *vertex,
-                            const struct airc_stage_in *stage_in)
+                            const struct airc_stage_in *stage_in, uint32_t samples)
 {
     // a fragment function's inputs pair with the vertex outputs by name, or in order without any
-    uint32_t fixed[4] = { getenv("AIRC_SERIAL") != NULL, (uint32_t)bitcode.count, vertex ? vertex->n : UINT32_MAX,
-                          stage_in != NULL };
+    uint32_t fixed[5] = { getenv("AIRC_SERIAL") != NULL, (uint32_t)bitcode.count, vertex ? vertex->n : UINT32_MAX,
+                          stage_in != NULL, samples };
     CC_SHA256_CTX c;
     CC_SHA256_Init(&c);
     CC_SHA256_Update(&c, malachite_cache.identity, sizeof(malachite_cache.identity));
@@ -7560,17 +7560,18 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
 
 - (id<MTLBuffer>)compile:(id<MTLFunction>)function header:(struct nvk_header *)h error:(NSError **)error
 {
-    return [self compile:function linked:nil vertex:NULL stageIn:NULL outputs:NULL header:h error:error];
+    return [self compile:function linked:nil vertex:NULL stageIn:NULL samples:1 outputs:NULL header:h error:error];
 }
 
 // Compile a function's AIR to SASS with airc, in process, into a GPU-mapped buffer. nil (and *error) on failure.
 // The pipeline's linked functions are what the function's visible-function calls resolve to; a fragment function's
 // inputs are paired with the vertex function's outputs (vertex) by name, and a vertex function's are given back;
-// a kernel's stage input is fetched as stageIn lays it out.
+// a kernel's stage input is fetched as stageIn lays it out. samples is the pipeline's raster sample count.
 - (id<MTLBuffer>)compile:(id<MTLFunction>)function
                   linked:(MTLLinkedFunctions *)linked
                   vertex:(const struct airc_varyings *)vertex
                  stageIn:(const struct airc_stage_in *)stageIn
+                 samples:(NSUInteger)samples
                  outputs:(struct airc_varyings *)outputs
                   header:(struct nvk_header *)h
                    error:(NSError **)error
@@ -7628,7 +7629,7 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
     bool cached = !over && malachite_cache_init();
     uint8_t key[CC_SHA256_DIGEST_LENGTH];
     if (cached)
-        malachite_cache_key(key, air, bitcode, names, vertex, stageIn);
+        malachite_cache_key(key, air, bitcode, names, vertex, stageIn, (uint32_t)samples);
     NSData *entry = cached ? malachite_cache_load(key) : nil;
     NSString *why = nil;
     if (!entry) {
@@ -7636,8 +7637,8 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
         for (NSUInteger i = 0; i < bitcode.count; i++)
             sources[i] = (struct airc_source){ bitcode[i].bytes, bitcode[i].length, names[i].UTF8String };
         os_unfair_lock_lock(&malachite_airc_lock);
-        if (airc_compile_linked(air.bytes, air.length, sources, (unsigned)bitcode.count, vertex, stageIn, NULL, 0, 0,
-                                &k))
+        if (airc_compile_linked(air.bytes, air.length, sources, (unsigned)bitcode.count, vertex, stageIn,
+                                (unsigned)samples, NULL, 0, 0, &k))
             why = @(k.error);
         else
             entry = malachite_cache_entry(&k);
@@ -7768,7 +7769,8 @@ static const struct airc_stage_in *malachite_stage_in(MTLStageInputOutputDescrip
         return nil;
     }
     struct nvk_header h;
-    id<MTLBuffer> code = [self compile:function linked:linked vertex:NULL stageIn:layout outputs:NULL header:&h
+    id<MTLBuffer> code = [self compile:function linked:linked vertex:NULL stageIn:layout samples:1 outputs:NULL
+                                header:&h
                                  error:error];
     if (!code)
         return nil;
@@ -7938,6 +7940,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
                                  linked:desc.vertexLinkedFunctions
                                  vertex:NULL
                                 stageIn:NULL
+                                samples:1
                                 outputs:&varyings
                                  header:&vh
                                   error:error];
@@ -7945,6 +7948,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
                                          linked:desc.fragmentLinkedFunctions
                                          vertex:&varyings
                                         stageIn:NULL
+                                        samples:desc.rasterSampleCount
                                         outputs:NULL
                                          header:&fh
                                           error:error]

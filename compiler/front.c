@@ -3926,6 +3926,10 @@ static void call(LLVMValueRef in)
         mem_set(in);
         return;
     }
+    if (!strcmp(name, "air.get_num_samples.i32")) {  // fixed with the pipeline
+        set(in, 0, konst(IR_I32, airc_samples));
+        return;
+    }
     if (!strcmp(name, "air.discard_fragment")) {
         ir_add(g_cur, IR_KILL, IR_VOID, 0);
         g_info->ps_sysvals |= SPH_PS_KILLS;
