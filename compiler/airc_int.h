@@ -63,6 +63,8 @@ void airc_fetch(struct ir_block *b, const struct airc_tess_attr *a, unsigned loc
 // n / d in b, for a constant d
 struct ir_val *airc_udiv(struct ir_block *b, struct ir_val *n, uint32_t d);
 void airc_opt(struct ir_func *f);
+// airc_opt unrolls small loops unless airc_no_unroll is set, and sets airc_unrolled when it does
+extern int airc_no_unroll, airc_unrolled;
 // a local array that is only a copy of read-only memory, read from that memory instead; 1 if it changed f (which
 // airc_opt then cleans up)
 int airc_const_locals(struct ir_func *f, struct airc_info *info);

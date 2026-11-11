@@ -194,7 +194,28 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
             LLVMDisposeMemoryBuffer(mb);
             return -1;
         }
+    airc_no_unroll = airc_unrolled = 0;
     int ret = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, 0, k);
+    // an unrolled loop's copies hold more values at once: compiled again with its loops as they were, that is kept
+    // if it runs more warps
+    if (!ret && airc_unrolled) {
+        struct airc_kernel *r = calloc(1, sizeof(*r));
+        char *error = g_error;
+        g_error = r->error;
+        g_error_size = sizeof(r->error);
+        airc_no_unroll = 1;
+        int again = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, 0, r);
+        g_error = error;
+        g_error_size = sizeof(k->error);
+        if (!again && warps(r->h.reg_count) > warps(k->h.reg_count)) {
+            free(k->sass);
+            *k = *r;
+        } else {
+            free(r->sass);
+            airc_no_unroll = 0;
+        }
+        free(r);
+    }
     // a shader that needs many registers runs few warps at a time, which leaves memory waits unhidden: compiled
     // again with values made where they are read, it is kept if that runs more warps (or as many in less code)
     if (ret || k->h.reg_count > 40) {
@@ -215,6 +236,7 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
         }
         free(r);
     }
+    airc_no_unroll = 0;
     for (unsigned i = 0; i < nlinked; i++) {
         LLVMDisposeModule(lmod[i]);
         LLVMDisposeMemoryBuffer(lmb[i]);

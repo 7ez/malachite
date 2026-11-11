@@ -1269,6 +1269,136 @@ void airc_widen_shared(struct ir_func *f, const struct airc_info *info)
                 v = (shared_word(v, IR_LDS) || shared_word(v, IR_STS)) && widen(v, n, info) ? b->first : v->next;
 }
 
+// A loop of one block that branches back to itself and runs a few times known up front becomes that many copies of
+// its body in a row: the copies' loads (a convolution's taps) are all in flight at once rather than one iteration's
+// at a time, and the counter folds into their addresses. The counter is an i32 phi that starts at a constant, steps
+// by a constant and is compared with a constant to leave; running it gives the trip count. A loop with a barrier, a
+// call, a discard, a derivative or a lane exchange stays a loop: those depend on how the lanes converge, which the
+// back end plans around the loop as it is.
+#define UNROLL_TRIPS 16
+#define UNROLL_VALUES 320  // the copies' values at most
+
+static struct ir_val *phi_from(const struct ir_val *p, const struct ir_block *b)
+{
+    for (unsigned i = 0; i < p->nsrc; i++)
+        if (p->phi_blocks[i] == b)
+            return p->src[i];
+    airc_fail("phi lost the input of a predecessor");
+}
+
+// what x adds a constant to, with the constant in *step; NULL if it doesn't
+static const struct ir_val *stepped(const struct ir_val *x, uint32_t *step)
+{
+    if ((x->op != IR_ADD && x->op != IR_SUB) || x->src[1]->op != IR_CONST)
+        return NULL;
+    *step = x->op == IR_ADD ? (uint32_t)x->src[1]->imm : -(uint32_t)x->src[1]->imm;
+    return x->src[0];
+}
+
+// how many times loop b, entered from pre, runs; 0 if that isn't known or is more than UNROLL_TRIPS
+static int trip_count(const struct ir_block *b, const struct ir_block *pre)
+{
+    const struct ir_val *cmp = b->last->src[0];
+    if (cmp->op != IR_CMP || cmp->block != b || (cmp->aux & IR_FCMP) || cmp->src[1]->op != IR_CONST)
+        return 0;
+    // the compare reads the counter or the counter plus a constant (its next value, as a rule)
+    const struct ir_val *k = cmp->src[0];
+    uint32_t off = 0, step;
+    if (k->op != IR_PHI)
+        k = stepped(k, &off);
+    if (!k || k->op != IR_PHI || k->block != b || k->type != IR_I32)
+        return 0;
+    const struct ir_val *init = phi_from(k, pre);
+    if (init->op != IR_CONST || stepped(phi_from(k, b), &step) != k)
+        return 0;
+    uint32_t c = (uint32_t)init->imm;
+    for (int trip = 1; trip <= UNROLL_TRIPS; trip++, c += step)
+        if (b->succ[!int_cmp(cmp->aux, (int32_t)(c + off), (int32_t)cmp->src[1]->imm)] != b)
+            return trip;
+    return 0;
+}
+
+static int unroll_keeps(const struct ir_val *v)
+{
+    return v->op == IR_BAR || v->op == IR_CALL || v->op == IR_KILL || v->op == IR_SHFL || v->op == IR_VOTE ||
+           takes_derivatives(v);
+}
+
+int airc_no_unroll, airc_unrolled;
+
+static int unroll(struct ir_func *f)
+{
+    int changed = 0;
+    if (airc_no_unroll || airc_pass_off("AIRC_NOUNROLL"))
+        return 0;
+    for (struct ir_block *b = f->entry; b; b = b->next) {
+        struct ir_val *t = b->last;
+        if (!t || t->op != IR_CBR || b->npreds != 2 || (b->succ[0] == b) == (b->succ[1] == b))
+            continue;
+        struct ir_block *pre = b->preds[b->preds[0] == b], *out = b->succ[b->succ[0] == b];
+        unsigned nphi = 0, n = 0, maxid = 0;
+        int keep = 0;
+        for (struct ir_val *v = b->first; v != t; v = v->next) {
+            nphi += v->op == IR_PHI;
+            n += v->op != IR_PHI;
+            keep |= unroll_keeps(v);
+            maxid = (unsigned)v->id > maxid ? (unsigned)v->id : maxid;
+        }
+        int trip = keep || !n ? 0 : trip_count(b, pre);
+        if (!trip || trip * n > UNROLL_VALUES)
+            continue;
+        // map: what each of b's values is in the copy being made, a phi's what it holds at that copy's start
+        struct ir_val **map = calloc(maxid + 1, sizeof(*map)), **phis = malloc(nphi * sizeof(*phis)),
+                      **body = malloc(n * sizeof(*body)), **next = malloc(nphi * sizeof(*next));
+        nphi = n = 0;
+        for (struct ir_val *v = b->first; v != t; v = v->next) {
+            if (v->op == IR_PHI) {
+                phis[nphi++] = v;
+                map[v->id] = phi_from(v, pre);
+            } else {
+                body[n++] = v;
+            }
+        }
+        for (int it = 0; it < trip; it++) {
+            // all at once, so phis that take each other's values (a swap) see the last copy's
+            for (unsigned i = 0; it && i < nphi; i++) {
+                struct ir_val *s = phi_from(phis[i], b);
+                next[i] = s->block == b ? map[s->id] : s;
+            }
+            for (unsigned i = 0; it && i < nphi; i++)
+                map[phis[i]->id] = next[i];
+            for (unsigned i = 0; i < n; i++) {
+                struct ir_val *v = body[i], *c = ir_add(b, v->op, v->type, v->nsrc);
+                c->aux = v->aux;
+                c->imm = v->imm;
+                for (unsigned j = 0; j < v->nsrc; j++)
+                    c->src[j] = v->src[j] && v->src[j]->block == b ? map[v->src[j]->id] : v->src[j];
+                map[v->id] = c;
+            }
+        }
+        // after the loop a phi is what it held in the last iteration, a body value what the last copy made
+        for (unsigned i = 0; i < nphi; i++) {
+            replace_all(f, phis[i], map[phis[i]->id]);
+            ir_remove(phis[i]);
+        }
+        for (unsigned i = 0; i < n; i++) {
+            replace_all(f, body[i], map[body[i]->id]);
+            ir_remove(body[i]);
+        }
+        t->op = IR_BR;
+        t->nsrc = 0;
+        b->succ[0] = out;
+        b->nsucc = 1;
+        free(next);
+        free(body);
+        free(phis);
+        free(map);
+        changed = airc_unrolled = 1;
+    }
+    resolve(f);
+    return changed;
+}
+
 void airc_opt(struct ir_func *f)
 {
     g_no_range = airc_pass_off("AIRC_NORANGE");
@@ -1296,7 +1426,8 @@ void airc_opt(struct ir_func *f)
         changed |= cse(f);
         changed |= local_forward(f);
         changed |= dce(f);
-        if (!changed)
+        // unrolled only once the rest is clean, so a body's size is what's left of it
+        if (!changed && !unroll(f))
             break;
     }
 }
