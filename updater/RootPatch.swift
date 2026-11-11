@@ -84,8 +84,9 @@ func patchRoot(steps: Steps, say: Say) throws -> Bool {
             try steps.must("/bin/chmod", ["-R", "u=rwX,go=rX", dst])
         }
         try steps.must(bless, ["--mount", mnt, "--bootefi", "--create-snapshot"])
-        // a snapshot that has our copy and isn't sealed is one this made
-        let sealed = root.sealed || (exists(systemBundle) && state["sealed"] == "1")
+        // the seal is ours to have broken if the booted snapshot has our copy, or our patch of it waits for a restart
+        let ours = exists(systemBundle) || state["patched"] == root.snapshot
+        let sealed = root.sealed || (ours && state["sealed"] == "1")
         try steps.write("on=1\nsealed=\(sealed ? 1 : 0)\npatched=\(root.snapshot)\n", to: rootPatchFile)
         say("  Metal driver on the system volume, for browsers (new snapshot, takes effect at the next restart)")
         changed = true
