@@ -99,6 +99,7 @@ func runChecks(say: Say) -> Bool {
     for line in keep(capture("/usr/sbin/system_profiler", ["SPDisplaysDataType"]).text, containing: shown) {
         say(line)
     }
+    say(rootPatchSummary())
     say("")
     let tests = [
         ["mtldraw", "tests/gfx.metal"], ["mtlsimd"], ["mtlsoftmax"], ["mtltess"], ["mtlderiv"],
