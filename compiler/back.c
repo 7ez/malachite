@@ -2869,6 +2869,7 @@ static int coalesce_phis(int region)
 }
 
 static int g_clusters_first;
+static int g_second_pass;  // of airc_back's two allocations
 
 // Warps an SM keeps resident at a thread's register count, taken in 8-register units. GA10x: four partitions of
 // 16K registers, 48 warps.
@@ -2940,13 +2941,16 @@ static int place(int region)
     // the most the same occupancy allows. Taking the lowest free register puts a value where one just died, and the
     // scheduler can't move a write above the reads of the register's last value, nor a load above an earlier
     // load's use when both land in one register. Spread singles can leave a cluster no aligned room below that
-    // budget: then spread in the other order, rather than fall back to the packed placement. A shader with local
+    // budget: then spread in the other order, rather than fall back to the packed placement. In the second pass,
+    // failing that too (an unrolled loop's wide loads, with the budget tight), the clusters go first and lowest and
+    // only the singles spread. Not in the first: its schedule orders the second pass, whose packing then missed a
+    // smaller register granule it reached before (six kernels of the corpus lost occupancy). A shader with local
     // memory spreads down to 40 warps from 48: the path tracer's BVH walk, packed to run 48, was 5% slower than
     // spread at 40 (a shader without one, the particle simulation, was 10% slower at 40).
     int *best = malloc(g_nvregs * sizeof(*best)), best_count = 0, fitted = 0, best_first = 0, budget = NREGS;
     int *row_end = malloc(NREGS * sizeof(*row_end));
     int spread_fitted = 0;
-    for (int attempt = 0; attempt < 4 && !spread_fitted; attempt++) {
+    for (int attempt = 0; attempt < 4 + g_second_pass && !spread_fitted; attempt++) {
         int spread = attempt >= 2;
         if (attempt == 2) {
             if (!fitted)
@@ -2961,7 +2965,7 @@ static int place(int region)
             if (budget == best_count)
                 break;
         }
-        g_clusters_first = spread ? best_first ^ (attempt == 3) : attempt;
+        g_clusters_first = attempt == 4 || (spread ? best_first ^ (attempt == 3) : attempt);
         for (int c = 0; c < NREGS; c++)
             row_end[c] = -1;
         for (int i = 1; i < n; i++)
@@ -2998,11 +3002,13 @@ static int place(int region)
                 row[(start - base) / 64] |= 1ull << ((start - base) % 64);
             }
             int r = -1, size = g_vregs[h].size, align = g_vregs[h].align, age = 0;
-            for (int c = (from + align - 1) & ~(align - 1); c + size <= budget && (r < 0 || spread); c += align) {
+            int scatter = spread && (attempt < 4 || size == 1);
+            for (int c = (from + align - 1) & ~(align - 1); c + size <= budget && (r < 0 || scatter); c += align) {
                 int ok = 1, j = h, last = -1;
                 for (int k = 0; k < size && ok; k++, j = g_vregs[j].next) {
                     ok = !g_reserved[region][c + k] && seg_free(occ + (size_t)(c + k) * words, g_vregs[j].seg, base);
-                    int t = ok && spread ? last_taken(occ + (size_t)(c + k) * words, row_end, c + k, start - base) : -1;
+                    int t = ok && scatter ? last_taken(occ + (size_t)(c + k) * words, row_end, c + k, start - base)
+                                          : -1;
                     if (t > last)
                         last = t;
                 }
@@ -4723,6 +4729,7 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
         nxfers += g_mops[i].nxd;
     }
     int *order = malloc((g_nmops + 1) * sizeof(*order));
+    g_second_pass = 0;
     if (allocate_and_emit(f, info, order) < 0) {
         free(mops);
         free(vregs);
@@ -4747,6 +4754,7 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
     int again = in_runs(order);
     for (int i = 0; again && i < g_nmops; i++)
         g_mops[i] = mops[order[i]];
+    g_second_pass = 1;
     if (again && allocate_and_emit(f, info, order) == 0 && warps_at(g_regcount + 2) >= warps_at(count + 2)) {
         free(prog);
     } else {
