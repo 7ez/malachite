@@ -4073,6 +4073,9 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             for (int r = 0; r < 256; r++)
                 held |= (g_wbar_of[r] | g_rbar_of[r]) & g_mem_bars;
             settle(held);
+            // six cycles before the next instruction, as nvcc and NAK give it: a shared load issued one to three
+            // cycles after the barrier missed the other warps' stores from before it
+            c = (c & ~(0xfu << 9)) | 6u << 9;
             sched_push(sass_bar_sync(c | held << 20), NULL, 0, -1, 0, 0);
             break;
         case MK_BSSY:
