@@ -72,6 +72,12 @@ struct MenuView: View {
 
     var body: some View {
         Text(model.status)
+        if model.repatch {
+            Button("Patch the system volume again") {
+                NotificationCenter.default.post(name: showWindow, object: nil)
+                model.patchRoot()
+            }
+        }
         Button("Open") {
             NotificationCenter.default.post(name: showWindow, object: nil)
         }
@@ -93,6 +99,16 @@ struct MainView: View {
             Text(summary)
             Text(model.busy.map { "\($0)..." } ?? model.status)
                 .foregroundStyle(.secondary)
+            if model.repatch {
+                HStack {
+                    Text("The system volume lost its copy of the Metal driver, as it does on a macOS update, so browsers draw WebGL, video and canvas on the CPU.")
+                        .fixedSize(horizontal: false, vertical: true)
+                    Button("Patch again") {
+                        model.patchRoot()
+                    }
+                    .disabled(model.busy != nil)
+                }
+            }
             if let update = model.update, !update.notes.isEmpty {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("What's new")
