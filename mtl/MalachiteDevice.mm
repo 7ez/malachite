@@ -7681,15 +7681,17 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
         file = [NSString stringWithFormat:@"%@-%d", function.name, __sync_fetch_and_add(&programs, 1)];
     }
     if (failed || ((malachite_trace || malachite_dump) && !over)) {
+        // not atomically: where the sandbox refuses the file, an atomic write leaves its temporary folder behind,
+        // one for each failed compile
         dump = [NSString stringWithFormat:@"/tmp/malachite-%@.air", file];
-        if (![air writeToFile:dump atomically:YES]) {
+        if (![air writeToFile:dump atomically:NO]) {
             dump = [NSTemporaryDirectory() stringByAppendingFormat:@"malachite-%@.air", file];
-            [air writeToFile:dump atomically:YES];
+            [air writeToFile:dump atomically:NO];
         }
         for (NSUInteger i = 0; i < bitcode.count; i++)
             [bitcode[i] writeToFile:[dump stringByReplacingOccurrencesOfString:@".air"
                                                                     withString:[NSString stringWithFormat:@".linked%lu.air", i]]
-                         atomically:YES];
+                         atomically:NO];
         if (code)
             os_log(OS_LOG_DEFAULT, "Malachite dump: code %#llx from %{public}@", [(MTLIOAccelBuffer *)code gpuAddress], dump);
     }
