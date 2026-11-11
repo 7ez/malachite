@@ -13,8 +13,11 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOLib.h>
+#include <mach-o/loader.h>
 #include <mach/kmod.h>
 #include <pexpert/pexpert.h>
+#include <sys/fcntl.h>
+#include <sys/vnode.h>
 
 #include "bridge.h"
 #include "../fbkext/surface.h"
@@ -37,6 +40,66 @@ MalachiteDefineClass(Accelerator, IOGraphicsAccelerator2)
 #define kMetalPluginPath  "MalachiteMetal"
 #define kMetalPluginClass "MalachiteDevice"
 
+extern "C" void log_msg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+// The LC_UUID of a 64-bit Mach-O, from the load commands at its start
+static bool macho_uuid(const char *path, uint8_t uuid[16])
+{
+    const int size = 16384;
+    bool found = false;
+    vfs_context_t ctx = vfs_context_create(nullptr);
+    uint8_t *buf = (uint8_t *)IOMalloc(size);
+    vnode_t vp = nullptr;
+    int resid = 0;
+    if (ctx && buf && !vnode_open(path, FREAD, 0, 0, &vp, ctx)) {
+        if (!vn_rdwr(UIO_READ, vp, (caddr_t)buf, size, 0, UIO_SYSSPACE, 0, vfs_context_ucred(ctx), &resid,
+                     vfs_context_proc(ctx))) {
+            uint32_t len = (uint32_t)(size - resid);
+            auto mh = (const mach_header_64 *)buf;
+            uint32_t off = sizeof(*mh);
+            for (uint32_t i = 0; len >= off && mh->magic == MH_MAGIC_64 && i < mh->ncmds; i++) {
+                auto lc = (const load_command *)(buf + off);
+                if (off + sizeof(uuid_command) > len || lc->cmdsize < sizeof(load_command))
+                    break;
+                if (lc->cmd == LC_UUID) {
+                    memcpy(uuid, ((const uuid_command *)lc)->uuid, 16);
+                    found = true;
+                    break;
+                }
+                off += lc->cmdsize;
+            }
+        }
+        vnode_close(vp, FREAD, ctx);
+    }
+    if (buf)
+        IOFree(buf, size);
+    if (ctx)
+        vfs_context_rele(ctx);
+    return found;
+}
+
+// gpu_bundle_find_trusted() looks in /Library/GPUBundles first, and sandboxed processes (browsers' GPU processes) may
+// map code only from the system volume. So a copy the installer put there, of the same build, is named relative to
+// the first folder, and every process loads that one; a macOS update takes it away again.
+static const char *metal_plugin_name()
+{
+    // looking a path up before the root is mounted panics in namei
+    vnode_t root = vfs_rootvnode();
+    if (!root)
+        return kMetalPluginPath;
+    vnode_put(root);
+    uint8_t ours[16], system[16];
+    if (!macho_uuid("/Library/GPUBundles/MalachiteMetal.bundle/Contents/MacOS/MalachiteMetal", ours) ||
+        !macho_uuid("/System/Library/Extensions/MalachiteMetal.bundle/Contents/MacOS/MalachiteMetal", system))
+        return kMetalPluginPath;
+    if (memcmp(ours, system, sizeof(ours))) {
+        log_msg("accel: the Metal driver on the system volume is another build, using /Library/GPUBundles's\n");
+        return kMetalPluginPath;
+    }
+    log_msg("accel: using the Metal driver on the system volume\n");
+    return "../../System/Library/Extensions/" kMetalPluginPath;
+}
+
 bool Accelerator::start(IOService *provider)
 {
     uint32_t off = 0;
@@ -51,7 +114,7 @@ bool Accelerator::start(IOService *provider)
 
     // Metal.framework reads these off the registered accelerator; set before super::start(), which registers
     // the service on success.
-    setProperty("MetalPluginName", kMetalPluginPath);
+    setProperty("MetalPluginName", metal_plugin_name());
     setProperty("MetalPluginClassName", kMetalPluginClass);
     // OpenGL's renderer bundle: Apple's, which runs GL on whatever Metal device is ours. Boot-arg nvgl=0 leaves
     // GL apps on Apple's software renderer instead.
