@@ -290,6 +290,10 @@ struct gpu_ctx {
         uint32_t run_words, run_draws;
     } launches[16];
     unsigned launch_next;
+    // The queue whose draw last set the state the plugin's runs change (nullptr when the channel holds none of it: a
+    // new channel, or a draw that failed): a run only follows the draw or run before it in its command buffer.
+    const void *state_of;
+    bool runs_dropped;  // runs were dropped since, and the log said so
     uint64_t busy_since;  // when its outstanding graphics work began (time_us), 0 when none is
     uint64_t busy_unbilled;  // its busy time Accelerator has not yet charged to the task (NVGPU_FN_CTX_BUSY)
     bool compute_ready;
@@ -734,15 +738,16 @@ class Gpu : public IOService
     // a dispatch or a draw, again on a new channel when an earlier launch faulted the channel under it. A fault is
     // only reported after the launch that made it has released its semaphore, so there's no telling it from one
     // the timed-out launch made itself: that one runs twice (and faults the new channel too).
-    IOReturn launch(gpu_ctx *c, const struct nvgpu_dispatch *d, const struct nvgpu_draw *w, const char **reject = nullptr)
+    IOReturn launch(gpu_ctx *c, const struct nvgpu_dispatch *d, const struct nvgpu_draw *w, const char **reject = nullptr,
+                    const void *queue = nullptr)
     {
         // launches go to the GPU unwaited, so the word of a fault comes in after the faulting one returned: heard
         // first, it has the channel made anew before this one is lost on it
         if (gsp)
             gsp_poll(gsp);
-        IOReturn r = settle(d ? gpu_dispatch(c, d) : gpu_draw(c, w, reject));
+        IOReturn r = settle(d ? gpu_dispatch(c, d) : gpu_draw(c, w, queue, reject));
         if (r == kIOReturnTimeout && c->compute_faulted)
-            r = settle(d ? gpu_dispatch(c, d) : gpu_draw(c, w, reject));
+            r = settle(d ? gpu_dispatch(c, d) : gpu_draw(c, w, queue, reject));
         return r;
     }
     void kick_draws(gpu_ctx *c)
@@ -774,9 +779,9 @@ class Gpu : public IOService
     }
     // A kick is the slowest part of a draw: a read across the bus and a doorbell. Draws share one, a few at a time so
     // the GPU keeps working, and the end of the command buffer or anything that waits kicks the rest.
-    IOReturn draw(gpu_ctx *c, const struct nvgpu_draw *w, const char **reject)
+    IOReturn draw(gpu_ctx *c, const struct nvgpu_draw *w, const void *queue, const char **reject)
     {
-        IOReturn r = launch(c, nullptr, w, reject);
+        IOReturn r = launch(c, nullptr, w, reject, queue);
         if (r != kIOReturnSuccess || c->draws_queued >= 32)
             kick_draws(c);
         return r;
@@ -807,18 +812,31 @@ class Gpu : public IOService
             return;
         }
     }
-    IOReturn push_run(gpu_ctx *c, const struct malachite_push *p)
+    // A run the channel doesn't hold the state for is dropped, along with the runs after it, until the queue's next
+    // draw sends everything again: on a channel made anew after a fault it would fetch vertices through attribute
+    // and stream state the channel starts with, from address 0, and fault it again.
+    IOReturn push_run(gpu_ctx *c, const struct malachite_push *p, const void *queue)
     {
         if (gsp)
             gsp_poll(gsp);
-        if (!compute_bridge_init(c))
+        if (!compute_bridge_init(c)) {
+            c->state_of = nullptr;
             return kIOReturnNotReady;
+        }
         uncache_methods(c, p->va);
-        if (after_copies(c) != kIOReturnSuccess)
+        // the release's one slot (push_room(0x200) would count a wrap the release doesn't make); either wait may find
+        // the channel faulted and make it anew
+        if (after_copies(c) != kIOReturnSuccess || push_room(c, 0x100) != kIOReturnSuccess) {
+            c->state_of = nullptr;
             return settle(kIOReturnTimeout);
-        // the release's one slot (push_room(0x200) would count a wrap the release doesn't make)
-        if (push_room(c, 0x100) != kIOReturnSuccess)
-            return settle(kIOReturnTimeout);
+        }
+        if (!queue || c->state_of != queue) {
+            if (!c->runs_dropped)
+                log_msg("Malachite: %s's draws are dropped until its next full one: %s\n", c->owner,
+                        c->state_of ? "another queue's draw came between" : "the channel lost the state they change");
+            c->runs_dropped = true;
+            return kIOReturnSuccess;
+        }
         chan_entry(&c->compute_ch, p->va, p->words);
         render_mark(&c->compute_ch, c->compute_semva, ++c->compute_seq);
         // a run takes two GPFIFO entries and one slot of the pushbuffer, whose size is what keeps the GPFIFO from
@@ -874,7 +892,7 @@ class Gpu : public IOService
     IOReturn gpu_copy2d(gpu_ctx *c, const struct nvgpu_copy2d *cp);
     IOReturn gpu_fill(gpu_ctx *c, uint64_t dst, uint64_t size, uint32_t pattern);
     IOReturn gpu_dispatch(gpu_ctx *c, const struct nvgpu_dispatch *d);
-    IOReturn gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reject);
+    IOReturn gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const void *queue, const char **reject);
     IOReturn gpu_present(struct nvgpu_present *p, uint64_t since);
     void adopt_surface(int i);
     IOReturn present_frame(struct nvgpu_present *p);
@@ -1068,8 +1086,8 @@ public:
     IOReturn callPlatformFunction(const OSSymbol *name, bool wait, void *p1, void *p2, void *p3, void *p4) override;
     bool usable();
     IOReturn queue_dispatch(void *ctx, const struct nvgpu_dispatch *d);
-    IOReturn queue_draw(void *ctx, const struct nvgpu_draw *d, const char **why);
-    IOReturn queue_push(void *ctx, const struct malachite_push *p);
+    IOReturn queue_draw(void *ctx, const void *queue, const struct nvgpu_draw *d, const char **why);
+    IOReturn queue_push(void *ctx, const void *queue, const struct malachite_push *p);
     IOReturn queue_copy2d(void *ctx, const struct nvgpu_copy2d *p);
     IOReturn queue_compress(void *ctx, uint64_t va);
     // Framebuffer's calls (SURFACE_FN_*) for screen i, through its nub
@@ -1830,6 +1848,7 @@ bool Gpu::graphics_channel(gpu_ctx *c, uint32_t chid)
         return false;
     }
     vmm_flush(&gpu);
+    c->state_of = nullptr;
     compute_set_tex_pools(&c->compute_ch, c->compute_cbufva + TEX_HEADER_POOL, NVGPU_MAX_TEXTURES,
                           c->compute_cbufva + TEX_SAMPLER_POOL, NVGPU_MAX_TEXTURES);
     render_set_tex_pools(&c->compute_ch, c->compute_cbufva + TEX_HEADER_POOL, NVGPU_MAX_TEXTURES,
@@ -3545,8 +3564,10 @@ static const char *draw_reject(const struct nvgpu_draw *d)
     return nullptr;
 }
 
-IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reject)
+IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const void *queue, const char **reject)
 {
+    // until the draw is sent, the plugin's next runs would build on state it hasn't
+    c->state_of = nullptr;
     if (const char *why = draw_reject(d)) {
         if (reject)
             *reject = why;
@@ -3801,6 +3822,8 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const char **reje
     pe_draw(&l.pe, &r);
     issued(c);
     c->draw_slot_seq[slot] = c->draw_pending = c->compute_seq;
+    c->state_of = queue;
+    c->runs_dropped = false;
     return kIOReturnSuccess;
 }
 
@@ -3894,20 +3917,20 @@ IOReturn Gpu::queue_dispatch(void *ctx, const struct nvgpu_dispatch *d)
     WITH_CTX(ctx, (stats[ST_DISPATCH]++, busy_open(c, launch(c, d, nullptr))));
 }
 
-IOReturn Gpu::queue_draw(void *ctx, const struct nvgpu_draw *d, const char **why)
+IOReturn Gpu::queue_draw(void *ctx, const void *queue, const struct nvgpu_draw *d, const char **why)
 {
     if (!usable())
         return kIOReturnNotReady;
-    WITH_CTX(ctx, (stats[ST_DRAW]++, busy_open(c, draw(c, d, why))));
+    WITH_CTX(ctx, (stats[ST_DRAW]++, busy_open(c, draw(c, d, queue, why))));
 }
 
-IOReturn Gpu::queue_push(void *ctx, const struct malachite_push *p)
+IOReturn Gpu::queue_push(void *ctx, const void *queue, const struct malachite_push *p)
 {
     if (!usable())
         return kIOReturnNotReady;
     if (!p->words || p->words > 0x1fffff || (p->va & 3))
         return kIOReturnBadArgument;
-    WITH_CTX(ctx, (stats[ST_DRAW] += p->draws, busy_open(c, push_run(c, p))));
+    WITH_CTX(ctx, (stats[ST_DRAW] += p->draws, busy_open(c, push_run(c, p, queue))));
 }
 
 IOReturn Gpu::queue_copy2d(void *ctx, const struct nvgpu_copy2d *p)
@@ -3929,14 +3952,14 @@ IOReturn queue_dispatch(IOService *gpu, void *ctx, const struct nvgpu_dispatch *
     return static_cast<Gpu *>(gpu)->queue_dispatch(ctx, d);
 }
 
-IOReturn queue_draw(IOService *gpu, void *ctx, const struct nvgpu_draw *d, const char **why)
+IOReturn queue_draw(IOService *gpu, void *ctx, const void *queue, const struct nvgpu_draw *d, const char **why)
 {
-    return static_cast<Gpu *>(gpu)->queue_draw(ctx, d, why);
+    return static_cast<Gpu *>(gpu)->queue_draw(ctx, queue, d, why);
 }
 
-IOReturn queue_push(IOService *gpu, void *ctx, const struct malachite_push *p)
+IOReturn queue_push(IOService *gpu, void *ctx, const void *queue, const struct malachite_push *p)
 {
-    return static_cast<Gpu *>(gpu)->queue_push(ctx, p);
+    return static_cast<Gpu *>(gpu)->queue_push(ctx, queue, p);
 }
 
 IOReturn queue_copy2d(IOService *gpu, void *ctx, const struct nvgpu_copy2d *p)

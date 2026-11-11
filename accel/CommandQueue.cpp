@@ -150,7 +150,7 @@ uint64_t CommandQueue::processSegmentKernelCommand(IOAccelSegmentResourceList *r
         if (!record_payload(cmd, end, h.len, &d, sizeof(d)) || !gGpu)
             return 0;
         const char *why = "";
-        IOReturn r = rm::queue_draw(gGpu, ctx, &d, &why);
+        IOReturn r = rm::queue_draw(gGpu, ctx, this, &d, &why);
         if (r != kIOReturnSuccess)
             failed_log("queue: draw failed 0x%x %s\n", r, why);
         return 0;
@@ -160,7 +160,7 @@ uint64_t CommandQueue::processSegmentKernelCommand(IOAccelSegmentResourceList *r
         struct malachite_push p;
         if (!record_payload(cmd, end, h.len, &p, sizeof(p)) || !gGpu)
             return 0;
-        IOReturn r = rm::queue_push(gGpu, ctx, &p);
+        IOReturn r = rm::queue_push(gGpu, ctx, this, &p);
         if (r != kIOReturnSuccess)
             failed_log("queue: push failed 0x%x\n", r);
         return 0;
