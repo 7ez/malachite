@@ -29,6 +29,8 @@ final class Model: ObservableObject {
     @Published var fullBar = false
     // an install from before the name Malachite, which the next install moves over
     @Published var legacy = false
+    // the system volume's Metal driver is gone, as after a macOS update
+    @Published var repatch = false
     @Published var startAtLogin = UserDefaults.standard.object(forKey: "startAtLogin") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(startAtLogin, forKey: "startAtLogin")
@@ -53,6 +55,7 @@ final class Model: ObservableObject {
         legacy = oldDriverInstalled()
         Task {
             loaded = await !run("/usr/sbin/kextstat", ["-l", "-b", "pl.aochi.malachite"]).text.isEmpty
+            repatch = await Task.detached { rootPatchLost() }.value
         }
         applyLoginItem()
     }
@@ -237,6 +240,17 @@ final class Model: ObservableObject {
             }
             let ok = out.status == 0
             return Report(title: "Uninstalling", text: out.text + (ok ? "" : "\nUninstall failed.\n"),
+                          canRestart: ok)
+        }
+    }
+
+    func patchRoot() {
+        start("Patching the system volume") {
+            let out = await admin("\(quote(selfPath)) --root-patch") { text in
+                self.report.text = text
+            }
+            let ok = out.status == 0
+            return Report(title: "Patching the system volume", text: out.text + (ok ? "" : "\nPatch failed.\n"),
                           canRestart: ok)
         }
     }
