@@ -278,6 +278,30 @@ static int parse_config(struct decoder *d, const uint8_t *p, size_t len)
     return r < 0 ? -1 : 0;
 }
 
+// the pixel buffers the session's pool makes: a picture's size and bit depth
+static OSStatus set_output(VTVideoDecoderSession session, int32_t width, int32_t height, uint32_t bps)
+{
+    int32_t pixel_format = bps == 2 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                                    : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    CFNumberRef fmt = CFNumberCreate(NULL, kCFNumberSInt32Type, &pixel_format);
+    CFNumberRef w = CFNumberCreate(NULL, kCFNumberSInt32Type, &width);
+    CFNumberRef h = CFNumberCreate(NULL, kCFNumberSInt32Type, &height);
+    CFDictionaryRef surface = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                 &kCFTypeDictionaryValueCallBacks);
+    const void *keys[] = { kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelBufferHeightKey,
+                           kCVPixelBufferIOSurfacePropertiesKey };
+    const void *values[] = { fmt, w, h, surface };
+    CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, values, 4, &kCFTypeDictionaryKeyCallBacks,
+                                               &kCFTypeDictionaryValueCallBacks);
+    OSStatus st = VTDecoderSessionSetPixelBufferAttributes(session, attrs);
+    CFRelease(attrs);
+    CFRelease(surface);
+    CFRelease(h);
+    CFRelease(w);
+    CFRelease(fmt);
+    return st;
+}
+
 static OSStatus start_session(CMBaseObjectRef obj, VTVideoDecoderSession session, CMVideoFormatDescriptionRef format)
 {
     struct decoder *d = CMBaseObjectGetDerivedStorage(obj);
@@ -314,24 +338,7 @@ static OSStatus start_session(CMBaseObjectRef obj, VTVideoDecoderSession session
     if (open_buffers(d, &info, info.slots, 0))
         return kVTVideoDecoderNotAvailableNowErr;
 
-    int32_t pixel_format = info.bps == 2 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-                                         : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    CFNumberRef fmt = CFNumberCreate(NULL, kCFNumberSInt32Type, &pixel_format);
-    CFNumberRef w = CFNumberCreate(NULL, kCFNumberSInt32Type, &dim.width);
-    CFNumberRef h = CFNumberCreate(NULL, kCFNumberSInt32Type, &dim.height);
-    CFDictionaryRef surface = CFDictionaryCreate(NULL, NULL, NULL, 0, &kCFTypeDictionaryKeyCallBacks,
-                                                 &kCFTypeDictionaryValueCallBacks);
-    const void *keys[] = { kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelBufferHeightKey,
-                           kCVPixelBufferIOSurfacePropertiesKey };
-    const void *values[] = { fmt, w, h, surface };
-    CFDictionaryRef attrs = CFDictionaryCreate(NULL, keys, values, 4, &kCFTypeDictionaryKeyCallBacks,
-                                               &kCFTypeDictionaryValueCallBacks);
-    OSStatus st = VTDecoderSessionSetPixelBufferAttributes(session, attrs);
-    CFRelease(attrs);
-    CFRelease(surface);
-    CFRelease(h);
-    CFRelease(w);
-    CFRelease(fmt);
+    OSStatus st = set_output(session, dim.width, dim.height, info.bps);
     if (st)
         return st;
     d->session = session;
@@ -392,6 +399,17 @@ static CVPixelBufferRef picture_out(struct decoder *d, const struct nvdec_pic *p
     // a VP9 stream's bit depth is its format's until its first key frame says otherwise
     OSType format = pic->bps == 2 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
                                   : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+    // A stream can change its picture size without a new format (a video call raising its resolution): each frame
+    // comes out at its own size, not the format's. Detiled into a bigger buffer, it showed in a corner of green.
+    if (CVPixelBufferGetPixelFormatType(pb) != format || CVPixelBufferGetWidth(pb) != pic->crop.width ||
+        CVPixelBufferGetHeight(pb) != pic->crop.height) {
+        CVPixelBufferRelease(pb);
+        pb = NULL;
+        if (set_output(d->session, (int32_t)pic->crop.width, (int32_t)pic->crop.height, pic->bps) ||
+            !(pool = VTDecoderSessionGetPixelBufferPool(d->session)) ||
+            CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb))
+            return NULL;
+    }
     if (CVPixelBufferGetPlaneCount(pb) != 2 || CVPixelBufferGetPixelFormatType(pb) != format ||
         CVPixelBufferGetWidth(pb) < pic->crop.width || CVPixelBufferGetHeight(pb) < pic->crop.height ||
         CVPixelBufferLockBaseAddress(pb, 0)) {
