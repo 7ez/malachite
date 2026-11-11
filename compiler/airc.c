@@ -18,6 +18,8 @@
 // the optimised IR of a stage before it is compiled, for irsim
 void (*airc_ir_hook)(struct ir_func *f, const struct airc_info *info);
 
+unsigned airc_samples = 1;
+
 static jmp_buf g_bail;
 static int g_passes_off;
 static char *g_error;
@@ -166,11 +168,11 @@ static unsigned warps(unsigned regs)
 int airc_compile(const void *air, size_t len, const struct airc_constant *fc, unsigned nfc, int print_ir,
                  struct airc_kernel *k)
 {
-    return airc_compile_linked(air, len, NULL, 0, NULL, NULL, fc, nfc, print_ir, k);
+    return airc_compile_linked(air, len, NULL, 0, NULL, NULL, 1, fc, nfc, print_ir, k);
 }
 
 int airc_compile_linked(const void *air, size_t len, const struct airc_source *linked, unsigned nlinked,
-                        const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
+                        const struct airc_varyings *vertex, const struct airc_stage_in *stage_in, unsigned samples,
                         const struct airc_constant *fc, unsigned nfc, int print_ir, struct airc_kernel *k)
 {
     memset(k, 0, sizeof(*k));
@@ -195,6 +197,7 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
             return -1;
         }
     airc_no_unroll = airc_unrolled = 0;
+    airc_samples = samples;
     int ret = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, 0, k);
     // an unrolled loop's copies hold more values at once: compiled again with its loops as they were, that is kept
     // if it runs more warps
