@@ -2313,6 +2313,40 @@ static uint16_t malachite_lod(float lod)
     return lod <= 0 ? 0 : lod >= 15.99f ? 0xfff : (uint16_t)(lod * 256);
 }
 
+// The sampler with an encoder's LOD clamps in place of its own: one made per pair of clamps, kept with the sampler.
+static char malachite_clamped_key;
+
+static id malachite_clamped(MalachiteSamplerState *sampler, float lodMin, float lodMax)
+{
+    uint16_t lo = malachite_lod(lodMin), hi = malachite_lod(lodMax);
+    if (!sampler || (sampler->_desc.lod_min == lo && sampler->_desc.lod_max == hi))
+        return sampler;
+    @synchronized(sampler) {
+        NSMutableDictionary *made = objc_getAssociatedObject(sampler, &malachite_clamped_key);
+        if (!made) {
+            made = [NSMutableDictionary dictionary];
+            objc_setAssociatedObject(sampler, &malachite_clamped_key, made, OBJC_ASSOCIATION_RETAIN);
+        }
+        NSNumber *key = @(lo | hi << 16);
+        MalachiteSamplerState *s = made[key];
+        if (!s) {
+            MTLSamplerDescriptor *d = [objc_getAssociatedObject(sampler, &malachite_desc_key) copy];
+            if (!d)
+                d = [MTLSamplerDescriptor new];
+            d.lodMinClamp = lodMin;
+            d.lodMaxClamp = lodMax;
+            s = [[MalachiteSamplerState alloc] initWithDevice:((id<MTLSamplerState>)sampler).device samplerDescriptor:d];
+            s->_desc = sampler->_desc;
+            s->_desc.lod_min = lo;
+            s->_desc.lod_max = hi;
+            if (malachite_rec_only)
+                objc_setAssociatedObject(s, &malachite_desc_key, d, OBJC_ASSOCIATION_RETAIN);
+            made[key] = s;
+        }
+        return s;
+    }
+}
+
 // A constexpr sampler's packed state: the s, t and r address modes in bits 0-2, 3-5 and 6-8 (0 clamp to the border
 // colour, 1 clamp to edge, 2 repeat, 3 mirrored repeat, 4 mirror clamp to edge); mag and min linear in bits 9 and
 // 11, the mip filter in 13-14 (MTLSamplerMipFilter), pixel coordinates in 15, the compare function in 16-19
@@ -2825,10 +2859,9 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
         malachite_keep(_cb, heaps[i]);
 }
 
-// the sampler's own LOD clamps apply, not these
 - (void)setSamplerState:(id)sampler lodMinClamp:(float)lodMin lodMaxClamp:(float)lodMax atIndex:(NSUInteger)index
 {
-    [self setSamplerState:sampler atIndex:index];
+    [self setSamplerState:malachite_clamped(sampler, lodMin, lodMax) atIndex:index];
 }
 
 - (void)setSamplerStates:(const id __unsafe_unretained *)samplers
@@ -2836,7 +2869,8 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
             lodMaxClamps:(const float *)lodMax
                withRange:(NSRange)range
 {
-    [self setSamplerStates:samplers withRange:range];
+    for (NSUInteger i = 0; i < range.length; i++)
+        [self setSamplerState:samplers[i] lodMinClamp:lodMin[i] lodMaxClamp:lodMax[i] atIndex:range.location + i];
 }
 
 // [[threadgroup(n)]] memory, laid out at dispatch; Apple-GPU imageblocks have nothing to set
@@ -4066,11 +4100,13 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 
 - (void)setVertexSamplerStates:(const id __unsafe_unretained *)samplers withRange:(NSRange)range
 {
+    for (NSUInteger i = 0; i < range.length; i++)
+        [self setVertexSamplerState:samplers[i] atIndex:range.location + i];
 }
 
-// the sampler's own LOD clamps apply, not these
 - (void)setVertexSamplerState:(id)sampler lodMinClamp:(float)lodMin lodMaxClamp:(float)lodMax atIndex:(NSUInteger)index
 {
+    [self setVertexSamplerState:malachite_clamped(sampler, lodMin, lodMax) atIndex:index];
 }
 
 - (void)setVertexSamplerStates:(const id __unsafe_unretained *)samplers
@@ -4078,6 +4114,8 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
                   lodMaxClamps:(const float *)lodMax
                      withRange:(NSRange)range
 {
+    for (NSUInteger i = 0; i < range.length; i++)
+        [self setVertexSamplerState:samplers[i] lodMinClamp:lodMin[i] lodMaxClamp:lodMax[i] atIndex:range.location + i];
 }
 
 - (void)setFragmentSamplerState:(id)sampler
@@ -4085,7 +4123,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
                     lodMaxClamp:(float)lodMax
                         atIndex:(NSUInteger)index
 {
-    [self setFragmentSamplerState:sampler atIndex:index];
+    [self setFragmentSamplerState:malachite_clamped(sampler, lodMin, lodMax) atIndex:index];
 }
 
 - (void)setFragmentSamplerStates:(const id __unsafe_unretained *)samplers
@@ -4093,7 +4131,9 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
                     lodMaxClamps:(const float *)lodMax
                        withRange:(NSRange)range
 {
-    [self setFragmentSamplerStates:samplers withRange:range];
+    for (NSUInteger i = 0; i < range.length; i++)
+        [self setFragmentSamplerState:samplers[i] lodMinClamp:lodMin[i] lodMaxClamp:lodMax[i]
+                              atIndex:range.location + i];
 }
 
 - (void)setDepthTestMinBound:(float)minBound maxBound:(float)maxBound
