@@ -63,12 +63,16 @@ unsigned draw_target_words(uint32_t *push, const struct render_draw *d)
     for (unsigned j = 0; j < count; j++) {
         struct render_ct ct = { d->target, d->pitch, d->format, d->target_blocklinear, d->write_mask };
         memcpy(ct.blend, d->blend, sizeof(ct.blend));
+        ct.width = d->target_width;
+        ct.height = d->target_height;
         if (j)
             ct = d->more[j - 1];
+        // its own size, which lays a block-linear surface out; the pass's surface clip keeps the draw within all
+        uint32_t width = ct.width ? ct.width : d->width, height = ct.height ? ct.height : d->height;
         // block-linear (one-GOB blocks) takes the width in samples, pitch-linear the row pitch in bytes
         uint32_t w[] = {
             MTHD(0, R_SET_COLOR_TARGET_A(j), 9), (uint32_t)(ct.addr >> 32), (uint32_t)ct.addr,
-            ct.blocklinear ? d->width * sx : ct.pitch, d->height * sy, ct.addr ? ct.format : 0,
+            ct.blocklinear ? width * sx : ct.pitch, height * sy, ct.addr ? ct.format : 0,
             ct.blocklinear ? 0 : CT_MEMORY_LAYOUT_PITCH, draw_target_layers(d, j), d->layer_pitch[j] >> 2, 0,
             MTHD(0, R_SET_CT_WRITE(j), 1), ct.write_mask,
             MTHD(0, R_SET_BLEND(j), 1), ct.blend[0],

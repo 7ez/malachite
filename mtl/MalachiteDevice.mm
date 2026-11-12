@@ -3564,8 +3564,26 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     }
 
     unsigned ncolour = 0;
+    // the pass draws in the area every attachment has
+    MTLRenderPassAttachmentDescriptor *sized[9] = {};
+    for (unsigned i = 0; i < 8; i++)
+        sized[i] = descriptor.colorAttachments[i];
+    if (_pass.zt)
+        sized[8] = da.texture ? da : sa;
+    for (MTLRenderPassAttachmentDescriptor *a : sized) {
+        MalachiteTexture *t = (MalachiteTexture *)a.texture;
+        struct malachite_sub s;
+        if (![t isKindOfClass:[MalachiteTexture class]] || !t->_backing ||
+            !malachite_sub(t, a.level, a.slice, a.depthPlane, &s))
+            continue;
+        uint32_t sx, sy;
+        malachite_grid(t->_samples, &sx, &sy);
+        _pass.width = _pass.width ? MIN(_pass.width, s.width / sx) : s.width / sx;
+        _pass.height = _pass.height ? MIN(_pass.height, s.height / sy) : s.height / sy;
+    }
     for (unsigned i = 0; i < 8; i++)
         ncolour += descriptor.colorAttachments[i].texture != nil;
+    bool first = true;
     for (unsigned i = 0; i < 8; i++) {
         MTLRenderPassColorAttachmentDescriptor *ca = descriptor.colorAttachments[i];
         MalachiteTexture *t = (MalachiteTexture *)ca.texture;
@@ -3588,10 +3606,9 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         }
         uint32_t sx, sy;
         malachite_grid(t->_samples, &sx, &sy);
-        if (!_pass.width) {
-            _pass.width = s.width / sx;
-            _pass.height = s.height / sy;
+        if (first) {
             _pass.samples = t->_samples;
+            first = false;
         }
         // a multisampled attachment resolved into another texture at the end (a level and slice of it)
         id<MTLTexture> rt = ca.resolveTexture;
@@ -3630,6 +3647,9 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
             ct.addr = sva;
             ct.pitch = 0;  // a block-linear target has none
             ct.blocklinear = 1;
+        } else {
+            ct.width = s.width / sx;
+            ct.height = s.height / sy;
         }
         _formats[i] = f;
         _attached[i] = t;
@@ -3655,14 +3675,10 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         _pass.pitch = ct.pitch;
         _pass.format = ct.format;
         _pass.target_blocklinear = ct.blocklinear;
+        _pass.target_width = ct.width;
+        _pass.target_height = ct.height;
         _pass.clear = ct.clear;
         memcpy(_pass.clear_rgba, ct.clear_rgba, sizeof(ct.clear_rgba));
-    }
-    if (!_pass.width && _pass.zt) {  // depth and stencil only
-        uint32_t sx, sy;
-        malachite_grid(z->_samples, &sx, &sy);
-        _pass.width = zs.width / sx;
-        _pass.height = zs.height / sy;
     }
     [self setViewport:(MTLViewport){ 0, 0, (double)_pass.width, (double)_pass.height, 0, 1 }];
     [self setScissorRect:(MTLScissorRect){ 0, 0, _pass.width, _pass.height }];
@@ -4766,13 +4782,26 @@ static bool malachite_resolves(MTLStoreAction action)
     }
 }
 
+// colour target n of d with its size, which may be more than the pass's
+static struct nvgpu_target malachite_target(const struct nvgpu_draw &d, unsigned n)
+{
+    struct nvgpu_target ct = { d.target, d.pitch, 0, d.target_blocklinear };
+    ct.width = d.target_width;
+    ct.height = d.target_height;
+    if (n)
+        ct = d.more[n - 1];
+    if (!ct.width) {
+        ct.width = d.width;
+        ct.height = d.height;
+    }
+    return ct;
+}
+
 // attachment n's texture header, at the memory the pass draws it to
 - (void)attachment:(unsigned)n header:(unsigned int *)header of:(const struct nvgpu_draw &)d
 {
-    struct nvgpu_target ct = { d.target, d.pitch, 0, d.target_blocklinear };
-    if (n)
-        ct = d.more[n - 1];
-    struct tex_desc td = { ct.addr, d.width, d.height, ct.pitch, (enum tex_format)_formats[n], (int)ct.blocklinear };
+    struct nvgpu_target ct = malachite_target(d, n);
+    struct tex_desc td = { ct.addr, ct.width, ct.height, ct.pitch, (enum tex_format)_formats[n], (int)ct.blocklinear };
     tex_fill_header(header, &td);
 }
 
@@ -5276,23 +5305,21 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
 // draws since have covered (their scissors).
 - (void)attachment:(unsigned)n copy:(unsigned int *)header of:(const struct nvgpu_draw &)d
 {
-    struct nvgpu_target ct = { d.target, d.pitch, 0, d.target_blocklinear };
-    if (n)
-        ct = d.more[n - 1];
+    struct nvgpu_target ct = malachite_target(d, n);
     uint32_t bpp = tex_format_info((enum tex_format)_formats[n]).bytes;
-    uint32_t pitch = ct.blocklinear ? (d.width * bpp + 63) & ~63u : ct.pitch;
-    uint32_t rows = ct.blocklinear ? (d.height + 7) & ~7u : d.height;
+    uint32_t pitch = ct.blocklinear ? (ct.width * bpp + 63) & ~63u : ct.pitch;
+    uint32_t rows = ct.blocklinear ? (ct.height + 7) & ~7u : ct.height;
     id<MTLDevice> device = ((id<MTLCommandBuffer>)_cb).device;
     uint64_t to = malachite_scratch(device, n, (NSUInteger)pitch * rows);
-    struct tex_desc td = { to, d.width, d.height, pitch, (enum tex_format)_formats[n], (int)ct.blocklinear };
+    struct tex_desc td = { to, ct.width, ct.height, pitch, (enum tex_format)_formats[n], (int)ct.blocklinear };
     tex_fill_header(header, &td);
-    uint32_t x0 = 0, y0 = 0, x1 = d.width, y1 = d.height;
+    uint32_t x0 = 0, y0 = 0, x1 = ct.width, y1 = ct.height;
     if (!ct.blocklinear && _copied[n]) {
         const uint32_t *w = _written[n];
         x0 = w[0];
         y0 = w[1];
-        x1 = MIN(w[2], d.width);
-        y1 = MIN(w[3], d.height);
+        x1 = MIN(w[2], ct.width);
+        y1 = MIN(w[3], ct.height);
     }
     _copied[n] = true;
     memset(_written[n], 0, sizeof(_written[n]));
@@ -5308,15 +5335,15 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
         struct nvgpu_draw c = {};
         c.target = to;
         c.pitch = ct.blocklinear ? 0 : pitch;  // a block-linear target has none, and the scratch's 64-byte rows aren't 128
-        c.width = d.width;
-        c.height = d.height;
+        c.width = ct.width;
+        c.height = ct.height;
         c.target_blocklinear = ct.blocklinear;
         c.format = tex_format_info(malachite_raw[raw].format).target;
         c.vs = [(MTLIOAccelBuffer *)copy->_vcode gpuAddress];
         c.ps = [(MTLIOAccelBuffer *)copy->_fcode gpuAddress];
         c.vs_regs = copy->_vertex.reg_count;
         c.ps_regs = copy->_fragment.reg_count;
-        struct tex_desc src = { ct.addr, d.width, d.height, ct.pitch, malachite_raw[raw].format, (int)ct.blocklinear };
+        struct tex_desc src = { ct.addr, ct.width, ct.height, ct.pitch, malachite_raw[raw].format, (int)ct.blocklinear };
         tex_fill_header(c.headers[0], &src);
         struct samp_desc def = malachite_default_sampler();
         tex_fill_sampler(c.samplers[0], &def);
@@ -5328,8 +5355,8 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
         c.primitive = 4;
         c.count = 3;
         c.instances = 1;
-        c.viewport[2] = d.width;
-        c.viewport[3] = d.height;
+        c.viewport[2] = ct.width;
+        c.viewport[3] = ct.height;
         c.viewport[5] = 1;
         c.scissor[0] = x0;
         c.scissor[1] = y0;
@@ -5338,9 +5365,9 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
         malachite_record(_cb, MALACHITE_CMD_DRAW, &c, sizeof(c));
         return;
     }
-    struct nvgpu_copy2d c = { ct.addr, to, pitch, pitch, d.width * bpp, d.height, ct.blocklinear, ct.blocklinear,
+    struct nvgpu_copy2d c = { ct.addr, to, pitch, pitch, ct.width * bpp, ct.height, ct.blocklinear, ct.blocklinear,
                               ct.blocklinear ? rows : 0, ct.blocklinear ? rows : 0 };
-    if (x0 || y0 || x1 != d.width || y1 != d.height) {
+    if (x0 || y0 || x1 != ct.width || y1 != ct.height) {
         uint64_t at = (uint64_t)y0 * pitch + x0 * bpp;
         c = (struct nvgpu_copy2d){ ct.addr + at, to + at, pitch, pitch, (x1 - x0) * bpp, y1 - y0 };
     }
@@ -5356,14 +5383,12 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
     for (unsigned i = 0; i < 8; i++) {
         if (_formats[i] < 0)
             continue;
-        struct nvgpu_target ct = { d.target, d.pitch, 0, d.target_blocklinear };
-        if (i)
-            ct = d.more[i - 1];
-        uint32_t bpp = tex_format_info((enum tex_format)_formats[i]).bytes, bytes = d.width * bpp;
-        uint32_t h = d.height, w = d.width;
+        struct nvgpu_target ct = malachite_target(d, i);
+        uint32_t bpp = tex_format_info((enum tex_format)_formats[i]).bytes, bytes = ct.width * bpp;
+        uint32_t h = ct.height, w = ct.width;
         // only the rect copied when there is one: a frame of whole-target copies runs the machine out of memory
         const uint32_t *r = malachite_snap_rect;
-        bool cut = r[2] && d.width >= r[0] + r[2] && d.height >= r[1] + r[3];
+        bool cut = r[2] && ct.width >= r[0] + r[2] && ct.height >= r[1] + r[3];
         uint32_t keep = cut ? r[2] * bpp : bytes, rows = cut ? r[3] : h, pitch = (keep + 255) & ~255u;
         id<MTLBuffer> snap = [((id<MTLCommandBuffer>)_cb).device newBufferWithLength:(NSUInteger)pitch * rows
                                                                             options:MTLResourceStorageModeShared];
@@ -5506,12 +5531,10 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
 // colour attachment i, all of it, where the pass draws it (its shadow, if it has one)
 - (bool)record:(NSString *)path attachment:(unsigned)i of:(const struct nvgpu_draw &)d
 {
-    struct nvgpu_target ct = { d.target, d.pitch, 0, d.target_blocklinear };
-    if (i)
-        ct = d.more[i - 1];
-    uint32_t bytes = d.width * tex_format_info((enum tex_format)_formats[i]).bytes;
+    struct nvgpu_target ct = malachite_target(d, i);
+    uint32_t bytes = ct.width * tex_format_info((enum tex_format)_formats[i]).bytes;
     return malachite_rec_copy(_cb, path, ct.addr, ct.blocklinear ? (bytes + 63) & ~63u : ct.pitch,
-                          ct.blocklinear ? (d.height + 7) & ~7u : 0, bytes, d.height);
+                          ct.blocklinear ? (ct.height + 7) & ~7u : 0, bytes, ct.height);
 }
 
 - (bool)record:(NSString *)path depthOf:(const struct nvgpu_draw &)d

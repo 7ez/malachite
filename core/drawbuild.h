@@ -153,6 +153,7 @@ struct render_draw {
     uint64_t target;  // colour target, address and pitch 128-byte aligned
     uint32_t pitch, width, height, format;
     uint32_t target_blocklinear;  // block-linear in one-GOB blocks, as a target drawn with depth must be
+    uint32_t target_width, target_height;  // as nvgpu_draw's
     uint64_t vs, ps;  // shader headers, each followed by its code, 128-byte aligned
     uint32_t vs_regs, ps_regs;
     uint64_t vs_cbuf, ps_cbuf;  // each stage's const bank 0 (0x1000 bytes), or 0 for none
@@ -194,6 +195,7 @@ struct render_draw {
         uint64_t addr;
         uint32_t pitch, format, blocklinear, write_mask;
         uint32_t blend[7];
+        uint32_t width, height;
     } more[7];
     uint32_t cull_face;  // OGL_SET_CULL_FACE value, 0 to cull nothing
     uint32_t front_ccw;  // counter-clockwise triangles face the front, not Metal's default clockwise ones

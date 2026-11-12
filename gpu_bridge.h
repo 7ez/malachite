@@ -153,12 +153,16 @@ struct nvgpu_target {
     unsigned int pitch, format, blocklinear, clear, write_mask;
     unsigned int blend[7];
     float clear_rgba[4];
+    unsigned int width, height;  // as target_width and target_height
 };
 
 struct nvgpu_draw {
     unsigned long long target;  // colour target: address and pitch 128-byte aligned
-    unsigned int pitch, width, height;
+    unsigned int pitch, width, height;  // width and height: the pass's, which every target has
     unsigned int target_blocklinear;  // the target is block-linear in one-GOB blocks (with depth it has to be)
+    // the target's own size in pixels, which may be more than the pass's (attachments of different sizes); 0 for the
+    // pass's
+    unsigned int target_width, target_height;
     unsigned int format;  // SET_COLOR_TARGET_FORMAT value (0xd5 RGBA8, 0xcf BGRA8)
     unsigned int clear;   // clear the target to clear_rgba first
     float clear_rgba[4];
