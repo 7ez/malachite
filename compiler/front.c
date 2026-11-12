@@ -2162,6 +2162,55 @@ static struct ir_val *nextafter_ir(struct ir_val *x, struct ir_val *y, enum ir_t
     return op2(IR_OR, t, s, konst(t, 0));
 }
 
+// remainder exactly: fmod by 2|y|, then |y| off once or twice to the nearest multiple, a tie to the even one
+static struct ir_val *remainder_ir(struct ir_val *x, struct ir_val *y)
+{
+    struct ir_val *ay = absf(y), *r = absf(fmod_precise(x, addf(ay, ay)));
+    struct ir_val *over = fcmp(FCMP_OGT, addf(r, r), ay);
+    r = sel(over, subf(r, ay), r);
+    over = op2(IR_PAND, IR_PRED, over, fcmp(FCMP_OGE, addf(r, r), ay));
+    return xorsign(sel(over, subf(r, ay), r), x);
+}
+
+// cbrt from MUFU's 2^(log2 |x| / 3) and a Newton step on the exact x - y^3 (y^2 in two parts), a tiny x scaled
+// by 2^75 so that the step doesn't flush
+static struct ir_val *cbrt_ir(struct ir_val *x)
+{
+    struct ir_val *ax = absf(x), *tiny = fcmp(FCMP_OLT, ax, fconst(0x1p-100f));
+    ax = sel(tiny, mulf(ax, fconst(0x1p75f)), ax);
+    struct ir_val *y = mufu(MUFU_EX2, mulf(mufu(MUFU_LG2, ax), fconst(1.0f / 3)));
+    struct ir_val *s = mulf(y, y), *sl = madf(y, y, negf(s));
+    struct ir_val *d = madf(negf(sl), y, madf(negf(s), y, ax));
+    struct ir_val *r = mulf(madf(d, mufu(MUFU_RCP, mulf(s, fconst(3))), y), sel(tiny, fconst(0x1p-25f), fconst(1)));
+    r = sel(fcmp(FCMP_OEQ, ax, finf(0)), ax, sel(fcmp(FCMP_OEQ, y, fconst(0)), fconst(0), r));  // y 0 for denormals
+    return xorsign(r, x);
+}
+
+// hypot: the larger magnitude times sqrt(1 + r^2), r the smaller over it; inf even with a NaN
+static struct ir_val *hypot_ir(struct ir_val *x, struct ir_val *y)
+{
+    struct ir_val *ax = absf(x), *ay = absf(y);
+    struct ir_val *hi = op2(IR_FMAX, IR_F32, ax, ay), *lo = op2(IR_FMIN, IR_F32, ax, ay);
+    struct ir_val *s = sel(fcmp(FCMP_OGT, hi, fconst(0x1p64f)), fconst(0x1p-64f), fconst(1));  // or 1 / hi flushes
+    struct ir_val *r = divf(mulf(lo, s), mulf(hi, s));
+    struct ir_val *h = mulf(hi, sqrtf_ir(madf(r, r, fconst(1)), 1));
+    h = sel(fcmp(FCMP_OEQ, hi, fconst(0)), fconst(0), h);
+    h = sel(fcmp(FCMP_UNO, x, y), addf(x, y), h);
+    return sel(fcmp(FCMP_OEQ, hi, finf(0)), finf(0), h);
+}
+
+// logb from the exponent field, or for a denormal its top bit's place
+static struct ir_val *logb_ir(struct ir_val *x)
+{
+    struct ir_val *bits = fbits(IR_AND, x, 0x7fffffff);
+    struct ir_val *e = ibin(IR_SUB, ibin(IR_SHR, bits, ik(23)), ik(127));
+    e = sel(icmp(IR_LT, bits, ik(0x00800000)), ibin(IR_SUB, op1(IR_FLO, IR_I32, bits), ik(149)), e);
+    struct ir_val *r = op1(IR_I2F, IR_F32, e);
+    r->aux = 1;
+    r = sel(icmp(IR_EQ, bits, ik(0)), finf(1), r);
+    return sel(icmp(IR_GE, bits, ik(0x7f800000)), mulf(x, x), r);
+}
+
 // sinh, cosh, tanh: Cephes' polynomials for a small |x|, x itself for a tiny one, and e^|x| / 2 so that sinh and
 // cosh reach 89.4
 static struct ir_val *hyperbolic(const char *name, struct ir_val *x)
@@ -2502,7 +2551,15 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
         struct ir_val *q = op1(IR_FRND, IR_F32, op2(IR_FMUL, IR_F32, a, mufu(MUFU_RCP, b)));
         q->aux = SASS_RND_TRUNC;
         r = op3(IR_FFMA, IR_F32, op1(IR_FNEG, IR_F32, q), b, a);
-    } else if (is_fn(name, "fdim"))
+    } else if (is_fn(name, "remainder"))
+        r = remainder_ir(a, b);
+    else if (is_fn(name, "cbrt"))
+        r = cbrt_ir(a);
+    else if (is_fn(name, "hypot"))
+        r = hypot_ir(a, b);
+    else if (is_fn(name, "logb"))
+        r = logb_ir(a);
+    else if (is_fn(name, "fdim"))
         r = sel(fcmp(FCMP_UNO, a, b), addf(a, b), sel(fcmp(FCMP_OGT, a, b), subf(a, b), fconst(0)));
     else if (is_fn(name, "exp10"))
         r = exp_precise(a, 3.32192802f, 7.05953696e-8f, 0);
