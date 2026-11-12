@@ -286,6 +286,7 @@ struct gpu_ctx {
     struct dma *compute_qmd;   // one QMD (reused per dispatch), its semaphore in the page's tail
     struct dma *compute_cbuf;  // const bank 0 (kernel params at 0x160+), then the texture pools
     uint64_t compute_qmdva, compute_cbufva, compute_semva;
+    uint64_t zero_va;  // Gpu::zero_page, read only: what vertex fetches past a stream's end read
     struct dma *draw_ring;
     uint64_t draw_ringva;
     // kern.malachite_prof_on: a timestamp the GPU writes after each draw, and what the draw was, for the time between
@@ -1966,6 +1967,7 @@ bool Gpu::graphics_channel(gpu_ctx *c, uint32_t chid)
                           c->compute_cbufva + TEX_SAMPLER_POOL, NVGPU_MAX_TEXTURES);
     render_set_tex_pools(&c->compute_ch, c->compute_cbufva + TEX_HEADER_POOL, NVGPU_MAX_TEXTURES,
                          c->compute_cbufva + TEX_SAMPLER_POOL, NVGPU_MAX_TEXTURES);
+    render_set_vertex_substitute(&c->compute_ch, c->zero_va);
     if (c->slm_va) {
         compute_set_local_memory(&c->compute_ch, c->slm_va, c->slm_per_tpc);
         render_set_local_memory(&c->compute_ch, c->slm_va, c->slm_size, c->slm_per_warp);
@@ -3027,9 +3029,11 @@ bool Gpu::compute_bridge_init(gpu_ctx *c)
         return false;
     c->compute_qmdva = vmm_alloc(&c->vm, c->compute_qmd->size, 0x1000);
     c->compute_cbufva = vmm_alloc(&c->vm, c->compute_cbuf->size, 0x1000);
-    if (!c->compute_qmdva || !c->compute_cbufva ||
+    c->zero_va = vmm_alloc(&c->vm, 0x1000, 0x1000);
+    if (!c->compute_qmdva || !c->compute_cbufva || !c->zero_va ||
         vmm_map_sys(&c->vm, c->compute_qmdva, c->compute_qmd, 0, c->compute_qmd->size, 0) ||
-        vmm_map_sys(&c->vm, c->compute_cbufva, c->compute_cbuf, 0, c->compute_cbuf->size, 0))
+        vmm_map_sys(&c->vm, c->compute_cbufva, c->compute_cbuf, 0, c->compute_cbuf->size, 0) ||
+        !map_slack(c, c->zero_va))
         return false;
     vmm_flush(&gpu);
     c->compute_sem = (volatile uint32_t *)((uint8_t *)c->compute_qmd->cpu + 0x800);  // sem lives in the QMD page tail
@@ -3039,6 +3043,7 @@ bool Gpu::compute_bridge_init(gpu_ctx *c)
                           c->compute_cbufva + TEX_SAMPLER_POOL, NVGPU_MAX_TEXTURES);
     render_set_tex_pools(&c->compute_ch, c->compute_cbufva + TEX_HEADER_POOL, NVGPU_MAX_TEXTURES,
                          c->compute_cbufva + TEX_SAMPLER_POOL, NVGPU_MAX_TEXTURES);
+    render_set_vertex_substitute(&c->compute_ch, c->zero_va);
     c->compute_ready = true;
     log_msg("Malachite: compute bridge ready (qmd va 0x%llx cbuf va 0x%llx)\n", c->compute_qmdva, c->compute_cbufva);
     issued(c);  // where the first launch starts, should it be run again
