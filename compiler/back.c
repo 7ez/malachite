@@ -461,6 +461,9 @@ static int pair_of(struct ir_val *v)
 // output, which sit in registers of their own in a row). AIRC_NODEFINTO=1 keeps the copy.
 static int *g_use_count;
 static int g_no_define_into;
+// by IR id: a bitcast (an or with 0, which marks the change of type) that is its source's register, or a source one
+// is; phi_into_def leaves them alone, as moving one's register would leave the other's behind
+static unsigned char *g_alias;
 
 static void count_uses(struct ir_func *f)
 {
@@ -470,7 +473,9 @@ static void count_uses(struct ir_func *f)
             if (v->id >= n)
                 n = v->id + 1;
     free(g_use_count);
+    free(g_alias);
     g_use_count = calloc(n, sizeof(*g_use_count));
+    g_alias = calloc(n, 1);
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v; v = v->next)
             for (unsigned i = 0; i < v->nsrc; i++)
@@ -1511,6 +1516,12 @@ static void lower_value(struct ir_val *v)
             break;
         if (is_logic(v) && lower_lop3(v))
             break;
+        if (v->op == IR_OR && v->src[1]->op == IR_CONST && !v->src[1]->imm && v->src[0]->op != IR_CONST &&
+            v->type != IR_I64 && v->src[0]->type != IR_I64 && v->src[0]->type != IR_PRED) {
+            v->vreg = vreg_of(v->src[0]);
+            g_alias[v->id] = g_alias[v->src[0]->id] = 1;
+            break;
+        }
         struct ir_val *in;
         int sel = byte_select(v, &in);
         if (sel >= 0 && g_folded[in->id]) {
@@ -2083,7 +2094,7 @@ static void lower_late_def(struct ir_val *p, struct ir_val *v)
 
 static void phi_into_def(struct ir_block *b, struct ir_val *p, struct ir_val *v)
 {
-    if (airc_pass_off("AIRC_NOPHIDEF") || p->type == IR_I64 || v->type != p->type ||
+    if (airc_pass_off("AIRC_NOPHIDEF") || p->type == IR_I64 || v->type != p->type || g_alias[v->id] || g_alias[p->id] ||
         ((v->op < IR_ADD || v->op > IR_FRND) && v->op != IR_SEL) ||
         v->block != b || p->vreg < 0 || v->vreg < 0 || g_phi_moved[v->id] || g_phi_moved[p->id] ||
         g_phi_outside[p->id] || g_vregs[v->vreg].size != 1 || g_vregs[v->vreg].next != -1 ||
