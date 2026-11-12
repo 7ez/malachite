@@ -3697,6 +3697,7 @@ static void inline_call(LLVMValueRef call, LLVMValueRef fn);
 static int call_sub(LLVMValueRef call, LLVMValueRef fn);
 static void control_point(LLVMValueRef call);
 static void picked_from(struct sub_param *param, struct ptr from);
+static struct sub_param *picker(enum space space);
 static void note_picked_uses(void);
 
 static LLVMValueRef first_node(LLVMModuleRef m, const char *name)
@@ -4650,6 +4651,43 @@ static struct ir_val *word_of(struct ir_val *x, unsigned at, unsigned bits)
     return x->type == IR_I32 ? x : NULL;
 }
 
+// A pointer read from an array of them at an index known at run time (buffers or textures and samplers copied into
+// a local array): a select over those stored in it of the kind the first element holds. In local memory the index
+// is a byte offset from p.off, which any 8-byte slot to the alloca's end may be.
+static struct ptr picked_ptr(struct ptr p)
+{
+    struct ptr q = { 0 };
+    int local = p.space == SP_LOCAL;
+    unsigned n = local ? (p.slot - (unsigned)p.off) / 8 : p.count;
+    for (unsigned k = 0; k < n; k++) {
+        unsigned at = local ? 8 * k : k * p.stride;
+        struct private_ptr *e = private_ptr(local ? 0x80000000u | (unsigned)(p.off + at) : private_var(p, at));
+        if (!e || (q.base && e->p.space != q.space))
+            continue;
+        if (!e->block)
+            airc_fail("loading a pointer from thread memory that holds no one pointer");
+        if (!q.base) {
+            q.space = e->p.space;
+            if (q.space == SP_TEXTURE || q.space == SP_SAMPLER)
+                q.param = picker(q.space);
+        }
+        if (q.param)
+            picked_from(q.param, e->p);
+        if (e->p.space == SP_LOCAL && e->p.slot > q.slot)
+            q.slot = e->p.slot;
+        struct ir_val *v = ptr_value(e->p);
+        if (!q.base) {
+            q.base = v;
+            continue;
+        }
+        struct ir_val *is = local ? icmp(IR_EQ, p.base, konst(IR_I32, at)) : index_is(p, k);
+        q.base = sel(is, v, q.base);
+    }
+    if (!q.base)
+        airc_fail("loading a pointer from thread memory that holds none");
+    return q;
+}
+
 static void load(LLVMValueRef in)
 {
     LLVMValueRef addr = LLVMGetOperand(in, 0);
@@ -4678,6 +4716,10 @@ static void load(LLVMValueRef in)
         if (!e || !e->block)
             airc_fail("loading a pointer from thread memory that holds no one pointer");
         insert(g_ptrs, in, 0, g_scope)->p = e->p;
+        return;
+    }
+    if (is_ptr(t) && (p.space == SP_PRIVATE || p.space == SP_LOCAL)) {
+        insert(g_ptrs, in, 0, g_scope)->p = picked_ptr(p);
         return;
     }
     if (is_ptr(t) && (p.space == SP_TEXTURE || p.space == SP_SAMPLER)) {
