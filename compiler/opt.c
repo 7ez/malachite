@@ -527,10 +527,28 @@ static void splice(struct ir_block *b, struct ir_block *m)
     m->nsucc = 0;
 }
 
+// by block id: how many loops it is in, a loop being the blocks from its header to its back edge in layout order
+static unsigned char *g_loops;
+
+static void find_loops(struct ir_func *f)
+{
+    int *pos = ir_alloc(f->nblocks * sizeof(*pos)), n = 0;
+    g_loops = ir_alloc(f->nblocks);
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        pos[b->id] = n++;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (unsigned i = 0; i < b->nsucc; i++)
+            if (pos[b->succ[i]->id] <= pos[b->id])
+                for (struct ir_block *c = b->succ[i]; c != b->next; c = c->next)
+                    g_loops[c->id] += g_loops[c->id] < 255;
+}
+
 // A derivative (or an implicit-LOD sample) needs its whole quad, and a branch that splits the quad leaves it a
 // neighbour short: an Apple GPU has its value anyway. So an if, or an if/else, around one, of side-effect-free
 // code only, runs on both paths and selects the result. Where the paths met goes on the end, so an enclosing if
-// sees one block.
+// sees one block. So does a tiny one in a loop: the loop is then one block, which can be unrolled.
+#define FLATTEN_VALUES 2
+
 static int flatten(struct ir_func *f, struct ir_block *b)
 {
     struct ir_val *t = b->last;
@@ -552,7 +570,11 @@ static int flatten(struct ir_func *f, struct ir_block *b)
             return 0;
         side[0] = side[1] = 1;
     }
-    if (!deriv)
+    unsigned n = 0;
+    for (int k = 0; k < 2; k++)
+        for (struct ir_val *v = side[k] ? s[k]->first : NULL; v; v = v->next)
+            n += v->op != IR_BR;
+    if (!deriv && (!g_loops[b->id] || n > FLATTEN_VALUES))
         return 0;
     for (int k = 0; k < 2; k++)
         if (side[k])
@@ -1342,7 +1364,7 @@ static int unroll(struct ir_func *f)
         return 0;
     for (struct ir_block *b = f->entry; b; b = b->next) {
         struct ir_val *t = b->last;
-        if (!t || t->op != IR_CBR || b->npreds != 2 || (b->succ[0] == b) == (b->succ[1] == b))
+        if (!t || t->op != IR_CBR || b->npreds != 2 || (b->succ[0] == b) == (b->succ[1] == b) || b->unrolled)
             continue;
         struct ir_block *pre = b->preds[b->preds[0] == b], *out = b->succ[b->succ[0] == b];
         unsigned nphi = 0, n = 0, maxid = 0;
@@ -1408,6 +1430,234 @@ static int unroll(struct ir_func *f)
     return changed;
 }
 
+// A loop of one block that loads, with a trip count only known when it starts, gets a loop of four copies of its
+// body ahead of it (two, if that makes more than UNROLL_LOADS loads), which runs while a whole round of copies is
+// left; the loop as it was runs the rest. The copies' loads are then in flight together. The counter has to step
+// by one towards a bound the loop doesn't change, which gives the trip count up front. Working that out costs
+// about as much as a trip of a small body, and a loop inside another pays it every time round the outer one, often
+// for a few trips (a 3x3 filter's rows): such a loop is unrolled only when its body is bigger than that.
+#define UNROLL_LOADS 8
+#define UNROLL_INNER_VALUES 12
+
+static struct ir_val *phi2(struct ir_block *b, enum ir_type type, struct ir_block *p0, struct ir_val *v0,
+                           struct ir_block *p1, struct ir_val *v1)
+{
+    struct ir_val *p = ir_add(b, IR_PHI, type, 2);
+    p->phi_blocks = ir_alloc(2 * sizeof(*p->phi_blocks));
+    p->phi_blocks[0] = p0;
+    p->src[0] = v0;
+    p->phi_blocks[1] = p1;
+    p->src[1] = v1;
+    return p;
+}
+
+static struct ir_val *cmp2(struct ir_block *b, int aux, struct ir_val *x, struct ir_val *y)
+{
+    struct ir_val *c = ir_op2(b, IR_CMP, IR_PRED, x, y);
+    c->aux = aux;
+    return c;
+}
+
+static void branch(struct ir_block *b, struct ir_val *cond, struct ir_block *yes, struct ir_block *no)
+{
+    struct ir_val *t = ir_add(b, IR_CBR, IR_VOID, 1);
+    t->src[0] = cond;
+    ir_edge(b, yes);
+    ir_edge(b, no);
+}
+
+static int in_loop(const struct ir_val *v, const struct ir_block *b)
+{
+    return v->block == b && v->op != IR_CONST;
+}
+
+// how loop b goes round as the condition it stays in on, its counter's compare reading the counter (or the counter
+// plus *off) as its first source and the bound as its second; -1 if it can't be counted
+static int stays_while(const struct ir_block *b, struct ir_val **counter, uint32_t *off, int32_t *step)
+{
+    struct ir_val *cmp = b->last->src[0];
+    if (cmp->op != IR_CMP || cmp->block != b || (cmp->aux & IR_FCMP))
+        return -1;
+    int side = !in_loop(cmp->src[0], b);
+    if (!in_loop(cmp->src[side], b) || in_loop(cmp->src[!side], b))
+        return -1;
+    const struct ir_val *k = cmp->src[side];
+    uint32_t s;
+    *off = 0;
+    if (k->op != IR_PHI)
+        k = stepped(k, off);
+    if (!k || k->op != IR_PHI || k->block != b || k->type != IR_I32 || stepped(phi_from(k, b), &s) != k ||
+        (s != 1 && s != ~0u))
+        return -1;
+    *counter = (struct ir_val *)k;
+    *step = (int32_t)s;
+    int cond = cmp->aux & 7;
+    if (side)  // the bound first: LT and GT swap, LE and GE
+        cond = cond < IR_LT ? cond : cond < IR_GT ? cond + 2 : cond - 2;
+    if (b->succ[0] != b)  // EQ and NE, LT and GE, LE and GT
+        cond = cond < IR_LT ? cond ^ 1 : 7 - cond;
+    int up = *step > 0;
+    if (cond == IR_NE || cond == (up ? IR_LT : IR_GT) || cond == (up ? IR_LE : IR_GE))
+        return cond;
+    return -1;
+}
+
+static int unroll_partial(struct ir_func *f)
+{
+    if (airc_no_unroll || airc_pass_off("AIRC_NOUNROLL"))
+        return 0;
+    for (struct ir_block *b = f->entry; b; b = b->next) {
+        struct ir_val *t = b->last, *k;
+        if (!t || t->op != IR_CBR || b->npreds != 2 || (b->succ[0] == b) == (b->succ[1] == b) || b->unrolled)
+            continue;
+        struct ir_block *pre = b->preds[b->preds[0] == b], *out = b->succ[b->succ[0] == b];
+        unsigned nphi = 0, n = 0, maxid = 0, loads = 0;
+        int keep = 0;
+        for (struct ir_val *v = b->first; v != t; v = v->next) {
+            nphi += v->op == IR_PHI;
+            n += v->op != IR_PHI;
+            keep |= unroll_keeps(v);
+            loads += v->op == IR_LDG || v->op == IR_LDS || v->op == IR_LDL || v->op == IR_TEX;
+            maxid = (unsigned)v->id > maxid ? (unsigned)v->id : maxid;
+        }
+        unsigned by = loads * 4 <= UNROLL_LOADS ? 4 : 2;
+        uint32_t off;
+        int32_t step;
+        int inner = g_loops[b->id] > 1 && n < UNROLL_INNER_VALUES;
+        int cond = keep || !loads || inner || n * by > UNROLL_VALUES ? -1 : stays_while(b, &k, &off, &step);
+        if (cond < 0)
+            continue;
+        struct ir_val *cmp = b->last->src[0], *bound = cmp->src[in_loop(cmp->src[0], b)];
+        int sign = cmp->aux & IR_SIGNED;
+
+        // g: the trips less one, d, and from them the copies' share, all; bu: the copies; h: into the loop for the
+        // rest, if any is left; join: after it, where the loop's values read past it meet
+        struct ir_block *g = ir_block(f), *bu = ir_block(f), *h = ir_block(f), *join = ir_block(f);
+        g->func = bu->func = h->func = join->func = b->func;
+        struct ir_val *init = phi_from(k, pre), *first = init;
+        if (off)
+            first = ir_op2(g, IR_ADD, IR_I32, init, ir_const(g, IR_I32, off));
+        struct ir_val *zero = ir_const(g, IR_I32, 0), *one = ir_const(g, IR_I32, 1);
+        struct ir_val *d = step > 0 ? ir_op2(g, IR_SUB, IR_I32, bound, first) : ir_op2(g, IR_SUB, IR_I32, first, bound);
+        if (cond != IR_NE) {
+            // a bound the counter starts past: one trip
+            struct ir_val *in = cmp2(g, cond | sign, first, bound);
+            if (cond == IR_LE || cond == IR_GE)
+                d = ir_op2(g, IR_ADD, IR_I32, d, one);
+            struct ir_val *sel = ir_add(g, IR_SEL, IR_I32, 3);
+            sel->src[0] = in;
+            sel->src[1] = d;
+            sel->src[2] = zero;
+            d = sel;
+        }
+        struct ir_val *trips = ir_op2(g, IR_ADD, IR_I32, d, one);
+        struct ir_val *all = ir_op2(g, IR_AND, IR_I32, trips, ir_const(g, IR_I32, -by));
+        struct ir_val *rest = ir_op2(g, IR_AND, IR_I32, trips, ir_const(g, IR_I32, by - 1));
+        struct ir_val *end = ir_op2(g, step > 0 ? IR_ADD : IR_SUB, IR_I32, init, all);
+        branch(g, cmp2(g, IR_NE, all, zero), bu, h);
+
+        struct ir_val **map = calloc(maxid + 1, sizeof(*map)), **phis = malloc(nphi * sizeof(*phis)),
+                      **body = malloc(n * sizeof(*body)), **next = malloc(nphi * sizeof(*next)),
+                      **last = malloc(nphi * sizeof(*last)), **round = malloc(nphi * sizeof(*round));
+        nphi = n = 0;
+        for (struct ir_val *v = b->first; v != t; v = v->next) {
+            if (v->op == IR_PHI) {
+                phis[nphi] = v;
+                round[nphi] = phi2(bu, v->type, g, phi_from(v, pre), bu, NULL);
+                map[v->id] = round[nphi++];
+            } else {
+                body[n++] = v;
+            }
+        }
+        for (unsigned it = 0; it < by; it++) {
+            for (unsigned i = 0; it && i < nphi; i++) {
+                struct ir_val *s = phi_from(phis[i], b);
+                next[i] = s->block == b ? map[s->id] : s;
+            }
+            for (unsigned i = 0; i < nphi; i++) {
+                if (it)
+                    map[phis[i]->id] = next[i];
+                last[i] = map[phis[i]->id];
+            }
+            for (unsigned i = 0; i < n; i++) {
+                struct ir_val *v = body[i], *c = ir_add(bu, v->op, v->type, v->nsrc);
+                c->aux = v->aux;
+                c->imm = v->imm;
+                for (unsigned j = 0; j < v->nsrc; j++)
+                    c->src[j] = v->src[j] && v->src[j]->block == b ? map[v->src[j]->id] : v->src[j];
+                map[v->id] = c;
+            }
+        }
+        for (unsigned i = 0; i < nphi; i++) {
+            struct ir_val *s = phi_from(phis[i], b);
+            next[i] = s->block == b ? map[s->id] : s;
+            round[i]->src[1] = next[i];
+        }
+        struct ir_val *counted = NULL;
+        for (unsigned i = 0; i < nphi; i++)
+            if (phis[i] == k)
+                counted = next[i];
+        branch(bu, cmp2(bu, IR_NE, counted, end), bu, h);
+
+        for (unsigned i = 0; i < nphi; i++) {
+            struct ir_val *q = phi2(h, phis[i]->type, g, phi_from(phis[i], pre), bu, next[i]);
+            for (unsigned j = 0; j < phis[i]->nsrc; j++)
+                if (phis[i]->phi_blocks[j] == pre) {
+                    phis[i]->phi_blocks[j] = h;
+                    phis[i]->src[j] = q;
+                }
+        }
+        // what the loop's values read past it are when no trip is left for it: its last copies'
+        struct ir_val **past = calloc(maxid + 1, sizeof(*past));
+        for (struct ir_block *c = f->entry; c; c = c->next)
+            for (struct ir_val *u = c == b ? NULL : c->first; u; u = u->next)
+                for (unsigned i = 0; i < u->nsrc; i++)
+                    if (u->src[i] && u->src[i]->block == b && !past[u->src[i]->id])
+                        past[u->src[i]->id] = u->src[i];
+        for (unsigned i = 0; i < nphi; i++)
+            if (past[phis[i]->id])
+                map[phis[i]->id] = last[i];
+        for (struct ir_val *v = b->first; v != t; v = v->next)
+            if (past[v->id]) {
+                struct ir_val *skip = phi2(h, v->type, g, ir_add(g, IR_UNDEF, v->type, 0), bu, map[v->id]);
+                past[v->id] = phi2(join, v->type, b, v, h, skip);
+            }
+        branch(h, cmp2(h, IR_NE, rest, zero), b, join);
+        ir_add(join, IR_BR, IR_VOID, 0);
+        ir_edge(join, out);
+
+        for (struct ir_block *c = f->entry; c; c = c->next) {
+            if (c == b || c == join)
+                continue;
+            for (struct ir_val *u = c->first; u; u = u->next) {
+                for (unsigned i = 0; i < u->nsrc; i++)
+                    if (u->src[i] && u->src[i]->block == b)
+                        u->src[i] = past[u->src[i]->id];
+                for (unsigned i = 0; u->op == IR_PHI && i < u->nsrc; i++)
+                    if (u->phi_blocks[i] == b)
+                        u->phi_blocks[i] = join;
+            }
+        }
+        for (unsigned i = 0; i < pre->nsucc; i++)
+            if (pre->succ[i] == b)
+                pre->succ[i] = g;
+        b->succ[b->succ[0] == b] = join;
+        b->unrolled = 1;
+        bu->unrolled = 2;
+        free(past);
+        free(round);
+        free(last);
+        free(next);
+        free(body);
+        free(phis);
+        free(map);
+        airc_unrolled = 1;
+        // the predecessor lists are stale until reorder() runs again
+        return 1;
+    }
+    return 0;
+}
+
 void airc_opt(struct ir_func *f)
 {
     g_no_range = airc_pass_off("AIRC_NORANGE");
@@ -1422,6 +1672,7 @@ void airc_opt(struct ir_func *f)
     for (;;) {
         int changed = 0;
         reorder(f);
+        find_loops(f);
         int reshaped = 0;  // the predecessor lists are stale until the next reorder
         for (struct ir_block *b = f->entry; b; b = b->next) {
             for (struct ir_val *v = b->first; v; v = v->next)
@@ -1436,7 +1687,7 @@ void airc_opt(struct ir_func *f)
         changed |= local_forward(f);
         changed |= dce(f);
         // unrolled only once the rest is clean, so a body's size is what's left of it
-        if (!changed && !unroll(f))
+        if (!changed && !unroll(f) && !unroll_partial(f))
             break;
     }
 }

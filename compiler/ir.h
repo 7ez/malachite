@@ -154,6 +154,7 @@ struct ir_block {
     struct ir_block *next;  // in creation order; opt puts them in reverse postorder
     int dead;
     int func;  // 0 the shader's own, i + 1 subroutine i's (as opt finds them)
+    int unrolled;  // opt: a loop left after unrolling it (1) or made of its copies (2), not unrolled again
 };
 
 // Subroutines: the functions called rather than inlined, each a body of its own with no edge into it. Their

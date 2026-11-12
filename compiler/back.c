@@ -2539,6 +2539,101 @@ static void link_before(struct ir_val *x, struct ir_val *at)
     at->prev = x;
 }
 
+// what a load reads: 1 global, 2 shared, 3 local; 0 for a value that touches no memory and has no effect
+static int load_space(const struct ir_val *v)
+{
+    switch (v->op) {
+    case IR_LDG:
+    case IR_TEX:
+        return 1;
+    case IR_LDS:
+        return 2;
+    case IR_LDL:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+static int store_space(const struct ir_val *v)
+{
+    switch (v->op) {
+    case IR_STG:
+    case IR_SUST:
+        return 1;
+    case IR_ATOM:
+        return IR_ATOMA_SHARED(v->aux) ? 2 : 1;
+    case IR_STS:
+        return 2;
+    case IR_STL:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
+static int pure(const struct ir_val *v)
+{
+    return v->op == IR_CONST || v->op == IR_CBUF || v->op == IR_PROJ || (v->op >= IR_ADD && v->op <= IR_FRND) ||
+           (v->op >= IR_CMP && v->op <= IR_ADDI);
+}
+
+// An unrolled loop's copies come one after another, and allocated in that order a copy's registers are taken
+// again by the next one, which keeps the scheduler from starting the next copy's loads early. The loads go first
+// instead, the copies' in turn, with what their addresses take. A load stays behind anything that may change
+// what it reads.
+static void loads_first(struct ir_func *f)
+{
+    int n = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            if (v->id >= n)
+                n = v->id + 1;
+    unsigned char *ok = calloc(n, 1), *need = calloc(n, 1);
+    const struct ir_val **writes = malloc(n * sizeof(*writes));
+    for (struct ir_block *b = f->entry; b; b = b->next) {
+        if (b->unrolled != 2)
+            continue;
+        int fenced = 0;
+        unsigned nw = 0;
+        for (struct ir_val *v = b->first; v; v = v->next) {
+            if (v->op == IR_PHI)
+                continue;
+            int sp = load_space(v), in = pure(v) || (sp && !fenced);
+            if (sp && !(v->op == IR_LDG && g_readonly_load[v->id]))
+                for (unsigned i = 0; i < nw && in; i++)
+                    in = store_space(writes[i]) != sp || (v->op == IR_LDG && writes[i]->op == IR_STG &&
+                                                          apart(v, writes[i]));
+            for (unsigned i = 0; i < v->nsrc && in; i++)
+                if (v->src[i] && v->src[i]->block == b && v->src[i]->op != IR_PHI)
+                    in = ok[v->src[i]->id];
+            ok[v->id] = in;
+            if (store_space(v))
+                writes[nw++] = v;
+            fenced |= v->op == IR_BAR || v->op == IR_CALL || v->op == IR_KILL;
+        }
+        for (struct ir_val *v = b->last; v; v = v->prev) {
+            if (!ok[v->id] || (!load_space(v) && !need[v->id]))
+                continue;
+            need[v->id] = 1;
+            for (unsigned i = 0; i < v->nsrc; i++)
+                if (v->src[i] && v->src[i]->block == b)
+                    need[v->src[i]->id] = 1;
+        }
+        struct ir_val *at = b->first;
+        while (at->op == IR_PHI || need[at->id])
+            at = at->next;
+        for (struct ir_val *v = at, *next; v; v = next) {
+            next = v->next;
+            if (need[v->id])
+                link_before(v, at);
+        }
+    }
+    free(writes);
+    free(need);
+    free(ok);
+}
+
 static void spill_values(struct ir_func *f)
 {
     if (!g_nspill_ids)
@@ -4744,6 +4839,7 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
     g_win_end = 0;
     find_readonly_loads(f);
     drop_overwritten_stores(f);
+    loads_first(f);
     plan_regions(f);
     find_fused_compares(f);
     g_no_mods = airc_pass_off("AIRC_NOMODS");
