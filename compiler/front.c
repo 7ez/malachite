@@ -6607,8 +6607,8 @@ static int md_int(LLVMValueRef v, unsigned *out)
 static void fragment_outputs(LLVMValueRef list)
 {
     int n = LLVMGetMDNodeNumOperands(list);
-    if (n > 8)
-        airc_fail("more than 8 fragment outputs");
+    if (n > (int)(sizeof g_out / sizeof g_out[0]))  // colour targets, past 7, fail below
+        airc_fail("more than %zu fragment outputs", sizeof g_out / sizeof g_out[0]);
     LLVMValueRef *o = calloc(n, sizeof(*o));
     LLVMGetMDNodeOperands(list, o);
     for (int i = 0; i < n; i++) {
