@@ -25,17 +25,17 @@ Still experimental. RTX 30 series only for now, support for other cards is plann
 Geekbench and Unigine (windowed) on an RTX 3060 in a macOS 26.7.1 VM (GPU passed through), both drivers in the same VM on
 the same day, November 2026.
 
-| | Malachite | NullMoth 2.7.1 |
+| | Malachite 2026.11.12 | NullMoth 2.9 |
 |---|---|---|
-| Geekbench 7 Metal | [72351](https://browser.geekbench.com/v7/gpu/364417) | [80868](https://browser.geekbench.com/v7/gpu/364005) |
-| Geekbench 7 OpenCL | [48106](https://browser.geekbench.com/v7/gpu/364423) | [8835](https://browser.geekbench.com/v7/gpu/364012), one kernel fails to build |
-| Geekbench 6 Metal | [65772](https://browser.geekbench.com/v6/compute/6963086) | [21544](https://browser.geekbench.com/v6/compute/6962922), Face Detection fails validation |
-| Geekbench 6 OpenCL | [54125](https://browser.geekbench.com/v6/compute/6963087) | [43308](https://browser.geekbench.com/v6/compute/6962923) |
-| Unigine Heaven 4.0, 1920x1080 | 8.2 fps | doesn't finish, OpenGL falls back to software |
-| Unigine Valley 1.0, 1920x1080 | 37.7 fps | doesn't finish, OpenGL falls back to software |
+| Geekbench 7 Metal | [73911](https://browser.geekbench.com/v7/gpu/390372) | [80819](https://browser.geekbench.com/v7/gpu/390474) |
+| Geekbench 7 OpenCL | [52259](https://browser.geekbench.com/v7/gpu/390343) | [43784](https://browser.geekbench.com/v7/gpu/390480), Path Tracer scores about 3k |
+| Geekbench 6 Metal | [68599](https://browser.geekbench.com/v6/compute/6970952) | [22235](https://browser.geekbench.com/v6/compute/6970997), Face Detection fails validation |
+| Geekbench 6 OpenCL | [56796](https://browser.geekbench.com/v6/compute/6970955) | [74223](https://browser.geekbench.com/v6/compute/6970984) |
+| Unigine Heaven 4.0, 1920x1080 | 31.4 fps | doesn't finish, OpenGL falls back to software |
+| Unigine Valley 1.0, 1920x1080 | 35.2 fps | doesn't finish, OpenGL falls back to software |
 
-NullMoth's compiler still beats ours in Geekbench 7 Metal overall, most of all in Feature Matching and Super Resolution.
-That's being worked on.
+NullMoth's compiler still beats ours in Geekbench 7 Metal overall, most of all in Feature Matching, and in every
+Geekbench 6 OpenCL workload. That's being worked on.
 
 ## Install
 
