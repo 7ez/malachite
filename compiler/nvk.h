@@ -78,10 +78,12 @@ enum nvk_arg_kind {
 // a post-tessellation vertex function is the tessellation stage; the tessellation init stage before it is generated
 enum nvk_stage { NVK_COMPUTE, NVK_VERTEX, NVK_FRAGMENT, NVK_TESS_EVAL, NVK_TESS_INIT };
 
-// what the tessellation init stage leaves the tessellation stage in the patch's attributes: the patch id and
-// instance id (from the base instance), then the per-patch [[attribute(n)]]s in location order
-#define NVK_PATCH_IDS 0x20
-#define NVK_PATCH_INPUT(inputs, n) (0x30 + 16 * __builtin_popcount((inputs) & ((1u << (n)) - 1)))
+// what the tessellation init stage leaves the tessellation stage in the patch's attributes: the per-patch
+// [[attribute(n)]]s in location order, then the patch id and instance id (from the base instance) where they fit.
+// A patch has 128 words, the levels' 8 and 30 attributes: with 30 there's no room for the ids.
+#define NVK_PATCH_INPUT(inputs, n) (0x20 + 16 * __builtin_popcount((inputs) & ((1u << (n)) - 1)))
+#define NVK_PATCH_IDS(inputs) (0x20 + 16 * __builtin_popcount(inputs))
+#define NVK_MAX_PATCH_INPUTS 30
 
 struct nvk_arg {
     uint8_t kind;
