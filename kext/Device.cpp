@@ -533,21 +533,27 @@ class Gpu : public IOService
         map_slack(c, base);
         return base + 0x1000;
     }
-    // the same on 64 KB, for big pages: the ends of the range it took to get there go back
+    // the same on 64 KB, for big pages, with a big page's worth of zeros before it: helper lanes of an image blit
+    // read a row or two before the buffer of rows it copies from (8 KB before, a 2048-pixel row)
     uint64_t map_va_big(gpu_ctx *c, uint64_t size)
     {
-        uint64_t base = vmm_alloc(&c->vm, size + 0x12000, 0x10000);
+        uint64_t base = vmm_alloc(&c->vm, size + 0x11000, 0x10000);
         if (!base)
             return 0;
-        vmm_free(&c->vm, base, 0xf000);
-        vmm_free(&c->vm, base + size + 0x11000, 0x1000);
-        map_slack(c, base + 0xf000);
+        for (uint64_t off = 0; off < 0x10000; off += 0x1000)
+            map_slack(c, base + off);
         return base + 0x10000;
     }
-    void map_va_free(gpu_ctx *c, uint64_t va, uint64_t size)
+    // the zero pages before a mapping of size bytes, as map_va or map_va_big made it
+    static uint64_t slack_before(uint64_t size, bool vram)
     {
-        vmm_unmap(&c->vm, va - 0x1000, size + 0x2000);
-        vmm_free(&c->vm, va - 0x1000, size + 0x2000);
+        return vram && size >= 0x10000 ? 0x10000 : 0x1000;
+    }
+    void map_va_free(gpu_ctx *c, uint64_t va, uint64_t size, bool vram)
+    {
+        uint64_t before = slack_before(size, vram);
+        vmm_unmap(&c->vm, va - before, size + before + 0x1000);
+        vmm_free(&c->vm, va - before, size + before + 0x1000);
     }
     IOReturn set_kind(gpu_ctx *c, uint64_t va, uint8_t kind, bool compress);
     // the first bytes of the code at va, for the log of a launch that faulted
@@ -2281,7 +2287,7 @@ IOReturn Gpu::gpu_map(gpu_ctx *c, IOMemoryDescriptor *md, uint64_t *outva)
     c->cached_sys |= flags != 0;
     if (!va || (copy ? vmm_map_vram(&c->vm, va, copy, size, 0) : vmm_map_sys(&c->vm, va, d, 0, size, flags))) {
         if (va)
-            map_va_free(c, va, size);
+            map_va_free(c, va, size, false);
         mem_free(d->pages);
         md->complete();
         memset(d, 0, sizeof(*d));
@@ -2310,7 +2316,7 @@ IOReturn Gpu::gpu_map_vram(gpu_ctx *c, uint64_t vram, uint64_t size, uint64_t *o
     uint64_t va = size >= 0x10000 ? map_va_big(c, size) : map_va(c, size);
     if (!va || vmm_map_vram(&c->vm, va, vram, size, 0)) {
         if (va)
-            map_va_free(c, va, size);
+            map_va_free(c, va, size, true);
         return kIOReturnError;
     }
     memset(&gpu_maps[slot], 0, sizeof(gpu_maps[slot]));
@@ -2333,9 +2339,11 @@ IOReturn Gpu::gpu_unmap(uint64_t va, uint64_t size, gpu_ctx *owner)
         return kIOReturnNotFound;
     gpu_maps[i].ctx->kind_va = 0;
     struct dma *d = &gpu_maps[i].dma;
-    vmm_unmap(&gpu_maps[i].ctx->vm, va - 0x1000, d->size + 0x2000);
+    uint64_t before = slack_before(d->size, gpu_maps[i].vram != 0);
+    vmm_unmap(&gpu_maps[i].ctx->vm, va - before, d->size + before + 0x1000);
     vmm_flush(&gpu);
-    vmm_free(&gpu_maps[i].ctx->vm, va - 0x1000, d->size + 0x2000);  // the address and its page tables are the next map's
+    // the address and its page tables are the next map's
+    vmm_free(&gpu_maps[i].ctx->vm, va - before, d->size + before + 0x1000);
     if (d->pages)
         mem_free(d->pages);
     if (d->handle) {
