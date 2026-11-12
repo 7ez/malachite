@@ -1357,10 +1357,10 @@ static void parse_instruction(struct ll_module *m, struct body *f, const struct 
         struct ll_type *ft = type(m, fty);
         if (ft->kind != T_FUNC)
             fail(m, "call through a non-function type");
-        struct ll_value *list[64];
+        struct ll_value *list[256];
         unsigned n = 0;
         for (unsigned i = 0; i < ft->nparams; i++) {
-            if (n == 63)
+            if (n == 255)
                 fail(m, "call with too many arguments");
             enum tkind k = type(m, ft->params[i])->kind;
             if (k == T_LABEL) {
@@ -1372,7 +1372,7 @@ static void parse_instruction(struct ll_module *m, struct body *f, const struct 
                 list[n++] = val_rel(&o, ft->params[i]);
             }
         }
-        while (ft->vararg && more(&o) && n < 63)
+        while (ft->vararg && more(&o) && n < 255)
             list[n++] = val_pair(&o);
         v = inst(m, f, LLVMCall, ft->ret, !is_void(m, ft->ret), n + 1);
         memcpy(v->ops, list, n * sizeof(*list));
