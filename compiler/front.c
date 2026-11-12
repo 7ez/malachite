@@ -1646,6 +1646,7 @@ static struct ir_val *clampf(struct ir_val *x, struct ir_val *lo, struct ir_val 
 #define LOG2E_HI 1.44269502f
 #define LOG2E_LO 1.92596303e-8f
 #define LN2 0.693147182f
+#define LN2_LO -1.90465421e-9f
 #define FLT_NAN 0x7fc00000u
 
 static struct ir_val *icmp(int cond, struct ir_val *a, struct ir_val *b);
@@ -2162,6 +2163,39 @@ static struct ir_val *nextafter_ir(struct ir_val *x, struct ir_val *y, enum ir_t
     return op2(IR_OR, t, s, konst(t, 0));
 }
 
+// e^x - 1 = 2^k (e^r - 1) + 2^k - 1, x = k ln 2 + r, |r| <= ln 2 / 2, e^r - 1 = r + r^2/2 + r^3 P(r); taken as
+// 2 (2^(k-1) (e^r - 1) + 2^(k-1) - 1/2) so that 2^(k-1) is finite and the sum exact up to k = 128
+static struct ir_val *expm1_ir(struct ir_val *x)
+{
+    static const float k[] = { 0.00019823933f, 0.0013933758f, 0.00833342131f, 0.0416664779f, 0.166666657f };
+    struct ir_val *kf = op1(IR_FRND, IR_F32, mulf(x, fconst(LOG2E_HI)));
+    kf->aux = SASS_RND_NEAREST;
+    kf = clampf(kf, fconst(-26), fconst(128));
+    struct ir_val *r = madf(negf(kf), fconst(LN2_LO), madf(negf(kf), fconst(LN2), x));
+    struct ir_val *em = madf(mulf(r, r), madf(r, poly(r, k, 5), fconst(0.5f)), r);
+    struct ir_val *ki = op1(IR_F2I, IR_I32, kf);
+    ki->aux = 1;
+    struct ir_val *h = ibin(IR_SHL, ibin(IR_ADD, ki, ik(126)), ik(23));
+    struct ir_val *v = mulf(madf(h, em, subf(h, fconst(0.5f))), fconst(2));
+    v = sel(fcmp(FCMP_OLT, x, fconst(-18)), fconst(-1), v);  // -inf too, where e^r - 1 is NaN
+    return sel(fcmp(FCMP_OLT, absf(x), fconst(0x1p-25f)), x, v);  // keeps -0
+}
+
+// log(1 + x): log2_split's log of u = 1 + x in two parts times ln 2 in two parts, u's rounding put back as
+// (x - (u - 1)) / u. u isn't normal for x -1 (-inf) or below it (NaN), inf or NaN, where MUFU.LG2 is right.
+static struct ir_val *log1p_ir(struct ir_val *x)
+{
+    struct ir_val *u = addf(x, fconst(1)), *hi, *lo;
+    log2_split(u, &hi, &lo);
+    struct ir_val *h = mulf(hi, fconst(LN2));
+    struct ir_val *l = madf(hi, fconst(LN2_LO), madf(lo, fconst(LN2), madf(hi, fconst(LN2), negf(h))));
+    struct ir_val *c = divf(subf(x, subf(u, fconst(1))), u);
+    struct ir_val *v = addf(h, addf(l, c));
+    struct ir_val *normal = op2(IR_PAND, IR_PRED, fcmp(FCMP_OGT, u, fconst(0)), fcmp(FCMP_OLT, u, finf(0)));
+    v = sel(normal, v, mulf(mufu(MUFU_LG2, u), fconst(LN2)));
+    return sel(fcmp(FCMP_OLT, absf(x), fconst(0x1p-25f)), x, v);  // keeps -0
+}
+
 // remainder exactly: fmod by 2|y|, then |y| off once or twice to the nearest multiple, a tie to the even one
 static struct ir_val *remainder_ir(struct ir_val *x, struct ir_val *y)
 {
@@ -2551,7 +2585,11 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
         struct ir_val *q = op1(IR_FRND, IR_F32, op2(IR_FMUL, IR_F32, a, mufu(MUFU_RCP, b)));
         q->aux = SASS_RND_TRUNC;
         r = op3(IR_FFMA, IR_F32, op1(IR_FNEG, IR_F32, q), b, a);
-    } else if (is_fn(name, "remainder"))
+    } else if (is_fn(name, "expm1"))
+        r = expm1_ir(a);
+    else if (is_fn(name, "log1p"))
+        r = log1p_ir(a);
+    else if (is_fn(name, "remainder"))
         r = remainder_ir(a, b);
     else if (is_fn(name, "cbrt"))
         r = cbrt_ir(a);
