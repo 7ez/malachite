@@ -2196,6 +2196,31 @@ static struct ir_val *log1p_ir(struct ir_val *x)
     return sel(fcmp(FCMP_OLT, absf(x), fconst(0x1p-25f)), x, v);  // keeps -0
 }
 
+// erfc |x| = e^(-x^2) (1 + p(q)) / (1 + 2|x|), q = (|x| - 2) / (|x| + 2), to 10.05 (past it, below the least
+// denormal); x^2's rounding comes back as a factor 1 + its error
+static struct ir_val *erfc_abs(struct ir_val *a)
+{
+    static const float k[] = { 2.59099579e-05f, -0.000365826301f, -0.00125354168f, 0.00127438351f, 0.00863884017f,
+                               -0.0080448715f,  -0.0542052649f,   0.164053187f,    -0.166031346f,  -0.0927639008f,
+                               0.276978403f };
+    struct ir_val *q = divf(subf(a, fconst(2)), addf(a, fconst(2)));
+    struct ir_val *v = divf(addf(poly(q, k, 11), fconst(1)), madf(a, fconst(2), fconst(1)));
+    struct ir_val *s = mulf(a, a);
+    v = mulf(v, exp_precise(negf(s), LOG2E_HI, LOG2E_LO, 0));
+    v = madf(v, madf(negf(a), a, s), v);
+    return sel(fcmp(FCMP_OGT, a, fconst(10.0546875f)), fconst(0), v);
+}
+
+// erf: x P(x^2) below 1, 1 - erfc |x| from there, where erfc is under a sixth
+static struct ir_val *erf_ir(struct ir_val *x)
+{
+    static const float k[] = { 7.85386146e-05f, -0.000801019371f, 0.00518832775f, -0.0268538129f,
+                               0.112835854f,    -0.37612626f,     1.12837911f };
+    struct ir_val *ax = absf(x);
+    struct ir_val *big = xorsign(subf(fconst(1), erfc_abs(ax)), x);
+    return sel(fcmp(FCMP_OLT, ax, fconst(1)), mulf(x, poly(mulf(x, x), k, 7)), big);
+}
+
 // remainder exactly: fmod by 2|y|, then |y| off once or twice to the nearest multiple, a tie to the even one
 static struct ir_val *remainder_ir(struct ir_val *x, struct ir_val *y)
 {
@@ -2585,6 +2610,11 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
         struct ir_val *q = op1(IR_FRND, IR_F32, op2(IR_FMUL, IR_F32, a, mufu(MUFU_RCP, b)));
         q->aux = SASS_RND_TRUNC;
         r = op3(IR_FFMA, IR_F32, op1(IR_FNEG, IR_F32, q), b, a);
+    } else if (is_fn(name, "erf"))
+        r = erf_ir(a);
+    else if (is_fn(name, "erfc")) {
+        r = erfc_abs(absf(a));
+        r = sel(fcmp(FCMP_OLT, a, fconst(0)), subf(fconst(2), r), r);
     } else if (is_fn(name, "expm1"))
         r = expm1_ir(a);
     else if (is_fn(name, "log1p"))
