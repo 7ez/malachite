@@ -3419,6 +3419,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     uint32_t _vstrides[31];  // each vertex buffer's stride as bound, for a layout whose stride is dynamic
     __unsafe_unretained id _vbound[31], _fbound[31];  // the buffers, for set*BufferOffset (kept by the command buffer)
     MTLRenderPassDescriptor *_rpd;  // the recorder's: the pass as asked for
+    MTLRenderPassDescriptor *_deferred;  // the pass, when a resolve waits on a store action given at the end
     __unsafe_unretained id _textures[MALACHITE_BINDINGS];  // the fragment stage's, by Metal index
     __unsafe_unretained id _samplers[MALACHITE_BINDINGS];
     __unsafe_unretained id _vtextures[MALACHITE_BINDINGS];  // the vertex stage's
@@ -3623,6 +3624,13 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         _pass.scissors[j][3] = _pass.height;
     }
     _pass.layers = (uint32_t)descriptor.renderTargetArrayLength;
+    bool later = (da.resolveTexture && da.storeAction == MTLStoreActionUnknown) ||
+                 (sa.resolveTexture && sa.storeAction == MTLStoreActionUnknown);
+    for (unsigned i = 0; i < 8; i++)
+        later |= descriptor.colorAttachments[i].resolveTexture &&
+                 descriptor.colorAttachments[i].storeAction == MTLStoreActionUnknown;
+    if (later)
+        _deferred = [descriptor copy];
     if (malachite_trace) {
         MTLRenderPassColorAttachmentDescriptor *ca = descriptor.colorAttachments[0];
         for (int i = 0; i < 4; i++) {
@@ -3986,18 +3994,39 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 {
 }
 
+static bool malachite_resolves(MTLStoreAction action)
+{
+    return action == MTLStoreActionMultisampleResolve || action == MTLStoreActionStoreAndMultisampleResolve;
+}
+
+// what the pass left unknown: a resolve into the descriptor's target is only asked for here
 - (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index
 {
-    if (index < 8 && action == MTLStoreActionDontCare)
+    if (index >= 8)
+        return;
+    if (action == MTLStoreActionDontCare)
         _store[index].bytes = 0;
+    MTLRenderPassColorAttachmentDescriptor *ca = _deferred.colorAttachments[index];
+    if (ca.resolveTexture && ca.storeAction == MTLStoreActionUnknown && malachite_resolves(action) &&
+        _attached[index] && _attached[index]->_samples)
+        [self setColorResolveTexture:ca.resolveTexture slice:ca.resolveSlice depthPlane:ca.resolveDepthPlane
+                               level:ca.resolveLevel atIndex:index];
 }
 
 - (void)setDepthStoreAction:(MTLStoreAction)action
 {
+    MTLRenderPassDepthAttachmentDescriptor *da = _deferred.depthAttachment;
+    if (da.resolveTexture && da.storeAction == MTLStoreActionUnknown && malachite_resolves(action) && _zattached &&
+        _zattached->_samples)
+        [self setDepthResolveTexture:da.resolveTexture slice:da.resolveSlice depthPlane:0 level:da.resolveLevel];
 }
 
 - (void)setStencilStoreAction:(MTLStoreAction)action
 {
+    MTLRenderPassStencilAttachmentDescriptor *sa = _deferred.stencilAttachment;
+    if (sa.resolveTexture && sa.storeAction == MTLStoreActionUnknown && malachite_resolves(action) && _zattached &&
+        _zattached->_samples)
+        [self setStencilResolveTexture:sa.resolveTexture slice:sa.resolveSlice depthPlane:0 level:sa.resolveLevel];
 }
 
 - (void)setVertexBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
@@ -5889,6 +5918,11 @@ static uint32_t malachite_vertex_format(MTLVertexFormat f, bool as_float)
 @property (copy, atomic) NSString *label;
 @end
 
+static MTLStoreAction malachite_stored(MTLStoreAction action)
+{
+    return malachite_resolves(action) ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore;
+}
+
 @implementation MalachiteParallelRenderCommandEncoder {
     __unsafe_unretained id<MTLCommandBuffer> _cb;
     MTLRenderPassDescriptor *_pass;
@@ -5920,26 +5954,32 @@ static uint32_t malachite_vertex_format(MTLVertexFormat f, bool as_float)
         d.depthAttachment.loadAction = MTLLoadActionLoad;
         d.stencilAttachment.loadAction = MTLLoadActionLoad;
     }
+    // each resolves what it has so far, the last one the whole pass
     for (NSUInteger i = 0; i < 8; i++)
-        d.colorAttachments[i].storeAction = MTLStoreActionStore;
-    d.depthAttachment.storeAction = MTLStoreActionStore;
-    d.stencilAttachment.storeAction = MTLStoreActionStore;
+        d.colorAttachments[i].storeAction = malachite_stored(_pass.colorAttachments[i].storeAction);
+    d.depthAttachment.storeAction = malachite_stored(_pass.depthAttachment.storeAction);
+    d.stencilAttachment.storeAction = malachite_stored(_pass.stencilAttachment.storeAction);
     id<MTLRenderCommandEncoder> e = [_cb renderCommandEncoderWithDescriptor:d];
     if (e)
         [_subs addObject:e];
     return e;
 }
 
+// for the sub-encoders made from now on
 - (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index
 {
+    if (index < 8)
+        _pass.colorAttachments[index].storeAction = action;
 }
 
 - (void)setDepthStoreAction:(MTLStoreAction)action
 {
+    _pass.depthAttachment.storeAction = action;
 }
 
 - (void)setStencilStoreAction:(MTLStoreAction)action
 {
+    _pass.stencilAttachment.storeAction = action;
 }
 
 - (void)setColorStoreActionOptions:(MTLStoreActionOptions)options atIndex:(NSUInteger)index
