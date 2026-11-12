@@ -116,6 +116,7 @@ extern "C" {
 #define R_SET_CT_WRITE(i) (0x1a00 + (i) * 4)
 #define R_SET_VERTEX_STREAM_A_FORMAT(j) (0x1c00 + (j) * 16)  // format, location hi, location lo, frequency
 #define R_SET_VERTEX_STREAM_SIZE_A(j) (0x0600 + (j) * 8)  // Turing+: replaces the 0x1f00 end address
+#define R_SET_VERTEX_STREAM_SUBSTITUTE_A 0x0f84  // address hi, lo
 #define R_SET_PIPELINE_SHADER(j) (0x2000 + (j) * 64)
 #define R_SET_PIPELINE_REGISTER_COUNT(j) (0x200c + (j) * 64)  // register count, binding, address hi, lo
 #define R_SET_SAMPLER_BINDING 0x1234

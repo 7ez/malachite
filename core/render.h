@@ -17,6 +17,9 @@ void render_set_local_memory(struct chan *ch, uint64_t va, uint64_t size, uint32
 // shader is header index | sampler index << 20
 void render_set_tex_pools(struct chan *ch, uint64_t header_va, uint32_t headers, uint64_t sampler_va,
                           uint32_t samplers);
+// where a vertex fetch past the end of its stream reads instead: a page of zeros. The channel starts with 0, which
+// faults it.
+void render_set_vertex_substitute(struct chan *ch, uint64_t va);
 
 // colour target formats, as SET_COLOR_TARGET_FORMAT takes them
 #define RENDER_RGBA8 0xd5  // A8B8G8R8: bytes R, G, B, A

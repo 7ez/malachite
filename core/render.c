@@ -111,6 +111,12 @@ void render_set_tex_pools(struct chan *ch, uint64_t header_va, uint32_t headers,
     chan_submit(ch, push, sizeof(push) / 4);
 }
 
+void render_set_vertex_substitute(struct chan *ch, uint64_t va)
+{
+    uint32_t push[] = { MTHD(0, R_SET_VERTEX_STREAM_SUBSTITUTE_A, 2), (uint32_t)(va >> 32), (uint32_t)va };
+    chan_submit(ch, push, sizeof(push) / 4);
+}
+
 void render_set_local_memory(struct chan *ch, uint64_t va, uint64_t size, uint32_t per_warp)
 {
     uint32_t push[] = {
