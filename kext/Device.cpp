@@ -113,14 +113,19 @@ SYSCTL_PROC(_kern, OID_AUTO, malachite_stats, CTLTYPE_OPAQUE | CTLFLAG_RD | CTLF
             "what the NVIDIA driver's GPU calls cost");
 
 // What the primitive engine fetches for a draw, as the methods last set it: each attribute's SET_VERTEX_ATTRIBUTE_A,
-// each stream's format (on with bit 12), address and size, and the index buffer. A stream turned off keeps its
-// address, and one never set reads from 0. PE_UNKNOWN marks a stream whose state the log doesn't know.
+// each stream's format (on with bit 12), address, size and instancing, the index buffer and the last draw's range.
+// A stream turned off keeps its address, and one never set reads from 0. PE_UNKNOWN marks a stream whose state the
+// log doesn't know. Streams 16 to 31 are never set: off since the channel was made.
 struct pe_state {
     uint32_t attributes[RENDER_ATTRIBUTES];
-    uint32_t format[RENDER_STREAMS], size[RENDER_STREAMS];
+    uint32_t format[RENDER_STREAMS], size[RENDER_STREAMS], divisor[RENDER_STREAMS];
     uint64_t addr[RENDER_STREAMS];
+    uint32_t instanced;  // a bit a stream
     uint64_t index;
-    uint32_t index_size;
+    uint32_t index_size, index_format;
+    uint32_t restart, restart_index;
+    uint32_t first, count, instances, base_instance;
+    int32_t base_vertex;
 };
 static const uint32_t PE_UNKNOWN = ~0u;
 static const uint32_t PE_STREAM_ON = 1u << 12;
@@ -132,10 +137,15 @@ static void pe_unknown(pe_state *s)
     for (uint32_t j = 0; j < RENDER_STREAMS; j++) {
         s->format[j] = PE_UNKNOWN;
         s->size[j] = 0;
+        s->divisor[j] = 0;
         s->addr[j] = 0;
     }
+    s->instanced = 0;
     s->index = ~0ull;
-    s->index_size = 0;
+    s->index_size = s->index_format = 0;
+    s->restart = s->restart_index = 0;
+    s->first = s->count = s->instances = s->base_instance = 0;
+    s->base_vertex = 0;
 }
 
 // as build_draw (core/render.c) sets it
@@ -148,9 +158,20 @@ static void pe_draw(pe_state *s, const struct render_draw *r)
         s->format[j] = r->streams[j].addr ? r->streams[j].stride | PE_STREAM_ON : 0;
         s->addr[j] = r->streams[j].addr;
         s->size[j] = r->streams[j].size;
+        s->divisor[j] = r->streams[j].divisor;
+        if (r->streams[j].addr && r->streams[j].divisor)
+            s->instanced |= 1u << j;
     }
     s->index = r->index;
     s->index_size = r->index_size;
+    s->index_format = r->index_format;
+    s->restart = draw_restarts(r->primitive, r->restart, r->index != 0);
+    s->restart_index = draw_restart_index(r->restart, r->restart_index, r->index_format);
+    s->first = r->first;
+    s->count = r->count;
+    s->instances = r->instances;
+    s->base_instance = r->base_instance;
+    s->base_vertex = r->base_vertex;
 }
 
 // a method of a run applied to s: 1 for a draw of vertices, 2 for an indexed one, else 0
@@ -166,19 +187,37 @@ static int pe_method(pe_state *s, uint32_t m, uint32_t v)
             s->addr[j] = (uint64_t)v << 32 | (uint32_t)s->addr[j];
         else if (k == 2)
             s->addr[j] = (s->addr[j] & ~0xffffffffull) | v;
+        else
+            s->divisor[j] = v;
     } else if (m >= R_SET_VERTEX_STREAM_SIZE_A(0) && m < R_SET_VERTEX_STREAM_SIZE_A(RENDER_STREAMS)) {
         if (m % 8)
             s->size[(m - R_SET_VERTEX_STREAM_SIZE_A(0)) / 8] = v;
+    } else if (m >= R_SET_VERTEX_STREAM_INSTANCE_A(0) && m < R_SET_VERTEX_STREAM_INSTANCE_A(RENDER_STREAMS)) {
+        uint32_t bit = 1u << (m - R_SET_VERTEX_STREAM_INSTANCE_A(0)) / 4;
+        s->instanced = v ? s->instanced | bit : s->instanced & ~bit;
     } else if (m == R_SET_INDEX_BUFFER_A) {
         s->index = (uint64_t)v << 32 | (uint32_t)s->index;
     } else if (m == R_SET_INDEX_BUFFER_A + 4) {
         s->index = (s->index & ~0xffffffffull) | v;
     } else if (m == R_SET_INDEX_BUFFER_SIZE_A + 4) {
         s->index_size = v;
-    } else if (m == R_DRAW_VERTEX_ARRAY_BEGIN_END_A + 4) {
-        return 1;
-    } else if (m == R_DRAW_INDEX_BUFFER_BEGIN_END_A + 4) {
-        return 2;
+    } else if (m == R_SET_INDEX_BUFFER_E) {
+        s->index_format = v;
+    } else if (m == R_SET_DA_PRIMITIVE_RESTART) {
+        s->restart = v;
+    } else if (m == R_SET_DA_PRIMITIVE_RESTART + 4) {
+        s->restart_index = v;
+    } else if (m == R_SET_GLOBAL_BASE_VERTEX_INDEX) {
+        s->base_vertex = (int32_t)v;
+    } else if (m == R_SET_GLOBAL_BASE_VERTEX_INDEX + 4) {
+        s->base_instance = v;
+    } else if (m == R_SET_DRAW_CONTROL_A + 4) {
+        s->instances = v;
+    } else if (m == R_DRAW_VERTEX_ARRAY_BEGIN_END_A || m == R_DRAW_INDEX_BUFFER_BEGIN_END_A) {
+        s->first = v;
+    } else if (m == R_DRAW_VERTEX_ARRAY_BEGIN_END_A + 4 || m == R_DRAW_INDEX_BUFFER_BEGIN_END_A + 4) {
+        s->count = v;
+        return m == R_DRAW_INDEX_BUFFER_BEGIN_END_A + 4 ? 2 : 1;
     }
     return 0;
 }
@@ -203,6 +242,28 @@ static bool pe_wrong(const pe_state *s, bool indexed, char *why, size_t n)
     if (indexed && s->index < 0x1000) {
         snprintf(why, n, "its index buffer is at %#llx", (unsigned long long)s->index);
         return true;
+    }
+    return false;
+}
+
+// An attribute of a draw from s, its vertices up to top (the highest index, or the last vertex), that starts past
+// the end of its stream, in a few words; false when none does. Such a fetch reads the vertex stream substitute
+// instead.
+static bool pe_past_end(const pe_state *s, uint32_t top, char *why, size_t n)
+{
+    for (uint32_t i = 0; i < RENDER_ATTRIBUTES; i++) {
+        uint32_t a = s->attributes[i], j = a & 0x1f;
+        if ((a & ATTR_INACTIVE) || j >= RENDER_STREAMS || s->format[j] == PE_UNKNOWN || !(s->format[j] & PE_STREAM_ON))
+            continue;
+        bool per_instance = (s->instanced >> j & 1) && s->divisor[j];
+        uint64_t v = per_instance ? s->base_instance + (s->instances ? s->instances - 1 : 0) / s->divisor[j]
+                                  : (uint64_t)((int64_t)top + s->base_vertex);
+        uint64_t at = v * (s->format[j] & 0xfff) + (a >> 7 & 0x3fff);
+        if (at >= s->size[j]) {
+            snprintf(why, n, "attribute %u reads vertex %llu of stream %u at +%#llx, past its %#x bytes", i,
+                     (unsigned long long)v, j, (unsigned long long)at, s->size[j]);
+            return true;
+        }
     }
     return false;
 }
@@ -506,6 +567,45 @@ class Gpu : public IOService
             return;
         }
     }
+    // len bytes at va of c's system memory, as the GPU reads them; false when no mapping of its pages holds them all
+    int read_slot = 0;  // the mapping the last read found, tried first
+    bool read_mapped(gpu_ctx *c, uint64_t va, void *out, uint32_t len)
+    {
+        for (int k = -1; k < gpu_maps_top; k++) {
+            int j = k < 0 ? read_slot : k;
+            if (j >= gpu_maps_top)
+                continue;
+            const gpu_mapping &m = gpu_maps[j];
+            if (m.ctx != c || !m.va || va < m.va || va + len > m.va + m.dma.size || !m.dma.handle || m.vram ||
+                m.shadow)
+                continue;
+            read_slot = j;
+            return ((IOMemoryDescriptor *)m.dma.handle)->readBytes(va - m.va, out, len) == len;
+        }
+        return false;
+    }
+    // The highest index an indexed draw from s reads, restart indices aside, or its last vertex; -1 when the indices
+    // aren't in system memory, -2 when the draw reads past its index buffer
+    int64_t pe_top(gpu_ctx *c, const pe_state *s, bool indexed)
+    {
+        if (!indexed)
+            return (int64_t)s->first + s->count - 1;
+        uint32_t bytes = 1u << s->index_format, top = 0;
+        if (s->index_format > RENDER_INDEX_U32 || ((uint64_t)s->first + s->count) * bytes > s->index_size)
+            return -2;
+        uint8_t w[256];
+        for (uint32_t i = 0; i < s->count && i < 0x10000; i += sizeof(w) / bytes) {
+            uint32_t k = s->count - i < sizeof(w) / bytes ? s->count - i : sizeof(w) / bytes;
+            if (!read_mapped(c, s->index + ((uint64_t)s->first + i) * bytes, w, k * bytes))
+                return -1;
+            for (uint32_t e = 0; e < k; e++) {
+                uint32_t v = bytes == 1 ? w[e] : bytes == 2 ? ((uint16_t *)w)[e] : ((uint32_t *)w)[e];
+                if (!(s->restart && v == s->restart_index) && v > top)
+                    top = v;
+            }
+        }
+        return top;
+    }
     // A run of the plugin's applied to s from the methods in its memory: the first of its draws that fetches from
     // nowhere, as "draw n of it: why" in out, or what kept it from being read; empty when none does
     void decode_run(gpu_ctx *c, uint64_t va, uint32_t words, pe_state *s, char *out, size_t n)
@@ -557,9 +657,16 @@ class Gpu : public IOService
             if (!drawn)
                 continue;
             draws++;
-            char why[64];
-            if (!*out && pe_wrong(s, drawn == 2, why, sizeof(why)))
+            if (*out)
+                continue;
+            char why[128];
+            int64_t top = pe_top(c, s, drawn == 2);
+            if (pe_wrong(s, drawn == 2, why, sizeof(why)) ||
+                (top >= 0 && pe_past_end(s, (uint32_t)top, why, sizeof(why))))
                 snprintf(out, n, "draw %u of it: %s", draws, why);
+            else if (top == -2)
+                snprintf(out, n, "draw %u of it: indices %u to %u, past its index buffer's %#x bytes", draws, s->first,
+                         s->first + s->count - 1, s->index_size);
         }
     }
     // Every context's mappings, in a table that doubles when full (a Metal process can hold tens of thousands of
@@ -3177,7 +3284,7 @@ void Gpu::recover(gpu_ctx *c)
         for (unsigned k = c->launch_next > 16 ? c->launch_next - 16 : 0; k < c->launch_next; k++) {
             const auto &l = c->launches[k % 16];
             bool pending = l.seq && (int32_t)(l.seq - *c->compute_sem) > 0;
-            char why[96];
+            char why[160];
             if (l.run_words) {
                 decode_run(c, l.run_va, l.run_words, &pe, why, sizeof(why));
                 if (pending)
@@ -3200,20 +3307,38 @@ void Gpu::recover(gpu_ctx *c)
                         (unsigned long long)l.zt, mapped(l.prog), mapped(l.vs), mapped(l.params[0]),
                         mapped(l.params[1]), mapped(l.params[2]), mapped(l.params[3]), mapped(l.target), mapped(l.zt));
             if (l.vs) {
-                // each stream on as stream:address/stride/size, and the streams the active attributes read
-                char streams[200] = "";
-                uint32_t reads = 0;
-                for (uint32_t j = 0, n = 0; j < RENDER_STREAMS && n < sizeof(streams); j++)
-                    if (l.pe.format[j] & PE_STREAM_ON)
-                        n += snprintf(streams + n, sizeof(streams) - n, " %u:%#llx/%u/%#x", j,
-                                      (unsigned long long)l.pe.addr[j], l.pe.format[j] & 0xfff, l.pe.size[j]);
-                for (uint32_t a : l.pe.attributes)
-                    if (!(a & ATTR_INACTIVE))
-                        reads |= 1u << (a & 0x1f);
-                bool wrong = pe_wrong(&l.pe, l.pe.index != 0, why, sizeof(why));
-                log_msg("Malachite:     vs %#llx, index %#llx+%#x, streams%s, attributes read streams %#x%s%s\n",
-                        (unsigned long long)l.vs, (unsigned long long)l.pe.index, l.pe.index_size,
-                        *streams ? streams : " none", reads, wrong ? ": " : "", wrong ? why : "");
+                // each stream on as stream:address/stride/size and /divisor when instanced, and each active attribute
+                // as attribute:stream+offset/SET_VERTEX_ATTRIBUTE_A
+                const pe_state &s = l.pe;
+                char streams[256] = "", attributes[256] = "";
+                for (uint32_t j = 0, n = 0; j < RENDER_STREAMS && n < sizeof(streams); j++) {
+                    if (!(s.format[j] & PE_STREAM_ON))
+                        continue;
+                    n += snprintf(streams + n, sizeof(streams) - n, " %u:%#llx/%u/%#x", j,
+                                  (unsigned long long)s.addr[j], s.format[j] & 0xfff, s.size[j]);
+                    if (s.instanced >> j & 1 && n < sizeof(streams))
+                        n += snprintf(streams + n, sizeof(streams) - n, "/%u", s.divisor[j]);
+                }
+                for (uint32_t i = 0, n = 0; i < RENDER_ATTRIBUTES && n < sizeof(attributes); i++)
+                    if (!(s.attributes[i] & ATTR_INACTIVE))
+                        n += snprintf(attributes + n, sizeof(attributes) - n, " %u:%u+%#x/%#x", i,
+                                      s.attributes[i] & 0x1f, s.attributes[i] >> 7 & 0x3fff, s.attributes[i]);
+                bool indexed = s.index != 0;
+                int64_t top = pe_top(c, &s, indexed);
+                bool wrong = pe_wrong(&s, indexed, why, sizeof(why)) ||
+                             (top >= 0 && pe_past_end(&s, (uint32_t)top, why, sizeof(why)));
+                char tops[24] = "not readable";
+                if (top >= 0)
+                    snprintf(tops, sizeof(tops), "to %lld", (long long)top);
+                else if (top == -2)
+                    strlcpy(tops, "past the buffer", sizeof(tops));
+                log_msg("Malachite:     vs %#llx, index %#llx+%#x format %u restart %u at %#x, %s %u+%u base %d, "
+                        "instances %u from %u, %s %s, streams%s\n",
+                        (unsigned long long)l.vs, (unsigned long long)s.index, s.index_size, s.index_format, s.restart,
+                        s.restart_index, indexed ? "indices" : "vertices", s.first, s.count, s.base_vertex, s.instances,
+                        s.base_instance, indexed ? "indices" : "vertices", tops, *streams ? streams : " none");
+                log_msg("Malachite:     attributes%s%s%s\n", *attributes ? attributes : " none", wrong ? ": " : "",
+                        wrong ? why : "");
             }
             if (l.seq == *c->compute_sem + 1) {
                 log_msg("Malachite:   the first one's code, ps or program then vs\n");
