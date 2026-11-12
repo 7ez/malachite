@@ -4209,23 +4209,28 @@ static void call(LLVMValueRef in)
             if (s->type == IR_PRED)  // a bool is 1 (or as a signed one, -1) or 0
                 s = sel(s, konst(IR_I32, sk == 's' ? -1 : 1), konst(IR_I32, 0));
             LLVMValueRef from = LLVMGetOperand(in, 0);
+            // a bfloat's bits, a float's top half, go through a float
+            int to_bfloat = LLVMGetTypeKind(lane_type(rt, l)) == LLVMBFloatTypeKind;
+            if (LLVMGetTypeKind(lane_type(LLVMTypeOf(from), l)) == LLVMBFloatTypeKind)
+                s = bfloat_to_float(s);
             if (sk == 'f' && dk != 'f' && is_i64(lane_type(rt, l))) {
                 set_pair(in, l, float_to_pair(widen(s), dk == 's'));
                 continue;
             }
             struct pair64 wide;
             if (dk == 'f' && sk != 'f' && is_i64(lane_type(LLVMTypeOf(from), l)) && pair_at(from, l, &wide)) {
-                set(in, l, narrow(pair_to_float(wide, sk == 's', dt == IR_F16), dt));
+                r = narrow(pair_to_float(wide, sk == 's', dt == IR_F16), dt);
+                set(in, l, to_bfloat ? float_to_bfloat(r) : r);
                 continue;
             }
             if (sk != 'f')  // a narrow lane keeps only its low bits
                 s = int_extend(s, 8 * scalar_bytes(lane_type(LLVMTypeOf(from), l)), sk == 's');
             if (dk == 'f' && sk == 'f') {
-                r = narrow(widen(s), dt);
+                r = to_bfloat ? float_to_bfloat(widen(s)) : narrow(widen(s), dt);
             } else if (dk == 'f') {  // from an integer
                 struct ir_val *i2f = op1(IR_I2F, IR_F32, s);
                 i2f->aux = sk == 's';
-                r = narrow(i2f, dt);
+                r = to_bfloat ? float_to_bfloat(i2f) : narrow(i2f, dt);
             } else if (sk == 'f' && dt == IR_PRED) {
                 // true unless 0 or a denormal (flushed), NaN included: the exponent isn't 0
                 r = op2(IR_AND, IR_I32, widen(s), konst(IR_I32, 0x7f800000));
