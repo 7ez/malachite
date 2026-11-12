@@ -1938,7 +1938,8 @@ static void lower_late_def(struct ir_val *p, struct ir_val *v)
 
 static void phi_into_def(struct ir_block *b, struct ir_val *p, struct ir_val *v)
 {
-    if (airc_pass_off("AIRC_NOPHIDEF") || p->type == IR_I64 || v->type != p->type || v->op < IR_ADD || v->op > IR_FRND ||
+    if (airc_pass_off("AIRC_NOPHIDEF") || p->type == IR_I64 || v->type != p->type ||
+        ((v->op < IR_ADD || v->op > IR_FRND) && v->op != IR_SEL) ||
         v->block != b || p->vreg < 0 || v->vreg < 0 || g_phi_moved[v->id] || g_phi_moved[p->id] ||
         g_phi_outside[p->id] || g_vregs[v->vreg].size != 1 || g_vregs[v->vreg].next != -1 ||
         g_vregs[p->vreg].size != 1 || g_vregs[p->vreg].next != -1)
