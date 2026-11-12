@@ -526,37 +526,41 @@ class Gpu : public IOService
             memset(zero_page->cpu, 0, 0x1000);
         return zero_page && !vmm_map_sys(&c->vm, va, zero_page, 0, 0x1000, VMM_RO);
     }
-    // A buffer's address range with its two zero pages: a fragment shader's helper lane reads one byte before its
-    // buffer (CoreAnimation's text blit does). Returns the buffer's address, 0 when the space is full.
+    // A buffer's address range with a zero page on either side: a fragment shader's helper lane reads one byte before
+    // its buffer (CoreAnimation's text blit does). Returns the buffer's address, 0 when the space is full.
     uint64_t map_va(gpu_ctx *c, uint64_t size)
     {
         uint64_t base = vmm_alloc(&c->vm, size + 0x2000, 0x1000);
         if (!base)
             return 0;
         map_slack(c, base);
+        map_slack(c, base + 0x1000 + size);
         return base + 0x1000;
     }
-    // the same on 64 KB, for big pages, with a big page's worth of zeros before it: helper lanes of an image blit
-    // read a row or two before the buffer of rows it copies from (8 KB before, a 2048-pixel row)
+    // the same on 64 KB, for big pages, with a big page's worth of zeros on either side: helper lanes of an image
+    // blit read a row or two before the buffer of rows it copies from (8 KB before, a 2048-pixel row), and a
+    // compositor's reduction kernel reads past the end of its partial sums, which Apple's GPUs return without a fault
     uint64_t map_va_big(gpu_ctx *c, uint64_t size)
     {
-        uint64_t base = vmm_alloc(&c->vm, size + 0x11000, 0x10000);
+        uint64_t base = vmm_alloc(&c->vm, size + 0x20000, 0x10000);
         if (!base)
             return 0;
-        for (uint64_t off = 0; off < 0x10000; off += 0x1000)
+        for (uint64_t off = 0; off < 0x10000; off += 0x1000) {
             map_slack(c, base + off);
+            map_slack(c, base + 0x10000 + size + off);
+        }
         return base + 0x10000;
     }
-    // the zero pages before a mapping of size bytes, as map_va or map_va_big made it
-    static uint64_t slack_before(uint64_t size, bool vram)
+    // the zero pages on each side of a mapping of size bytes, as map_va or map_va_big made it
+    static uint64_t slack(uint64_t size, bool vram)
     {
         return vram && size >= 0x10000 ? 0x10000 : 0x1000;
     }
     void map_va_free(gpu_ctx *c, uint64_t va, uint64_t size, bool vram)
     {
-        uint64_t before = slack_before(size, vram);
-        vmm_unmap(&c->vm, va - before, size + before + 0x1000);
-        vmm_free(&c->vm, va - before, size + before + 0x1000);
+        uint64_t s = slack(size, vram);
+        vmm_unmap(&c->vm, va - s, size + 2 * s);
+        vmm_free(&c->vm, va - s, size + 2 * s);
     }
     IOReturn set_kind(gpu_ctx *c, uint64_t va, uint8_t kind, bool compress);
     // the first bytes of the code at va, for the log of a launch that faulted
@@ -2343,11 +2347,11 @@ IOReturn Gpu::gpu_unmap(uint64_t va, uint64_t size, gpu_ctx *owner)
         return kIOReturnNotFound;
     gpu_maps[i].ctx->kind_va = 0;
     struct dma *d = &gpu_maps[i].dma;
-    uint64_t before = slack_before(d->size, gpu_maps[i].vram != 0);
-    vmm_unmap(&gpu_maps[i].ctx->vm, va - before, d->size + before + 0x1000);
+    uint64_t s = slack(d->size, gpu_maps[i].vram != 0);
+    vmm_unmap(&gpu_maps[i].ctx->vm, va - s, d->size + 2 * s);
     vmm_flush(&gpu);
     // the address and its page tables are the next map's
-    vmm_free(&gpu_maps[i].ctx->vm, va - before, d->size + before + 0x1000);
+    vmm_free(&gpu_maps[i].ctx->vm, va - s, d->size + 2 * s);
     if (d->pages)
         mem_free(d->pages);
     if (d->handle) {
