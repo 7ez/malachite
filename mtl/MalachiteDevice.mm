@@ -3526,6 +3526,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         _pass.zt_kind = z->_zt_kind;
         _pass.zt_compress = ((MalachiteBuffer *)z->_backing)->_one_image;
         _pass.zt_layer_pitch = z->_image ? (uint32_t)z->_layer_stride : 0;
+        _pass.zt_layers = z->_image ? z->_layers - (uint32_t)(da.texture ? da.slice : sa.slice) : 1;
         objc_setAssociatedObject(z->_backing, &malachite_kind_key, @YES, OBJC_ASSOCIATION_RETAIN);
         _pass.clear_zs = (da.texture && da.loadAction == MTLLoadActionClear) |
                          (sa.texture && sa.loadAction == MTLLoadActionClear) << 1;
@@ -3621,7 +3622,19 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         _formats[i] = f;
         _attached[i] = t;
         _attached_level[i] = t->_view_min + (uint32_t)ca.level;
-        _pass.layer_pitch[i] = t->_image ? (uint32_t)t->_layer_stride : 0;  // for a layered pass
+        // for a layered pass: the array layers from the slice on, or a 3D level's depth planes from the attached one
+        if (t->_image && t->_type == MTLTextureType3D) {
+            struct malachite_lvl v = malachite_image_level(t->_format, t->_width, t->_height, t->_depth,
+                                                           t->_view_min + (uint32_t)ca.level);
+            _pass.layer_pitch[i] = (uint32_t)v.slice;
+            _pass.target_layers[i] = v.depth - (uint32_t)ca.depthPlane;
+        } else if (t->_image) {
+            _pass.layer_pitch[i] = (uint32_t)t->_layer_stride;
+            _pass.target_layers[i] = t->_layers - (uint32_t)ca.slice;
+        } else {
+            _pass.layer_pitch[i] = 0;
+            _pass.target_layers[i] = 1;
+        }
         if (i) {
             _pass.more[i - 1] = ct;
             continue;

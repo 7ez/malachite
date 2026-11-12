@@ -244,6 +244,9 @@ struct nvgpu_draw {
     // layered targets, layers deep (0 or 1: not layered; 512 at most): colour target j's layers layer_pitch[j] bytes
     // apart, the depth/stencil target's zt_layer_pitch; the vertex stage picks the layer when shader_layer is set
     unsigned int layers, layer_pitch[8], zt_layer_pitch;
+    // the layers each target has from the attached one on, of which it takes layers at most (attachments of a
+    // layered pass may have fewer); 0 for layers
+    unsigned int target_layers[8], zt_layers;
     unsigned int shader_layer;
     // viewports and scissors 1..nviewports - 1, beside viewport and scissor 0, for a vertex stage picking one
     unsigned int nviewports;

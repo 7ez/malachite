@@ -69,7 +69,7 @@ unsigned draw_target_words(uint32_t *push, const struct render_draw *d)
         uint32_t w[] = {
             MTHD(0, R_SET_COLOR_TARGET_A(j), 9), (uint32_t)(ct.addr >> 32), (uint32_t)ct.addr,
             ct.blocklinear ? d->width * sx : ct.pitch, d->height * sy, ct.addr ? ct.format : 0,
-            ct.blocklinear ? 0 : CT_MEMORY_LAYOUT_PITCH, d->layers > 1 ? d->layers : 1, d->layer_pitch[j] >> 2, 0,
+            ct.blocklinear ? 0 : CT_MEMORY_LAYOUT_PITCH, draw_target_layers(d, j), d->layer_pitch[j] >> 2, 0,
             MTHD(0, R_SET_CT_WRITE(j), 1), ct.write_mask,
             MTHD(0, R_SET_BLEND(j), 1), ct.blend[0],
         };
