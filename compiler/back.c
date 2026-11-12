@@ -4255,12 +4255,13 @@ static int is_fence(const struct mop *m)
 enum { SP_NONE, SP_GLOBAL, SP_SHARED, SP_LOCAL, SP_ATTR, SP_COUNT };
 
 // the memory space a mop touches and whether it writes there: stores and atomics keep their order against every
-// other access of the space, loads move past each other
+// other access of the space, loads move past each other. A load of memory nothing writes moves past stores too.
 static int mem_space(const struct mop *m, int *store)
 {
     *store = 0;
     switch (m->k) {
     case MK_LDG:
+        return m->readonly ? SP_NONE : SP_GLOBAL;
     case MK_TEX:
         return SP_GLOBAL;
     case MK_STG:
