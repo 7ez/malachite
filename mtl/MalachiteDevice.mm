@@ -511,6 +511,8 @@ static void malachite_copy_sub(uint8_t *pixels, const struct malachite_sub *s, s
 
 static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizzleChannels swizzle);
 
+static bool opengl_renderer;  // Apple's OpenGL and OpenCL renderer is loaded in this process
+
 // Managed buffers with ranges to copy to VRAM; each commit takes the lot
 static NSMutableArray<MalachiteBuffer *> *malachite_pending;
 static uint64_t malachite_allocated;  // bytes of buffers alive, for the device's currentAllocatedSize
@@ -592,8 +594,10 @@ static bool malachite_opencl_memory(void *ptr)
     // one the GPU writes gains outright (Feature Matching's 300 MB cube took 2.4 ms a pass written over the bus). A small
     // one too: Path Tracer's 4-byte ray counters took 2M atomics a bounce over the bus. OpenCL's buffers read from
     // system memory ran its kernels 10-100 times slower.
+    // A no-copy one only for OpenCL, which says what it changed. WindowServer wraps the memory apps draw their layers
+    // into and never calls didModifyRange: its copy kept the first picture, and fields showed old text while typing.
     if ((options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged && length &&
-        length <= malachite_vram() / 4) {
+        (!ptr || opengl_renderer) && length <= malachite_vram() / 4) {
         _mirror = [[MalachiteBuffer alloc] initWithDevice:device
                                                withLength:length
                                               withOptions:MTLResourceStorageModePrivate
@@ -660,9 +664,6 @@ static bool malachite_opencl_memory(void *ptr)
     return [self newTextureWithDescriptor:descriptor offset:offset bytesPerRow:bytesPerRow];
 }
 @end
-
-// Append one kernel command (header + payload) to the command buffer, in a segment of its own.
-static bool opengl_renderer;
 
 // Apple's GL renderer takes what a GPU can do from a table it picks by the device's name, and NVIDIA's says it has no
 // last-vertex provoking, GL's default, which NVIDIA's hardware does have. So every draw has a compute pass rewrite its
