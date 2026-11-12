@@ -5546,7 +5546,8 @@ static void async_copy(LLVMValueRef in, const char *name)
 
 // OpenCL's vloadN and vstoreN: N lanes one after another at p + offset N elements. vload_half / vstore_half take
 // halves in memory to and from float lanes, and vloada_half3 / vstorea_half3 step 4 elements; vstore_half rounds as
-// its _rtz/_rtp/_rtn suffix says, to nearest even without one.
+// the .rtz/.rtp/.rtn after the address space says (air.vstore_half.global.rtz.v4f32), to nearest even without
+// one.
 static void vector_access(LLVMValueRef in, const char *name)
 {
     int load = name[5] == 'l';
@@ -5565,7 +5566,7 @@ static void vector_access(LLVMValueRef in, const char *name)
         return;
     }
     p = fit_offset(p);
-    const char *round = strstr(kind, "_rt");
+    const char *round = strstr(kind, ".rt");
     for (unsigned l = 0; l < n; l++) {
         if (load) {
             struct ir_val *h = load_lane(p, 2 * l, LLVMHalfType());
