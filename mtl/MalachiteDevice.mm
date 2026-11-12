@@ -28,6 +28,7 @@
 #import <mach-o/nlist.h>
 #import <string.h>
 #include <map>
+#include <vector>
 #import "../accel/commands.h"
 #import "../compiler/airc.h"
 #import "../core/drawbuild.h"
@@ -7679,7 +7680,7 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
     [fns addObjectsFromArray:linked.privateFunctions ?: @[]];
     for (id<MTLFunction> fn in fns) {
         NSData *b = ((id(*)(id, SEL))objc_msgSend)(fn, NSSelectorFromString(@"bitcodeData"));
-        if (b && bitcode.count < AIRC_MAX_LINKED) {
+        if (b) {
             [bitcode addObject:b];
             [names addObject:fn.name ?: @""];
         }
@@ -7713,11 +7714,11 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
     NSData *entry = cached ? malachite_cache_load(key) : nil;
     NSString *why = nil;
     if (!entry) {
-        struct airc_source sources[AIRC_MAX_LINKED];
+        std::vector<struct airc_source> sources;
         for (NSUInteger i = 0; i < bitcode.count; i++)
-            sources[i] = (struct airc_source){ bitcode[i].bytes, bitcode[i].length, names[i].UTF8String };
+            sources.push_back({ bitcode[i].bytes, bitcode[i].length, names[i].UTF8String });
         os_unfair_lock_lock(&malachite_airc_lock);
-        if (airc_compile_linked(air.bytes, air.length, sources, (unsigned)bitcode.count, vertex, stageIn,
+        if (airc_compile_linked(air.bytes, air.length, sources.data(), (unsigned)sources.size(), vertex, stageIn,
                                 (unsigned)samples, NULL, 0, 0, &k))
             why = @(k.error);
         else
