@@ -187,6 +187,14 @@ static int fold(struct ir_func *f, struct ir_val *v)
             return 1;
         }
     }
+    if ((v->op == IR_LDG || v->op == IR_STG) && x->op == IR_ADDI) {
+        int64_t imm = v->imm + x->imm;
+        if (imm >= -(1 << 23) && imm < (1 << 23) - 256) {
+            v->src[0] = x->src[0];
+            v->imm = imm;
+            return 1;
+        }
+    }
     if (v->op == IR_SEL && (x->op == IR_CONST || v->src[1] == v->src[2])) {
         replace_all(f, v, x->op != IR_CONST || x->imm ? v->src[1] : v->src[2]);
         return 1;
@@ -1696,12 +1704,25 @@ static int unroll_partial(struct ir_func *f)
                 last[i] = map[phis[i]->id];
             }
             for (unsigned i = 0; i < n; i++) {
-                struct ir_val *v = body[i], *c = ir_add(bu, v->op, v->type, v->nsrc);
+                struct ir_val *v = body[i], *c;
+                // the counter runs from its start to the bound without wrapping round, as unsigned or signed as
+                // its compare: an element it indexes, extended the same way, is the first copy's a few on
+                if (it && v->op == IR_ADDR && v->src[1] == k && !in_loop(v->src[0], b) && !v->aux == !sign &&
+                    cond != IR_NE) {
+                    c = ir_add(bu, IR_ADDI, IR_I64, 1);
+                    c->src[0] = copy0[v->id];
+                    c->imm = (int64_t)it * step * v->imm;
+                    map[v->id] = c;
+                    continue;
+                }
+                c = ir_add(bu, v->op, v->type, v->nsrc);
                 c->aux = v->aux;
                 c->imm = v->imm;
                 for (unsigned j = 0; j < v->nsrc; j++)
                     c->src[j] = v->src[j] && v->src[j]->block == b ? map[v->src[j]->id] : v->src[j];
                 map[v->id] = c;
+                if (!it)
+                    copy0[v->id] = c;
             }
         }
         for (unsigned i = 0; i < nphi; i++) {
@@ -1761,6 +1782,7 @@ static int unroll_partial(struct ir_func *f)
         b->unrolled = 1;
         bu->unrolled = 2;
         free(past);
+        free(copy0);
         free(round);
         free(last);
         free(next);
