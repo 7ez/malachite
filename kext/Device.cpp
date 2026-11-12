@@ -3772,6 +3772,8 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const void *queue
     r.samples = d->samples;
     r.format = d->format;
     r.target_blocklinear = d->target_blocklinear;
+    r.target_width = d->target_width;
+    r.target_height = d->target_height;
     r.alpha_control = d->alpha_control;
     r.per_sample = d->per_sample;
     r.ps_depth = d->ps_depth;
@@ -3788,7 +3790,7 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const void *queue
     __builtin_memcpy(r.blend, d->blend, sizeof(r.blend));
     for (int j = 0; j < 7; j++) {
         const struct nvgpu_target *t = &d->more[j];
-        r.more[j] = { t->addr, t->pitch, t->format, t->blocklinear, t->write_mask, {} };
+        r.more[j] = { t->addr, t->pitch, t->format, t->blocklinear, t->write_mask, {}, t->width, t->height };
         __builtin_memcpy(r.more[j].blend, t->blend, sizeof(t->blend));
     }
     // each target cleared in the layers it has
