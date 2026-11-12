@@ -8550,6 +8550,12 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     return 48 * 1024;  // shared memory a CTA gets without asking for the larger carve-out
 }
 
+// the base profile's 16 KB otherwise, which OpenCL reports as the local memory size (OpenCL 1.2 wants 32 KB)
+- (NSUInteger)maxComputeThreadgroupMemory
+{
+    return [self maxThreadgroupMemoryLength];
+}
+
 - (MTLSize)maxThreadsPerThreadgroup
 {
     return MTLSizeMake(1024, 1024, 64);
