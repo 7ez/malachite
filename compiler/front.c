@@ -3185,6 +3185,7 @@ static void mem_set(LLVMValueRef in);
 static void private_write(unsigned var, struct ir_val *v);
 static void load_value(LLVMValueRef in, struct ptr p, unsigned align);
 static void vector_access(LLVMValueRef in, const char *name);
+static void async_copy(LLVMValueRef in, const char *name);
 
 // A coherent load or store, volatile or not, is seen by the whole device (and, as no other processor shares this
 // memory, by the system): an atomic add of 0 returns what's there, an exchange writes without caching. The word's
@@ -4041,6 +4042,19 @@ static void call(LLVMValueRef in)
     }
     if (simd_op(in, name) || simd_lanes(in, name))
         return;
+    if (!strncmp(name, "air.async_wg_", 13)) {
+        async_copy(in, name);
+        return;
+    }
+    if (!strcmp(name, "air.get_null_wg_event")) {
+        insert(g_ptrs, in, 0, g_scope)->p = (struct ptr){ .space = SP_SHARED };
+        return;
+    }
+    if (!strcmp(name, "air.wait_wg_events")) {  // the copies are done: what's left is to see each other's
+        ir_add(g_cur, IR_BAR, IR_VOID, 0);
+        g_info->barriers = 1;
+        return;
+    }
     if (!strncmp(name, "air.shuffle.", 12) || !strncmp(name, "air.shuffle2.", 13)) {
         shuffle_lanes(in);
         return;
@@ -5154,6 +5168,60 @@ static struct ir_val *half_directed(struct ir_val *f, const char *mode)
     }
     struct ir_val *step = ibin(IR_ADD, h, sel(away, ik(1), ik((uint32_t)-1)));
     return op2(IR_OR, IR_F16, sel(past, step, h), konst(IR_F16, 0));
+}
+
+// element i of the elements bytes apart from p
+static struct ptr element(struct ptr p, struct ir_val *i, unsigned bytes)
+{
+    if (p.space == SP_GLOBAL) {
+        p.base = op2(IR_ADDR, IR_I64, p.base, i);
+        p.base->imm = bytes;
+        return p;
+    }
+    struct ir_val *at = ibin(IR_MUL, i, ik(bytes));
+    p.base = p.base ? ibin(IR_ADD, p.base, at) : at;
+    return p;
+}
+
+// OpenCL's async_work_group_copy and async_work_group_strided_copy (air.async_wg_[strided_]copy.<dst>.<src>, the
+// types p3v4i32 and so on), done there and then by the whole threadgroup, each thread an element in turn; the event
+// is a null one and waiting for it a barrier. The stride steps through the global side.
+static void async_copy(LLVMValueRef in, const char *name)
+{
+    int strided = LLVMGetNumOperands(in) == 6;  // dst, src, count, stride, event and the callee
+    const char *t = strstr(name, ".p") + 3;
+    char *end;
+    unsigned lanes = *t == 'v' ? (unsigned)strtoul(t + 1, &end, 10) : 1;
+    if (*t == 'v')
+        t = end;
+    unsigned bytes = (lanes == 3 ? 4 : lanes) * (unsigned)strtoul(t + 1, NULL, 10) / 8;
+    unsigned unit = bytes % 4 ? bytes : 4;
+    struct ptr to = fit_offset(ptr_of(LLVMGetOperand(in, 0))), from = fit_offset(ptr_of(LLVMGetOperand(in, 1)));
+    struct ir_val *n = get(LLVMGetOperand(in, 2), 0), *stride = strided ? get(LLVMGetOperand(in, 3), 0) : NULL;
+    struct ir_val *step = ibin(IR_MUL, ibin(IR_MUL, thread_value(NVK_ARG_TG_SIZE, 0), thread_value(NVK_ARG_TG_SIZE, 1)),
+                               thread_value(NVK_ARG_TG_SIZE, 2));
+    struct ir_block *start = g_cur, *head = ir_block(g_f), *body = ir_block(g_f), *done = ir_block(g_f);
+    ir_add(start, IR_BR, IR_VOID, 0);
+    ir_edge(start, head);
+    g_cur = head;
+    struct ir_val *i = ir_add(head, IR_PHI, IR_I32, 2);
+    ir_add(head, IR_CBR, IR_VOID, 1)->src[0] = icmp(IR_GE, i, n);  // the way out first, as fmod_precise has it
+    ir_edge(head, done);
+    ir_edge(head, body);
+    g_cur = body;
+    struct ir_val *gi = stride ? ibin(IR_MUL, i, stride) : i;
+    struct ptr d = element(to, to.space == SP_GLOBAL ? gi : i, bytes);
+    struct ptr s = element(from, from.space == SP_GLOBAL ? gi : i, bytes);
+    LLVMTypeRef ut = unit == 4 ? LLVMInt32Type() : unit == 2 ? LLVMHalfType() : LLVMInt8Type();
+    for (unsigned at = 0; at < bytes; at += unit)
+        mem_store(d, at, load_lane(s, at, ut), unit);
+    struct ir_val *next = ibin(IR_ADD, i, step);
+    ir_add(g_cur, IR_BR, IR_VOID, 0);
+    ir_edge(g_cur, head);
+    i->src[0] = flat_tid();
+    i->src[1] = next;
+    g_cur = done;
+    insert(g_ptrs, in, 0, g_scope)->p = (struct ptr){ .space = SP_SHARED };
 }
 
 // OpenCL's vloadN and vstoreN: N lanes one after another at p + offset N elements. vload_half / vstore_half take
