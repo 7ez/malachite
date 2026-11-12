@@ -206,6 +206,24 @@ static int fold(struct ir_func *f, struct ir_val *v)
             return 1;
         }
     }
+    // a select of a select that gives the same value one way, as an if flattened in a flattened if leaves them: one
+    // select on both conditions. sel(c, a, sel(d, b, a)) is sel(!c && d, b, a), sel(c, sel(d, b, z), z) is
+    // sel(c && d, b, z)
+    if (v->op == IR_SEL && v->type != IR_PRED) {
+        struct ir_val *a = v->src[1], *z = v->src[2];
+        int in_false = z->op == IR_SEL && z->uses == 1 && live(z->src[2]) == a;
+        int in_true = !in_false && a->op == IR_SEL && a->uses == 1 && live(a->src[2]) == z;
+        if (in_false || in_true) {
+            struct ir_val *s = in_false ? z : a, *c = in_false ? negated(x, v) : x;
+            struct ir_val *both = insert_before(v, IR_PAND, IR_PRED, 2);
+            both->src[0] = c;
+            both->src[1] = live(s->src[0]);
+            v->src[0] = both;
+            v->src[1] = live(s->src[1]);
+            v->src[2] = in_false ? a : z;
+            return 1;
+        }
+    }
     if (v->op == IR_PNOT && x->op == IR_CONST) {
         make_const(v, !x->imm);
         return 1;

@@ -574,14 +574,28 @@ static void find_fused_compares(struct ir_func *f)
         for (struct ir_val *v = b->first; v; v = v->next)
             g_cmp_fused[v->id] = v->op == IR_CMP || is_pand_or(v);
     int branches = !airc_pass_off("AIRC_NOFUSEBR");
-    for (struct ir_block *b = f->entry; b; b = b->next)
-        for (struct ir_val *v = b->first; v; v = v->next)
-            for (unsigned i = 0; i < v->nsrc; i++) {
-                struct ir_val *c = v->src[i];
-                if (c && is_pand_or(c) &&
-                    !(c->block == b && (is_condition(v, i) || (branches && v->op == IR_CBR))))
-                    g_cmp_fused[c->id] = 0;
+    // one read by another made in P0 in its block is made on the way to that one, a chain of SETP.AND/.OR: so
+    // long as each has a compare or a register to test on one side
+    for (int again = 1; again;) {
+        again = 0;
+        for (struct ir_block *b = f->entry; b; b = b->next)
+            for (struct ir_val *v = b->first; v; v = v->next) {
+                for (unsigned i = 0; i < v->nsrc; i++) {
+                    struct ir_val *c = v->src[i];
+                    if (c && is_pand_or(c) && g_cmp_fused[c->id] &&
+                        !(c->block == b && (is_condition(v, i) || (branches && v->op == IR_CBR) ||
+                                            (is_pand_or(v) && g_cmp_fused[v->id])))) {
+                        g_cmp_fused[c->id] = 0;
+                        again = 1;
+                    }
+                }
+                if (is_pand_or(v) && g_cmp_fused[v->id] && is_pand_or(v->src[0]) && g_cmp_fused[v->src[0]->id] &&
+                    is_pand_or(v->src[1]) && g_cmp_fused[v->src[1]->id]) {
+                    g_cmp_fused[v->id] = 0;
+                    again = 1;
+                }
             }
+    }
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v; v = v->next)
             for (unsigned i = 0; i < v->nsrc; i++) {
@@ -1249,8 +1263,9 @@ static struct mop *emit_test(struct ir_val *c)
 static void emit_cond(struct ir_val *c)
 {
     if (is_pand_or(c) && g_cmp_fused[c->id]) {
-        emit_test(c->src[0]);
-        emit_test(c->src[1])->aux |= c->op == IR_PAND ? SETP_AND : SETP_OR;
+        int chain = is_pand_or(c->src[1]) && g_cmp_fused[c->src[1]->id];
+        emit_cond(c->src[chain]);
+        emit_test(c->src[!chain])->aux |= c->op == IR_PAND ? SETP_AND : SETP_OR;
     } else {
         emit_test(c);
     }
