@@ -3,8 +3,9 @@ import Foundation
 private let logLimit = 10 << 20
 private let traceLimit = 8_000_000
 
+// a wedged GPU can leave system_profiler or ioreg waiting for good: a report with a gap beats no report
 private func logText(_ path: String, _ args: [String]) -> String {
-    capture(path, args).text
+    capture(path, args, timeout: 60).text
 }
 
 // grep for any of the words (every line with none given), or without them, then head
@@ -20,7 +21,9 @@ private func keep(_ text: String, containing words: [String] = [], skipping: Boo
 private func kernelLog(_ predicate: String, to file: String, last: String = "boot") {
     FileManager.default.createFile(atPath: file, contents: nil)
     if let handle = FileHandle(forWritingAtPath: file) {
-        capture("/usr/bin/log", ["show", "--last", last, "--style", "compact", "--predicate", predicate], log: handle)
+        // a busy system's log takes minutes to search: what it found by then is kept
+        capture("/usr/bin/log", ["show", "--last", last, "--style", "compact", "--predicate", predicate], timeout: 180,
+                log: handle)
         try? handle.close()
     }
 }
