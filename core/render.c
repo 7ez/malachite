@@ -423,10 +423,8 @@ static unsigned build_draw(uint32_t *push, const struct render_draw *d)
     if (d->visibility && d->visibility_reset)
         P(MTHD(0, R_CLEAR_REPORT_VALUE, 1), 1);  // ZPASS_PIXEL_CNT
     P(MTHD(0, R_SET_ZPASS_PIXEL_COUNT, 1), d->visibility != 0);
-    // Metal always restarts a strip at the largest index its type holds
-    static const uint32_t restart[] = { 0xff, 0xffff, 0xffffffff };
-    P(MTHD(0, R_SET_DA_PRIMITIVE_RESTART, 2), d->index && d->restart != 1,
-      d->restart == 2 ? d->restart_index : restart[d->index_format]);
+    P(MTHD(0, R_SET_DA_PRIMITIVE_RESTART, 2), draw_restarts(d->primitive, d->restart, d->index != 0),
+      draw_restart_index(d->restart, d->restart_index, d->index_format));
     if (d->index) {
         P(MTHD(0, R_SET_INDEX_BUFFER_A, 2), (uint32_t)(d->index >> 32), (uint32_t)d->index);
         P(MTHD(0, R_SET_INDEX_BUFFER_SIZE_A, 2), 0, d->index_size);

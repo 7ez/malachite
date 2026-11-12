@@ -242,6 +242,18 @@ static inline uint32_t fbits(float f)
     return u;
 }
 
+// SET_DA_PRIMITIVE_RESTART as nvgpu_draw's restart asks: Metal restarts indexed strips only (line strip 3, triangle
+// strip 5), at the largest index the type holds; 2 restarts any indexed draw at restart_index, 1 none
+static inline uint32_t draw_restarts(uint32_t primitive, uint32_t restart, int indexed)
+{
+    return indexed && (restart == 2 || (!restart && (primitive == 3 || primitive == 5)));
+}
+
+static inline uint32_t draw_restart_index(uint32_t restart, uint32_t restart_index, uint32_t index_format)
+{
+    return restart == 2 ? restart_index : index_format == 0 ? 0xff : index_format == 1 ? 0xffff : 0xffffffff;
+}
+
 // Each writes one group of d's methods into push and returns the words written.
 unsigned draw_shader_words(uint32_t *push, const struct render_draw *d);
 unsigned draw_depth_stencil_words(uint32_t *push, const struct render_draw *d);
