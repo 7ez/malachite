@@ -3143,7 +3143,7 @@ static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, c
     d.params_size = malachite_fill_params(&pipeline->_kernel, buffers, d.prog_va, d.params, sizeof(d.params));
     // [[threadgroup(n)]] memory after the kernel's own threadgroup variables, each at the offset its param says. An
     // OpenCL __local argument is aligned to its type, up to 128 bytes for a long16.
-    uint32_t align = pipeline->_cl ? 128 : 16;
+    uint32_t align = pipeline->_cl ? 128 : 16, slack = 0;
     for (uint32_t i = 0; i < pipeline->_kernel.nargs; i++) {
         const struct nvk_arg *a = &pipeline->_kernel.args[i];
         if (a->kind != NVK_ARG_THREADGROUP)
@@ -3153,7 +3153,12 @@ static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, c
         memcpy(d.params + a->cbuf_off - 0x160, &at, 4);
         d.params_size = MAX(d.params_size, a->cbuf_off - 0x160 + 8u);
         d.shared_size = at + ((len + 15) & ~15u);
+        // and a slack after the last: kernels read a little past their threadgroup buffers, which Apple's GPUs
+        // allow and an SM takes as an out-of-range address (one framework's temporal scaler reads over 256 bytes past)
+        slack = 1024;
     }
+    if (d.shared_size + slack <= [((id<MTLCommandBuffer>)cb).device maxThreadgroupMemoryLength])
+        d.shared_size += slack;
     for (uint32_t i = 0; i < pipeline->_kernel.nargs; i++) {
         const struct nvk_arg *a = &pipeline->_kernel.args[i];
         if (a->kind != NVK_ARG_STAGE_IN_REGION)
