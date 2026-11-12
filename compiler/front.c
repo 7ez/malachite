@@ -2041,7 +2041,8 @@ static void log2_split(struct ir_val *xb, struct ir_val **hi, struct ir_val **lo
     // 2f - u (2 + f) = 2 (f - u) - u f, and f - u, about f^2 / 2, is exact
     struct ir_val *ul = mulf(madf(negf(u), f, mulf(subf(f, u), fconst(2))), r);
     struct ir_val *u2 = mulf(u, u);
-    struct ir_val *tail = madf(mulf(u, u2), poly(u2, k, 6), ul);
+    // the series is in u + ul: its terms past u, taken in u, put right by their slope u^2/4 times ul
+    struct ir_val *tail = madf(mulf(u, u2), poly(u2, k, 6), madf(ul, mulf(u2, fconst(0.25f)), ul));
     struct ir_val *p = mulf(u, fconst(LOG2E_HI));
     struct ir_val *pl = madf(u, fconst(LOG2E_LO), madf(tail, fconst(LOG2E_HI), madf(u, fconst(LOG2E_HI), negf(p))));
     *hi = addf(e, p);
