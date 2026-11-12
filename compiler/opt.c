@@ -204,6 +204,11 @@ static int fold(struct ir_func *f, struct ir_val *v)
         make_const(v, v->op == IR_FLO && !a ? 0xffffffffu : r);
         return 1;
     }
+    // F2I truncates on its own, so a truncation before it only costs a conversion
+    if (v->op == IR_F2I && x->op == IR_FRND && x->aux == SASS_RND_TRUNC && x->type == IR_F32) {
+        v->src[0] = x->src[0];
+        return 1;
+    }
     if (v->op == IR_FFMA && v->type == IR_F32 && !v->aux && x->op == IR_CONST && y->op == IR_CONST &&
         v->src[2]->op == IR_CONST) {
         make_const(v, from_float(as_float(x->imm) * as_float(y->imm) + as_float(v->src[2]->imm)));
