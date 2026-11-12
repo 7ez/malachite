@@ -3177,6 +3177,8 @@ static unsigned private_var(struct ptr p, unsigned off);
 static void mem_copy(LLVMValueRef in);
 static void mem_set(LLVMValueRef in);
 static void private_write(unsigned var, struct ir_val *v);
+static void load_value(LLVMValueRef in, struct ptr p, unsigned align);
+static void vector_access(LLVMValueRef in, const char *name);
 
 // A coherent load or store, volatile or not, is seen by the whole device (and, as no other processor shares this
 // memory, by the system): an atomic add of 0 returns what's there, an exchange writes without caching. The word's
@@ -3950,6 +3952,10 @@ static void call(LLVMValueRef in)
         atomic_op(in, name);
         return;
     }
+    if (!strncmp(name, "air.vload", 9) || !strncmp(name, "air.vstore", 10)) {
+        vector_access(in, name);
+        return;
+    }
     if (!strncmp(name, "air.sample_", 11) || !strncmp(name, "air.gather_", 11) || !strncmp(name, "air.read_texture", 16) ||
         !strncmp(name, "air.read_depth", 14)) {
         texture_op(in, name);
@@ -4677,7 +4683,14 @@ static void load(LLVMValueRef in)
         insert(g_ptrs, in, 0, g_scope)->p = q;
         return;
     }
-    if (p.space == SP_GLOBAL && wide_lanes(t, LLVMGetAlignment(in)) && wide_lanes(t, global_align(p))) {
+    load_value(in, p, LLVMGetAlignment(in));
+}
+
+// in's lanes from p, which is align-byte aligned as the code says (and as far again as global_align finds)
+static void load_value(LLVMValueRef in, struct ptr p, unsigned align)
+{
+    LLVMTypeRef t = LLVMTypeOf(in);
+    if (p.space == SP_GLOBAL && wide_lanes(t, align) && wide_lanes(t, global_align(p))) {
         struct ir_val *v = ir_add(g_cur, IR_LDG, IR_VOID, 1);
         v->src[0] = p.base;
         v->imm = p.off;
@@ -4689,7 +4702,7 @@ static void load(LLVMValueRef in)
         }
         return;
     }
-    unsigned packed = p.space == SP_GLOBAL ? packed_bytes(t, LLVMGetAlignment(in)) : 0;
+    unsigned packed = p.space == SP_GLOBAL ? packed_bytes(t, align) : 0;
     if (packed && global_align(p) >= packed) {
         // one load, its lanes shifted out of the words and cleared above their bits, as a U8 or U16 load leaves them
         struct ir_val *v = ir_add(g_cur, IR_LDG, packed > 4 ? IR_VOID : IR_I32, 1), *words[4] = { v };
@@ -4949,6 +4962,74 @@ static void mem_set(LLVMValueRef in)
     for (unsigned at = 0, step; at < n; at += step) {
         step = !((to.off + at) & 3) && n - at >= 4 ? 4 : 1;
         mem_store(to, at, step == 4 ? word : byte, step);
+    }
+}
+
+// half h (its bits) into private memory or memory at p + off
+static void store_half(struct ptr p, unsigned off, struct ir_val *h)
+{
+    if (p.space != SP_PRIVATE) {
+        mem_store(p, off, h, 2);
+        return;
+    }
+    for (unsigned k = 0; k < (p.base ? p.count : 1); k++) {
+        unsigned var = private_var(p, off + k * p.stride);
+        private_write(var, p.base ? sel(index_is(p, k), h, private_read(var, IR_F16)) : h);
+    }
+}
+
+// f as a half, rounded towards zero, +inf or -inf: the nearest one, a step back towards f where that went past it
+static struct ir_val *half_directed(struct ir_val *f, const char *mode)
+{
+    struct ir_val *h = op1(IR_F2H, IR_F16, f), *g = op1(IR_H2F, IR_F32, h);
+    struct ir_val *neg = icmp(IR_NE, ibin(IR_AND, h, ik(0x8000)), ik(0));
+    struct ir_val *past, *away;  // whether to step, and whether that's away from zero (else towards it)
+    if (!strncmp(mode, "rtz", 3)) {
+        past = fcmp(FCMP_OGT, absf(g), absf(f));
+        away = konst(IR_PRED, 0);
+    } else if (!strncmp(mode, "rtp", 3)) {
+        past = fcmp(FCMP_OLT, g, f);
+        away = op1(IR_PNOT, IR_PRED, neg);
+    } else {
+        past = fcmp(FCMP_OGT, g, f);
+        away = neg;
+    }
+    struct ir_val *step = ibin(IR_ADD, h, sel(away, ik(1), ik((uint32_t)-1)));
+    return op2(IR_OR, IR_F16, sel(past, step, h), konst(IR_F16, 0));
+}
+
+// OpenCL's vloadN and vstoreN: N lanes one after another at p + offset N elements. vload_half / vstore_half take
+// halves in memory to and from float lanes, and vloada_half3 / vstorea_half3 step 4 elements; vstore_half rounds as
+// its _rtz/_rtp/_rtn suffix says, to nearest even without one.
+static void vector_access(LLVMValueRef in, const char *name)
+{
+    int load = name[5] == 'l';
+    const char *kind = name + (load ? 9 : 10);  // past air.vload / air.vstore
+    int aligned = *kind == 'a', half = !strncmp(kind + aligned, "_half", 5);
+    LLVMValueRef val = load ? in : LLVMGetOperand(in, 0);
+    LLVMTypeRef t = LLVMTypeOf(val), et = lane_type(t, 0);
+    unsigned n = nlanes(t), esz = half ? 2 : scalar_bytes(et);
+    unsigned step = aligned && n == 3 ? 4 : n;
+    struct ptr p = add_index(ptr_of(LLVMGetOperand(in, load ? 1 : 2)), LLVMGetOperand(in, load ? 0 : 1), step * esz, 0);
+    if (!half) {  // the code promises an element's alignment, so wider accesses go by what global_align finds
+        if (load)
+            load_value(in, p, 16);
+        else
+            store_value(p, t, val, 16);
+        return;
+    }
+    p = fit_offset(p);
+    const char *round = strstr(kind, "_rt");
+    for (unsigned l = 0; l < n; l++) {
+        if (load) {
+            struct ir_val *h = load_lane(p, 2 * l, LLVMHalfType());
+            if (h->type != IR_F16)  // a variable written as a short
+                h = op2(IR_OR, IR_F16, h, konst(IR_F16, 0));
+            set(in, l, narrow(widen(h), ir_type_of(et)));
+            continue;
+        }
+        struct ir_val *f = widen(get(val, l));
+        store_half(p, 2 * l, round && strncmp(round + 1, "rte", 3) ? half_directed(f, round + 1) : op1(IR_F2H, IR_F16, f));
     }
 }
 

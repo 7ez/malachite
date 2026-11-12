@@ -1803,6 +1803,12 @@ LLVMTypeRef LLVMInt8Type(void)
     return &i8;
 }
 
+LLVMTypeRef LLVMHalfType(void)
+{
+    static struct ll_type half = { .kind = T_FP, .bits = 16, .elem = -1 };
+    return &half;
+}
+
 LLVMTypeRef LLVMGetGEPSourceElementType(LLVMValueRef gep)
 {
     return gep->elty >= 0 && (unsigned)gep->elty < gep->m->ntypes ? &gep->m->types[gep->elty] : NULL;
