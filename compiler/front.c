@@ -2085,14 +2085,20 @@ static struct ir_val *pow_ir(struct ir_val *x, struct ir_val *y, int powr, int p
 }
 
 // r - q d for q = trunc(r / d), r / d below 2^23: exact, with q put right where the quotient rounded across an
-// integer
+// integer. A tiny d has both scaled up by 2^64, or a q one too big's remainder would flush, and a huge one
+// divides scaled down, or 1 / d would.
 static struct ir_val *rem_step(struct ir_val *r, struct ir_val *d)
 {
-    struct ir_val *q = op1(IR_FRND, IR_F32, divf(r, d));
+    struct ir_val *small = fcmp(FCMP_OLT, d, fconst(0x1p-100f));
+    r = mulf(r, sel(small, fconst(0x1p64f), fconst(1)));
+    d = mulf(d, sel(small, fconst(0x1p64f), fconst(1)));
+    struct ir_val *s = sel(fcmp(FCMP_OGT, d, fconst(0x1p100f)), fconst(0x1p-64f), fconst(1));
+    struct ir_val *q = op1(IR_FRND, IR_F32, divf(mulf(r, s), mulf(d, s)));
     q->aux = SASS_RND_TRUNC;
     struct ir_val *v = madf(negf(q), d, r);
     v = sel(fcmp(FCMP_OLT, v, fconst(0)), addf(v, d), v);
-    return sel(fcmp(FCMP_OGE, v, d), subf(v, d), v);
+    v = sel(fcmp(FCMP_OGE, v, d), subf(v, d), v);
+    return mulf(v, sel(small, fconst(0x1p-64f), fconst(1)));
 }
 
 // fmod exactly, as precise maths wants it: while |x| is past 2^22 |y|, |x| mod |y| 2^k takes q's top bits (in a
