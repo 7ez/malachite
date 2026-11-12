@@ -36,9 +36,9 @@ void sph_tess_init(uint32_t sph[32], uint32_t inputs, uint32_t outputs, unsigned
 {
     memset(sph, 0, SPH_BYTES);
     sph[0] = TYPE_VTG | 4 << 5 | SHADER_TESS_INIT << 10 | 1 << 17 | 1 << 26;  // DOES_LOAD_OR_STORE (26), as NAK has it
-    // PER_PATCH_ATTRIBUTE_COUNT (56:63), in words: the levels and the padding after them (0x00..0x1f), then four a
-    // generic; its low nibble again at 124:127, its high one at 148:151
-    uint32_t words = patch_outputs ? 8 + 4 * patch_outputs : 6;
+    // PER_PATCH_ATTRIBUTE_COUNT (56:63), in words: the levels and the two after them (0x00..0x1f), then four a
+    // generic, 128 at most; its low nibble again at 124:127, its high one at 148:151
+    uint32_t words = 8 + 4 * patch_outputs;
     sph[1] = words << 24;
     sph[3] = (words & 0xf) << 28;
     sph[2] = threads << 24;  // THREADS_PER_INPUT_PRIMITIVE (88:95)

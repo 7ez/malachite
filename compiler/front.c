@@ -1273,6 +1273,17 @@ static struct ir_val *tess_attr(struct ir_block *b, struct ir_val *vtx, unsigned
     return v;
 }
 
+// the patch id (word 0) or instance id (word 1) the tessellation init stage leaves after the patch's attributes;
+// with all of them there's no room, and they read 0
+static struct ir_val *patch_id_word(unsigned word)
+{
+    if (__builtin_popcount(g_info->patch_inputs) == NVK_MAX_PATCH_INPUTS)
+        return konst(IR_I32, 0);
+    struct ir_val *v = tess_attr(g_prologue, NULL, NVK_PATCH_IDS(g_info->patch_inputs) + 4 * word, IR_ATTR_PATCH);
+    v->type = IR_I32;
+    return v;
+}
+
 static struct ir_val *flat_tid(void)
 {
     struct ir_val *zy = ir_op2(g_prologue, IR_ADD, IR_I32,
@@ -1460,8 +1471,7 @@ static void entry_args(void)
             case NVK_ARG_VERTEX_ID:
             case NVK_ARG_INSTANCE_ID:
                 if (a->kind == NVK_ARG_INSTANCE_ID && g_info->stage == NVK_TESS_EVAL) {  // from the base instance
-                    v = tess_attr(g_prologue, NULL, NVK_PATCH_IDS + 4, IR_ATTR_PATCH);
-                    v->type = IR_I32;
+                    v = patch_id_word(1);
                     break;
                 }
                 v = attr(IR_ALD, a->kind == NVK_ARG_VERTEX_ID ? 0x2fc : 0x2f8);
@@ -1505,8 +1515,7 @@ static void entry_args(void)
                 v->type = ir_type_of(lane_type(LLVMTypeOf(p), l)) == IR_I32 ? IR_I32 : IR_F32;
                 break;
             case NVK_ARG_PATCH_ID:
-                v = tess_attr(g_prologue, NULL, NVK_PATCH_IDS, IR_ATTR_PATCH);
-                v->type = IR_I32;
+                v = patch_id_word(0);
                 break;
             case NVK_ARG_POSITION_IN_PATCH:  // u and v, outputs of the stage indexed by lane; a triangle's w 1 - u - v
                 if (l < 2)

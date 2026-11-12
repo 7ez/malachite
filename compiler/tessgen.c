@@ -227,7 +227,10 @@ static void tess_init(const void *arg, struct ir_func *f, struct airc_info *info
     info->stage = NVK_TESS_INIT;
     info->vertex_inputs = 1;
     info->point_outputs = d->point_inputs;
-    info->patch_outputs = 1 + __builtin_popcount(d->patch_inputs);
+    unsigned npatch = (unsigned)__builtin_popcount(d->patch_inputs);
+    if (npatch > NVK_MAX_PATCH_INPUTS)
+        airc_fail("%u per-patch attributes", npatch);
+    info->patch_outputs = npatch + (npatch < NVK_MAX_PATCH_INPUTS);
     info->patch_points = d->points;
 
     // the patch's vertex, where the patch's vertices start in the input map: bytes 0 and 2 of INVOCATION_INFO
@@ -256,13 +259,15 @@ static void tess_init(const void *arg, struct ir_func *f, struct airc_info *info
             fetch(&d->attrs[loc], loc, element(&d->attrs[loc], cp, pid, instance, base), v);
             ast(point, 0x80 + 16 * loc, 0, v, 4);
         }
-    struct ir_val *ids[2] = { pid, iid };
-    ast(NULL, NVK_PATCH_IDS, IR_ATTR_PATCH, ids, 2);
     for (unsigned loc = 0; loc < 32; loc++)
         if (d->patch_inputs >> loc & 1) {
             fetch(&d->attrs[loc], loc, element(&d->attrs[loc], cp, pid, instance, base), v);
             ast(NULL, NVK_PATCH_INPUT(d->patch_inputs, loc), IR_ATTR_PATCH, v, 4);
         }
+    if (npatch < NVK_MAX_PATCH_INPUTS) {
+        struct ir_val *ids[2] = { pid, iid };
+        ast(NULL, NVK_PATCH_IDS(d->patch_inputs), IR_ATTR_PATCH, ids, 2);
+    }
 
     // the factors, halves: the edges' then the inside's, 8 bytes a patch for triangles and 12 for quads; scaled,
     // clamped to the maximum (a NaN, which culls the patch, kept) and rounded up to a power of two for pow2
