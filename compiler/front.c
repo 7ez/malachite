@@ -1847,21 +1847,43 @@ enum { TRIG_PRECISE, TRIG_HALF, TRIG_FAST };
 // where the three parts' error starts to show, goes to Payne-Hanek in the lanes that need it. x 2/pi rounds, so
 // past 2^17 or so q can be a quadrant out and r outside [-pi/4, pi/4], where the polynomials aren't good: fast
 // takes a second, short reduction of r, which is cheaper than a more exact q
-static struct quadrant reduce_pio2(struct ir_val *x, int mode)
+// x rounded to the nearest integer, as FRND would, and *bits with that integer's low bits in its own: adding 1.5 *
+// 2^23 leaves no fraction while |x| is under 2^22, and taking it off again is exact. Two FADDs instead of FRND and
+// F2I, which both go through the quarter-rate conversion unit
+static struct ir_val *round_small(struct ir_val *x, struct ir_val **bits)
 {
-    struct ir_val *qf = op1(IR_FRND, IR_F32, mulf(x, fconst(0.636619747f)));
-    qf->aux = SASS_RND_NEAREST;
+    *bits = addf(x, fconst(12582912.0f));
+    return subf(*bits, fconst(12582912.0f));
+}
+
+// small: |x 2/pi| stays under 2^22 wherever the result is used (sin and cos give 0 past it, and half never gets
+// there), so q is the low bits of round_small's
+static struct quadrant reduce_pio2(struct ir_val *x, int mode, int small)
+{
+    struct ir_val *q, *qf;
+    if (small) {
+        qf = round_small(mulf(x, fconst(0.636619747f)), &q);
+    } else {
+        qf = op1(IR_FRND, IR_F32, mulf(x, fconst(0.636619747f)));
+        qf->aux = SASS_RND_NEAREST;
+        q = op1(IR_F2I, IR_I32, qf);
+        q->aux = 1;
+    }
     struct ir_val *r = madf(qf, fconst(-1.57079637f), x);
     r = madf(qf, fconst(4.37113883e-8f), r);
     r = madf(qf, fconst(1.71512451e-15f), r);
-    struct quadrant k = { r, op1(IR_F2I, IR_I32, qf) };
-    k.q->aux = 1;
+    struct quadrant k = { r, q };
     if (mode == TRIG_FAST) {
-        struct ir_val *adj = op1(IR_FRND, IR_F32, mulf(r, fconst(0.636619747f)));
-        adj->aux = SASS_RND_NEAREST;
+        struct ir_val *dq, *adj;
+        if (small) {
+            adj = round_small(mulf(r, fconst(0.636619747f)), &dq);
+        } else {
+            adj = op1(IR_FRND, IR_F32, mulf(r, fconst(0.636619747f)));
+            adj->aux = SASS_RND_NEAREST;
+            dq = op1(IR_F2I, IR_I32, adj);
+            dq->aux = 1;
+        }
         k.r = madf(adj, fconst(4.37113883e-8f), madf(adj, fconst(-1.57079637f), r));
-        struct ir_val *dq = op1(IR_F2I, IR_I32, adj);
-        dq->aux = 1;
         k.q = ibin(IR_ADD, k.q, dq);
     }
     if (mode != TRIG_PRECISE)
@@ -1903,7 +1925,7 @@ static void sincos_ir(struct ir_val *x, struct ir_val **sin_out, struct ir_val *
 {
     static const float k_sin[] = { -1.9515295891e-4f, 8.3321608736e-3f, -1.6666654611e-1f };
     static const float k_cos[] = { 2.443315711809948e-5f, -1.388731625493765e-3f, 4.166664568298827e-2f };
-    struct quadrant k = reduce_pio2(x, mode);
+    struct quadrant k = reduce_pio2(x, mode, mode != TRIG_PRECISE);
     struct ir_val *r2 = mulf(k.r, k.r);
     struct ir_val *sr = madf(mulf(k.r, r2), poly(r2, k_sin, 3), k.r);
     struct ir_val *cr = madf(r2, madf(r2, poly(r2, k_cos, 3), fconst(-0.5f)), fconst(1));
@@ -1925,7 +1947,7 @@ static struct ir_val *tan_ir(struct ir_val *x, int mode)
 {
     static const float k_tan[] = { 9.38540185543e-3f, 3.11992232697e-3f, 2.44301354525e-2f,
                                    5.34112807005e-2f, 1.33387994085e-1f, 3.33331568548e-1f };
-    struct quadrant k = reduce_pio2(x, mode);
+    struct quadrant k = reduce_pio2(x, mode, mode == TRIG_HALF);
     struct ir_val *r2 = mulf(k.r, k.r);
     struct ir_val *t = madf(mulf(k.r, r2), poly(r2, k_tan, 6), k.r);
     t = sel(is_odd(k.q), divf(fconst(-1), t), t);
