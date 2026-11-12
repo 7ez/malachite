@@ -3920,6 +3920,11 @@ static void call(LLVMValueRef in)
     }
     if (!strncmp(name, "llvm.lifetime.", 14))  // allocas are variables, alive wherever they're used
         return;
+    // hints, and a SIMD group's barrier: its threads run together
+    if (!strcmp(name, "llvm.assume") || !strncmp(name, "llvm.experimental.noalias.scope.decl", 36) ||
+        !strncmp(name, "llvm.dbg.", 9) || !strcmp(name, "llvm.donothing") || !strcmp(name, "llvm.sideeffect") ||
+        !strcmp(name, "air.simdgroup.barrier"))
+        return;
     if (!strncmp(name, "llvm.memcpy.", 12) || !strncmp(name, "llvm.memmove.", 13)) {
         mem_copy(in);
         return;
@@ -4262,6 +4267,12 @@ static void call(LLVMValueRef in)
         if (n > 1)
             airc_fail("unsupported intrinsic %s", name);
     }
+    // what's left is maths on lanes, which takes no pointer and has a result
+    for (int i = 0; i < LLVMGetNumOperands(in) - 1; i++)
+        if (is_ptr(LLVMTypeOf(LLVMGetOperand(in, i))))
+            n = 0;
+    if (!n)
+        airc_fail("unsupported intrinsic %s", name);
     for (unsigned l = 0; l < n; l++) {
         enum ir_type t = ir_type_of(lane_type(rt, l));
         if (LLVMGetTypeKind(lane_type(rt, l)) == LLVMBFloatTypeKind && (is_fn(name, "fma") || is_fn(name, "fmuladd"))) {
