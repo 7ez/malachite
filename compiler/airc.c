@@ -200,7 +200,8 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
     airc_samples = samples;
     int ret = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, 0, k);
     // an unrolled loop's copies hold more values at once: compiled again with its loops as they were, that is kept
-    // if it runs more warps
+    // if the unrolled one runs fewer than 7/8 of its warps. A dispatch of a few thousand threads has a handful of
+    // warps on each SM whatever the registers, and gains from each warp having more loads in flight.
     if (!ret && airc_unrolled) {
         struct airc_kernel *r = calloc(1, sizeof(*r));
         char *error = g_error;
@@ -210,7 +211,7 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
         int again = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, 0, r);
         g_error = error;
         g_error_size = sizeof(k->error);
-        if (!again && warps(r->h.reg_count) > warps(k->h.reg_count)) {
+        if (!again && 8 * warps(k->h.reg_count) < 7 * warps(r->h.reg_count)) {
             free(k->sass);
             *k = *r;
         } else {
