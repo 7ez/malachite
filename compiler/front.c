@@ -2253,6 +2253,84 @@ static struct ir_val *erf_ir(struct ir_val *x)
     return sel(fcmp(FCMP_OLT, ax, fconst(1)), mulf(x, poly(mulf(x, x), k, 7)), big);
 }
 
+// tgamma: |x| = m + t, t in [0, 1): Gamma(1 + t) (t + 1)...(t + m - 1) from 1, Gamma(1 + t) / x below it, and for
+// x < 0 pi / (sin(pi x) Gamma(1 + |x|)), with Gamma(1 + |x|) = Gamma(1 + t) (t + 1)...(t + m). The product (each
+// t + k exact) runs in a loop in two parts, from 2^-64 past 30 so that it doesn't overflow before the result does.
+static struct ir_val *tgamma_ir(struct ir_val *x)
+{
+    static const float k[] = { 0.0168256592f, -0.107834607f, 0.320049524f, -0.598353565f, 0.824188471f, -0.93257612f,
+                               0.972331107f,  -0.906408668f, 0.988992333f, -0.577214181f, 1 };
+    struct ir_val *v = absf(x), *neg = fcmp(FCMP_OLT, x, fconst(0));
+    struct ir_val *m = op1(IR_FRND, IR_F32, v);
+    m->aux = SASS_RND_FLOOR;
+    struct ir_val *t = subf(v, m);
+    struct ir_val *n = clampf(sel(neg, m, subf(m, fconst(1))), fconst(0), fconst(40));  // past 40, inf or 0
+    struct ir_val *big = fcmp(FCMP_OGT, v, fconst(30));
+    struct ir_val *start = sel(big, fconst(0x1p-64f), fconst(1));
+    struct ir_block *from = g_cur, *head = ir_block(g_f), *body = ir_block(g_f), *done = ir_block(g_f);
+    ir_add(from, IR_BR, IR_VOID, 0);
+    ir_edge(from, head);
+    g_cur = head;
+    struct ir_val *i = ir_add(head, IR_PHI, IR_F32, 2);
+    struct ir_val *ph = ir_add(head, IR_PHI, IR_F32, 2), *pl = ir_add(head, IR_PHI, IR_F32, 2);
+    ir_add(head, IR_CBR, IR_VOID, 1)->src[0] = op1(IR_PNOT, IR_PRED, fcmp(FCMP_OLE, i, n));  // as fmod_precise
+    ir_edge(head, done);
+    ir_edge(head, body);
+    g_cur = body;
+    struct ir_val *f = addf(t, i), *h = mulf(ph, f);
+    struct ir_val *l = madf(pl, f, madf(ph, f, negf(h)));
+    ir_add(g_cur, IR_BR, IR_VOID, 0);
+    ir_edge(g_cur, head);
+    i->src[0] = fconst(1);
+    i->src[1] = addf(i, fconst(1));
+    ph->src[0] = start;
+    ph->src[1] = h;
+    pl->src[0] = fconst(0);
+    pl->src[1] = l;
+    g_cur = done;
+    struct ir_val *g = poly(t, k, 11), *s;
+    struct ir_val *G = madf(g, ph, mulf(g, pl));
+    struct ir_val *r = sel(fcmp(FCMP_OLT, v, fconst(1)), divf(g, x), mulf(G, sel(big, fconst(0x1p64f), fconst(1))));
+    sincospi_ir(v, &s, NULL);
+    r = sel(neg, mulf(divf(fconst(-PI_HI), mulf(s, G)), start), r);
+    struct ir_val *pole = op2(IR_PAND, IR_PRED, fcmp(FCMP_OEQ, t, fconst(0)), fcmp(FCMP_OGE, v, fconst(1)));
+    r = sel(op2(IR_PAND, IR_PRED, neg, pole), konst(IR_F32, FLT_NAN), r);
+    return sel(fcmp(FCMP_OEQ, x, finf(0)), x, r);
+}
+
+// lgamma: lgamma(1 + t) = t (t - 1) R(t), t in [0, 1) the fraction of |x|, so that the zeros at 1 and 2 keep their
+// relative accuracy; less log |x| below 1, plus log((t + 1)...(t + m - 1)) up to 8, Stirling's series from there;
+// for x < 0, log(pi / |sin(pi x)|) - log |x| - lgamma |x|
+static struct ir_val *lgamma_ir(struct ir_val *x)
+{
+    static const float k[] = { -0.0015264434f, 0.00931734778f, -0.0266472865f, 0.0493969135f, -0.0709296688f,
+                               0.0907228291f,  -0.114932716f,  0.15541862f,    -0.245250911f, 0.577215672f };
+    static const float k_stirling[] = { 1.0f / 1260, -1.0f / 360, 1.0f / 12 };
+    struct ir_val *v = absf(x), *m = op1(IR_FRND, IR_F32, v);
+    m->aux = SASS_RND_FLOOR;
+    struct ir_val *t = subf(v, m);
+    struct ir_val *l = mulf(mulf(t, subf(t, fconst(1))), poly(t, k, 10)), *p = fconst(1);
+    for (unsigned i = 1; i < 7; i++)
+        p = sel(fcmp(FCMP_OGT, m, fconst(i)), mulf(p, addf(t, fconst(i))), p);
+    // log1p near 1, where MUFU.LG2's absolute error would show next to a result near 0
+    struct ir_val *below = fcmp(FCMP_OLT, v, fconst(1));
+    struct ir_val *lp = log1p_ir(subf(sel(below, v, p), fconst(1)));
+    lp = sel(fcmp(FCMP_OLT, v, fconst(0.5f)), log_ir(v, 1, LN2), lp);
+    l = addf(l, sel(below, negf(lp), lp));
+    struct ir_val *z = mufu(MUFU_RCP, v), *lv = log_ir(v, 1, LN2);
+    struct ir_val *st = madf(subf(v, fconst(0.5f)), subf(lv, fconst(1)), fconst(0.418938533f));
+    st = madf(z, poly(mulf(z, z), k_stirling, 3), st);
+    l = sel(fcmp(FCMP_OGE, v, fconst(8)), st, l);
+    struct ir_val *s;
+    sincospi_ir(v, &s, NULL);
+    struct ir_val *ln = subf(subf(log_ir(divf(fconst(PI_HI), absf(s)), 1, LN2), lv), l);
+    struct ir_val *neg = fcmp(FCMP_OLT, x, fconst(0));
+    l = sel(neg, ln, l);
+    struct ir_val *pole = op2(IR_POR, IR_PRED, op2(IR_PAND, IR_PRED, neg, fcmp(FCMP_OEQ, t, fconst(0))),
+                              fcmp(FCMP_OEQ, v, finf(0)));
+    return sel(pole, finf(0), l);
+}
+
 // remainder exactly: fmod by 2|y|, then |y| off once or twice to the nearest multiple, a tie to the even one
 static struct ir_val *remainder_ir(struct ir_val *x, struct ir_val *y)
 {
@@ -2644,7 +2722,11 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
         struct ir_val *q = op1(IR_FRND, IR_F32, op2(IR_FMUL, IR_F32, a, mufu(MUFU_RCP, b)));
         q->aux = SASS_RND_TRUNC;
         r = op3(IR_FFMA, IR_F32, op1(IR_FNEG, IR_F32, q), b, a);
-    } else if (is_fn(name, "erf"))
+    } else if (is_fn(name, "tgamma"))
+        r = tgamma_ir(a);
+    else if (is_fn(name, "lgamma"))
+        r = lgamma_ir(a);
+    else if (is_fn(name, "erf"))
         r = erf_ir(a);
     else if (is_fn(name, "erfc")) {
         r = erfc_abs(absf(a));
