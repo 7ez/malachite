@@ -2320,6 +2320,39 @@ static struct ir_val *cheap_math(const char *name, struct ir_val *a, struct ir_v
     return NULL;
 }
 
+// OpenCL's half_ maths, to 8192 ulps: MUFU and the cheap forms, but MUFU.LG2's error is absolute, so the logs
+// (and powr's log2) near 1 take log_ir; NULL for the rest
+static struct ir_val *half_math(const char *name, struct ir_val *a, struct ir_val *b)
+{
+    struct ir_val *r = NULL;
+    if (is_fn(name, "half_sin") || is_fn(name, "half_cos")) {
+        // past 2^16 any result in [-1, 1] does, which the fast reduction keeps to, but inf and NaN want NaN
+        int sin = is_fn(name, "half_sin");
+        sincos_ir(a, sin ? &r : NULL, sin ? NULL : &r, TRIG_FAST);
+        r = sel(fcmp(FCMP_OLT, absf(a), finf(0)), r, konst(IR_F32, FLT_NAN));
+    } else if (is_fn(name, "half_tan"))  // and any number for tan, where the fast one has NaN
+        r = tan_ir(a, TRIG_HALF);
+    else if (is_fn(name, "half_exp"))
+        r = mufu(MUFU_EX2, mulf(a, fconst(LOG2E_HI)));
+    else if (is_fn(name, "half_exp2"))
+        r = mufu(MUFU_EX2, a);
+    else if (is_fn(name, "half_exp10"))
+        r = mufu(MUFU_EX2, mulf(a, fconst(3.32192802f)));
+    else if (is_fn(name, "half_log"))
+        r = log_ir(a, 1, LN2);
+    else if (is_fn(name, "half_log2"))
+        r = log_ir(a, LOG2E_HI, 1);
+    else if (is_fn(name, "half_log10"))
+        r = log_ir(a, 0.434294492f, 0.30103001f);
+    else if (is_fn(name, "half_powr"))  // powr's special cases as pow_ir's half form has them
+        r = mufu(MUFU_EX2, mulf(b, log_ir(a, LOG2E_HI, 1)));
+    else if (is_fn(name, "half_rsqrt"))
+        r = mufu(MUFU_RSQ, a);
+    else if (is_fn(name, "half_sqrt"))
+        r = mufu(MUFU_SQRT, a);
+    return r;
+}
+
 // One lane of a math intrinsic on float/half lanes; NULL when name isn't one.
 static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, enum ir_type t)
 {
@@ -2330,7 +2363,7 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
     struct ir_val *b = LLVMGetNumOperands(call) > 2 ? widen(get(LLVMGetOperand(call, 1), lane)) : NULL;
     struct ir_val *c = LLVMGetNumOperands(call) > 3 ? widen(get(LLVMGetOperand(call, 2), lane)) : NULL;
     struct ir_val *r;
-    if ((!precise || t == IR_F16) && (r = cheap_math(name, a, b, !precise)))
+    if ((r = half_math(name, a, b)) || ((!precise || t == IR_F16) && (r = cheap_math(name, a, b, !precise))))
         return narrow(r, t);
     if (is_fn(name, "fma") || is_fn(name, "fmuladd"))
         r = op3(IR_FFMA, IR_F32, a, b, c);
