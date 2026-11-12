@@ -3131,12 +3131,15 @@ static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, c
     d.local_size = pipeline->_kernel.local_size;
     d.barriers = pipeline->_kernel.barriers;
     d.params_size = malachite_fill_params(&pipeline->_kernel, buffers, d.prog_va, d.params, sizeof(d.params));
-    // [[threadgroup(n)]] memory after the kernel's own threadgroup variables, each at the offset its param says
+    // [[threadgroup(n)]] memory after the kernel's own threadgroup variables, each at the offset its param says. An
+    // OpenCL __local argument is aligned to its type, up to 128 bytes for a long16.
+    uint32_t align = pipeline->_cl ? 128 : 16;
     for (uint32_t i = 0; i < pipeline->_kernel.nargs; i++) {
         const struct nvk_arg *a = &pipeline->_kernel.args[i];
         if (a->kind != NVK_ARG_THREADGROUP)
             continue;
-        uint32_t at = (d.shared_size + 15) & ~15u, len = threadgroup && a->index < 31 ? threadgroup[a->index] : 0;
+        uint32_t at = (d.shared_size + align - 1) & ~(align - 1);
+        uint32_t len = threadgroup && a->index < 31 ? threadgroup[a->index] : 0;
         memcpy(d.params + a->cbuf_off - 0x160, &at, 4);
         d.params_size = MAX(d.params_size, a->cbuf_off - 0x160 + 8u);
         d.shared_size = at + ((len + 15) & ~15u);
