@@ -848,9 +848,13 @@ static void scan_uses(LLVMValueRef fn, LLVMValueRef root, int64_t base, struct p
                 if (callee && !LLVMGetFirstBasicBlock(callee) && name && strncmp(name, "air.", 4) &&
                     strncmp(name, "llvm.", 5))
                     callee = linked_function(name);
-                // a memcpy or memset moves bytes whatever the lanes around it are, which only memory keeps
+                // a memcpy or memset moves bytes whatever the lanes around it are, which only memory keeps; so does
+                // a vload or vstore (a vload_half of an int array reads it as halves)
                 if (name && !strncmp(name, "llvm.mem", 8) &&
                     (ptr_root(LLVMGetOperand(in, 0)) == root || ptr_root(LLVMGetOperand(in, 1)) == root))
+                    s->dynamic = 1;
+                if (name && (!strncmp(name, "air.vload", 9) || !strncmp(name, "air.vstore", 10)) &&
+                    ptr_root(LLVMGetOperand(in, LLVMGetNumOperands(in) - 2)) == root)
                     s->dynamic = 1;
                 int lifetime = name && !strncmp(name, "llvm.lifetime.", 14);
                 for (int k = 0; k < LLVMGetNumOperands(in) - 1; k++) {
