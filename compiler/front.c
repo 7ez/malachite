@@ -2706,12 +2706,11 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
                  : is_fn(name, "trunc") ? SASS_RND_TRUNC
                                         : SASS_RND_NEAREST;
     } else if (is_fn(name, "round")) {
-        // halves away from zero: trunc(x + copysign(0.49999997, x)), exact everywhere, unlike trunc(x + 0.5),
+        // halves away from zero: trunc(|x| + 0.49999997) with x's sign, exact everywhere, unlike trunc(x + 0.5),
         // which rounds 0.49999997 + 0.5 up to 1; at 0.5 itself the sum's tie goes to 1
-        struct ir_val *half = op2(IR_OR, IR_F32, op2(IR_AND, IR_F32, a, konst(IR_F32, 0x80000000u)),
-                                  konst(IR_F32, 0x3effffff));
-        r = op1(IR_FRND, IR_F32, addf(a, half));
-        r->aux = SASS_RND_TRUNC;
+        struct ir_val *t = op1(IR_FRND, IR_F32, addf(absf(a), fconst(0.49999997f)));
+        t->aux = SASS_RND_TRUNC;
+        r = op2(IR_OR, IR_F32, op2(IR_AND, IR_F32, a, konst(IR_F32, 0x80000000u)), t);
     } else if (is_fn(name, "dfdx") || is_fn(name, "dfdy")) {
         r = op1(IR_DERIV, IR_F32, a);
         r->aux = is_fn(name, "dfdy");
