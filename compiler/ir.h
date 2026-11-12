@@ -66,7 +66,7 @@ enum ir_op {
     IR_ADDR,  // IR_I64 = src0 + src1 * imm, src1 sign-extended when aux
     IR_ADDI,  // IR_I64 = src0 + imm
 
-    IR_LDG,  // src0 address + imm, aux bytes (2 or 4)
+    IR_LDG,  // src0 address + imm, aux bytes (2 or 4); with src1, only where that predicate is set (else undefined)
     IR_STG,  // src0 address + imm <- src1
     IR_LDS,  // shared src0 (or none) + imm
     IR_STS,

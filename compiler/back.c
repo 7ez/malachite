@@ -106,6 +106,7 @@ struct mop {
                // narrow, or VREG_RZ for none); 0 when src0 is the whole address
     int narrow;
     int readonly;  // LDG: of memory nothing writes while the kernel runs, through the read-only cache
+    int guarded;   // LDG: only where P0 is set
 };
 
 // ISETP's and FSETP's aux: the compare combined with P0's value before it, rather than taken alone
@@ -554,6 +555,12 @@ static int is_pand_or(const struct ir_val *v)
     return v->op == IR_PAND || v->op == IR_POR;
 }
 
+// source i of v is read as P0: a select's condition or a load's guard
+static int is_condition(const struct ir_val *v, unsigned i)
+{
+    return (v->op == IR_SEL && i == 0) || (v->op == IR_LDG && i == 1);
+}
+
 static void find_fused_compares(struct ir_func *f)
 {
     int n = 0;
@@ -572,14 +579,14 @@ static void find_fused_compares(struct ir_func *f)
             for (unsigned i = 0; i < v->nsrc; i++) {
                 struct ir_val *c = v->src[i];
                 if (c && is_pand_or(c) &&
-                    !(c->block == b && ((v->op == IR_SEL && i == 0) || (branches && v->op == IR_CBR))))
+                    !(c->block == b && (is_condition(v, i) || (branches && v->op == IR_CBR))))
                     g_cmp_fused[c->id] = 0;
             }
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v; v = v->next)
             for (unsigned i = 0; i < v->nsrc; i++) {
                 struct ir_val *c = v->src[i];
-                if (!c || c->op != IR_CMP || (v->op == IR_SEL && i == 0))
+                if (!c || c->op != IR_CMP || is_condition(v, i))
                     continue;
                 if (is_pand_or(v) && g_cmp_fused[v->id] && c->block == b)
                     continue;
@@ -1694,10 +1701,14 @@ static void lower_value(struct ir_val *v)
         int q[4];
         // 8 or 16 bytes land in 2 or 4 registers aligned as many, the lanes read through IR_PROJ
         v->vreg = v->aux > 4 ? new_cluster(v->aux / 4, v->aux / 4, q) : new_vreg(1, 1);
+        int guarded = v->op == IR_LDG && v->nsrc > 1;
+        if (guarded)
+            emit_sel_cond(v->src[1]);
         struct mop *m = emit_mop(v->op == IR_LDG ? MK_LDG : v->op == IR_LDS ? MK_LDS : MK_LDL);
         m->def = v->vreg;
-        m->nsrc = v->nsrc;
-        for (unsigned i = 0; i < v->nsrc; i++)
+        m->nsrc = guarded ? 1 : v->nsrc;
+        m->guarded = guarded;
+        for (int i = 0; i < m->nsrc; i++)
             m->src[i] = vreg_of_address(v, i, m);
         m->imm = v->imm;
         m->aux = v->aux;
@@ -4168,7 +4179,13 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             ss[n++] = UR_PSEUDO;
             struct sass_insn in = m->ur ? sass_ldg_ur(d, s[0], wide, (uint8_t)m->ur, (uint32_t)m->imm, mem_size(m->aux), c)
                                         : sass_ldg(d, s[0], (uint32_t)m->imm, mem_size(m->aux), c);
-            sched_push(m->readonly ? sass_ldg_constant(in) : in, ss, n, d, 0, 0);
+            if (m->readonly)
+                in = sass_ldg_constant(in);
+            if (m->guarded) {
+                in = sass_pred(in, 0, 0);
+                ss[n++] = P0_PSEUDO;
+            }
+            sched_push(in, ss, n, d, 0, 0);
             break;
         }
         case MK_STG: {
