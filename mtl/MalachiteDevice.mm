@@ -350,6 +350,24 @@ static struct malachite_lvl malachite_image_level(MTLPixelFormat f, NSUInteger w
     return v;
 }
 
+// A pass's clear colour as SET_COLOR_CLEAR_VALUE takes it: an integer target's as the integers' bits, which the 3D
+// class clamps to the format's channels.
+static void malachite_clear_colour(enum tex_format f, MTLClearColor c, float out[4])
+{
+    const double v[4] = { c.red, c.green, c.blue, c.alpha };
+    bool sint = f == TEX_R8_SINT || f == TEX_RG8_SINT || f == TEX_RGBA8_SINT || f == TEX_R16_SINT || f == TEX_RG16_SINT ||
+                f == TEX_RGBA16_SINT || f == TEX_R32_SINT || f == TEX_RG32_SINT || f == TEX_RGBA32_SINT;
+    for (int i = 0; i < 4; i++) {
+        if (!tex_format_info(f).integer) {
+            out[i] = (float)v[i];
+            continue;
+        }
+        uint32_t bits = sint ? (uint32_t)(int32_t)fmin(fmax(v[i], INT32_MIN), INT32_MAX)
+                             : (uint32_t)fmin(fmax(v[i], 0), UINT32_MAX);
+        memcpy(&out[i], &bits, 4);
+    }
+}
+
 // the grid of samples a multisampled pixel is in memory: 2x1, 2x2, 4x2, as the 3D class renders them
 static void malachite_grid(uint32_t samples, uint32_t *sx, uint32_t *sy)
 {
@@ -3569,12 +3587,11 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
                               : rt;
             malachite_keep(cb, _resolve[i]);
         }
-        MTLClearColor c = ca.clearColor;
         // an image's surface is block-linear already
         struct nvgpu_target ct = { [(MTLIOAccelBuffer *)t->_backing gpuAddress] + s.offset, s.rows ? 0 : s.pitch,
                                    tex_format_info((enum tex_format)f).target, s.rows != 0,
-                                   ca.loadAction == MTLLoadActionClear, 0, {},
-                                   { (float)c.red, (float)c.green, (float)c.blue, (float)c.alpha } };
+                                   ca.loadAction == MTLLoadActionClear, 0, {}, {} };
+        malachite_clear_colour((enum tex_format)f, ca.clearColor, ct.clear_rgba);
         // a block-linear shadow, copied in and back by the copy engine, for what the 3D class can't render to: a
         // pitch-linear target beside a depth buffer or another colour target (a pass with one draws nothing to any
         // of them), or rows or a start not on 128 bytes (an IOSurface 357 pixels wide)
@@ -5585,9 +5602,9 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
                         tex_format_info((enum tex_format)_formats[i]).bytes, i, (unsigned long)ca.loadAction, i,
                         (unsigned long)ca.storeAction, i, (unsigned long)ca.level, i, (unsigned long)ca.slice];
         // the pass's clear, which this draw does first: the targets before it are as the pass found them
-        const float *c = i ? d.more[i - 1].clear_rgba : d.clear_rgba;
+        MTLClearColor c = ca.clearColor;
         if (i ? d.more[i - 1].clear : d.clear)
-            [m appendFormat:@"attachment.%u.clear=%.9g,%.9g,%.9g,%.9g\n", i, c[0], c[1], c[2], c[3]];
+            [m appendFormat:@"attachment.%u.clear=%.9g,%.9g,%.9g,%.9g\n", i, c.red, c.green, c.blue, c.alpha];
         NSString *file = [NSString stringWithFormat:@"attachment%u-before.bin", i];
         if ([self record:[dir stringByAppendingPathComponent:file] attachment:i of:d])
             [m appendFormat:@"attachment.%u.before=%@\n", i, file];
