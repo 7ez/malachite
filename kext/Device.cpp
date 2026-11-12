@@ -341,7 +341,9 @@ struct gpu_ctx {
     uint64_t pass_vs, pass_ps, pass_ti, pass_ts;  // and its shaders
     volatile uint32_t *compute_sem;
     uint32_t compute_seq;
-    // the last launches and runs, oldest first from launch_next, for the log when the channel faults
+    // the last launches and runs, oldest first from launch_next, for the log when the channel faults: as many as a
+    // kick holds and more, so the one that faulted is among them
+    static const unsigned LAUNCH_LOG = 64;
     struct launch_log {
         uint32_t seq, groups[3], block[3], regs;
         uint64_t prog, vs;  // a draw's vs, and its ps in prog
@@ -350,7 +352,7 @@ struct gpu_ctx {
         pe_state pe;  // what a draw's primitive engine fetches
         uint64_t run_va;  // a run of the plugin's: its methods, words and draws (run_words 0 for anything else)
         uint32_t run_words, run_draws;
-    } launches[16];
+    } launches[LAUNCH_LOG];
     unsigned launch_next;
     // The queue whose draw last set the state the plugin's runs change (nullptr when the channel holds none of it: a
     // new channel, or a draw that failed): a run only follows the draw or run before it in its command buffer.
@@ -960,7 +962,7 @@ class Gpu : public IOService
             c->compute_ch.push_off = PUSH_SIZE;
         c->draws_queued = 0;
         c->draw_pending = c->compute_seq;
-        gpu_ctx::launch_log &l = c->launches[c->launch_next++ % 16];
+        gpu_ctx::launch_log &l = c->launches[c->launch_next++ % gpu_ctx::LAUNCH_LOG];
         l = {};
         l.seq = c->compute_seq;
         l.run_va = p->va;
@@ -3294,8 +3296,9 @@ void Gpu::recover(gpu_ctx *c)
         // oldest first, with what the primitive engine fetches carried from each draw through the runs after it
         pe_state pe;
         pe_unknown(&pe);
-        for (unsigned k = c->launch_next > 16 ? c->launch_next - 16 : 0; k < c->launch_next; k++) {
-            const auto &l = c->launches[k % 16];
+        const unsigned logged = gpu_ctx::LAUNCH_LOG;
+        for (unsigned k = c->launch_next > logged ? c->launch_next - logged : 0; k < c->launch_next; k++) {
+            const auto &l = c->launches[k % logged];
             bool pending = l.seq && (int32_t)(l.seq - *c->compute_sem) > 0;
             char why[160];
             if (l.run_words) {
@@ -3607,8 +3610,8 @@ IOReturn Gpu::gpu_dispatch(gpu_ctx *c, const struct nvgpu_dispatch *d)
                                          0x80, 0, (uint16_t)block[0], (uint16_t)MIN(grid[0], 65535u) };
         compute_qmd_set_stamp((uint32_t *)(slot_cpu + 0x1000), c->prof_va + (i % PROF_RING) * 16, i + 1);
     }
-    c->launches[c->launch_next++ % 16] = { payload, { grid[0], grid[1], grid[2] }, { block[0], block[1], block[2] },
-                                           d->reg_count, d->prog_va, 0 };
+    c->launches[c->launch_next++ % gpu_ctx::LAUNCH_LOG] = { payload, { grid[0], grid[1], grid[2] },
+                                                            { block[0], block[1], block[2] }, d->reg_count, d->prog_va, 0 };
     compute_launch(&c->compute_ch, qmdva);
     issued(c);
     c->dispatch_slot_seq[slot] = c->draw_pending = payload;
@@ -3959,7 +3962,7 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const void *queue
         render_stamp(&c->compute_ch, c->prof_va + (i % PROF_RING) * 16, i + 1);
         chan_kick(&c->compute_ch);
     }
-    gpu_ctx::launch_log &l = c->launches[c->launch_next++ % 16];
+    gpu_ctx::launch_log &l = c->launches[c->launch_next++ % gpu_ctx::LAUNCH_LOG];
     l = { c->compute_seq, { r.count, r.instances, 0 }, {}, d->vs_regs, r.ps, r.vs };
     __builtin_memcpy(l.params, d->vs_params, 16);
     __builtin_memcpy(l.params + 2, d->ps_params, 16);
