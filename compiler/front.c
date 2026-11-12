@@ -2086,6 +2086,37 @@ static struct ir_val *pow_ir(struct ir_val *x, struct ir_val *y, int powr, int p
     return sel(one, fconst(1), r);
 }
 
+// pown x^n or rootn x^(1/n): log2_split's log2 |x| times n (over n) in two parts, and the sign of x for an odd n;
+// as in pow_ir, 0, inf, NaN and denormals take MUFU.LG2's log2, which gives their special cases
+static struct ir_val *pown_ir(struct ir_val *x, struct ir_val *n, int root)
+{
+    struct ir_val *xb = fbits(IR_AND, x, 0x7fffffff), *hi, *lo;
+    struct ir_val *normal = icmp(IR_LT, ibin(IR_SUB, xb, ik(0x00800000)), ik(0x7f000000));
+    log2_split(xb, &hi, &lo);
+    hi = sel(normal, hi, mufu(MUFU_LG2, xb));
+    lo = sel(normal, lo, fconst(0));
+    struct ir_val *nf = op1(IR_I2F, IR_F32, n), *th, *tl;
+    nf->aux = 1;
+    if (root) {  // the quotient's remainder is exact; past 2^24 n's rounding doesn't matter
+        th = divf(hi, nf);
+        tl = mulf(addf(madf(negf(th), nf, hi), lo), mufu(MUFU_RCP, nf));
+    } else {  // n's rounding past 2^24, exact as an int, times log2 |x| into the low part (out by one at 2^31)
+        struct ir_val *ni = op1(IR_F2I, IR_I32, nf);
+        ni->aux = 1;
+        struct ir_val *nl = op1(IR_I2F, IR_F32, ibin(IR_SUB, n, ni));
+        nl->aux = 1;
+        th = mulf(nf, hi);
+        tl = madf(nl, hi, madf(nf, lo, madf(nf, hi, negf(th))));
+    }
+    struct ir_val *odd = icmp(IR_NE, ibin(IR_AND, n, ik(1)), ik(0));
+    struct ir_val *r = op2(IR_XOR, IR_F32, exp2_split(th, tl), sel(odd, fbits(IR_AND, x, 0x80000000u), ik(0)));
+    struct ir_val *zero = icmp(IR_EQ, n, ik(0));
+    if (!root)
+        return sel(zero, fconst(1), r);
+    struct ir_val *even_neg = op2(IR_PAND, IR_PRED, fcmp(FCMP_OLT, x, fconst(0)), op1(IR_PNOT, IR_PRED, odd));
+    return sel(op2(IR_POR, IR_PRED, zero, even_neg), konst(IR_F32, FLT_NAN), r);
+}
+
 // r - q d for q = trunc(r / d), r / d below 2^23: exact, with q put right where the quotient rounded across an
 // integer. A tiny d has both scaled up by 2^64, or a q one too big's remainder would flush, and a huge one
 // divides scaled down, or 1 / d would.
@@ -2557,6 +2588,8 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
         r = sqrtf_ir(a, 1);
     else if (is_fn(name, "pow") || is_fn(name, "powr"))
         r = pow_ir(a, b, is_fn(name, "powr"), 1);
+    else if (is_fn(name, "pown") || is_fn(name, "rootn"))  // n an i32, which widen leaves
+        r = pown_ir(a, b, is_fn(name, "rootn"));
     else if (is_fn(name, "mix"))  // t b + (a - t a), as Apple's: mix(0, 1, inf) is NaN, mix(x, x, t) not always x
         r = madf(c, b, madf(negf(c), a, a));
     else if (is_fn(name, "step"))  // x >= edge ? 1 : 0, so 0 with a NaN as Apple's
