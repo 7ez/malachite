@@ -1641,6 +1641,8 @@ static struct ir_val *clampf(struct ir_val *x, struct ir_val *lo, struct ir_val 
 #define PIO2_LO -4.37113883e-8f
 #define PI_HI 3.14159274f
 #define PI_LO -8.74227766e-8f
+#define INV_PI_HI 0.318309873f
+#define INV_PI_LO 1.28412765e-8f
 #define LOG2E_HI 1.44269502f
 #define LOG2E_LO 1.92596303e-8f
 #define LN2 0.693147182f
@@ -1977,7 +1979,32 @@ static struct ir_val *atan_ir(struct ir_val *x)
     return xorsign(sel(inv, subf(fconst(PIO2_HI), subf(a, fconst(PIO2_LO))), a), x);
 }
 
-static struct ir_val *atan2_ir(struct ir_val *y, struct ir_val *x)
+// x / pi, 1/pi in two parts
+static struct ir_val *over_pi(struct ir_val *x)
+{
+    return madf(x, fconst(INV_PI_HI), mulf(x, fconst(INV_PI_LO)));
+}
+
+// asin x / pi or acos x / pi as asin and acos are built, in turns of pi so that their halves and wholes are exact
+static struct ir_val *asinpi_acospi(struct ir_val *x, int acos)
+{
+    struct ir_val *ax = absf(x), *big = fcmp(FCMP_OGT, ax, fconst(0.5f));
+    struct ir_val *p = over_pi(asin_core(ax, big));
+    if (!acos)
+        return xorsign(sel(big, madf(p, fconst(-2), fconst(0.5f)), p), x);
+    struct ir_val *side = sel(fcmp(FCMP_OLT, x, fconst(0)), madf(p, fconst(-2), fconst(1)), mulf(p, fconst(2)));
+    return sel(big, side, subf(fconst(0.5f), xorsign(p, x)));
+}
+
+static struct ir_val *atanpi_ir(struct ir_val *x)
+{
+    struct ir_val *ax = absf(x), *inv = fcmp(FCMP_OGT, ax, fconst(1));
+    struct ir_val *a = over_pi(atan01(sel(inv, divf(fconst(1), ax), ax)));
+    return xorsign(sel(inv, subf(fconst(0.5f), a), a), x);
+}
+
+// pi: atan2pi, the result in turns of pi
+static struct ir_val *atan2_ir(struct ir_val *y, struct ir_val *x, int pi)
 {
     // atan of the smaller magnitude over the larger, put in its octant; with that ratio 0 for two zeros and 1 for
     // two infinities, the moves give C's atan2(+-0, +-0) and atan2(+-inf, +-inf) as well
@@ -1986,9 +2013,16 @@ static struct ir_val *atan2_ir(struct ir_val *y, struct ir_val *x)
     struct ir_val *s = sel(fcmp(FCMP_OGT, hi, fconst(0x1p64f)), fconst(0x1p-64f), fconst(1));  // or 1 / hi flushes
     struct ir_val *z = divf(mulf(lo, s), mulf(hi, s));
     z = sel(fcmp(FCMP_OEQ, hi, fconst(0)), fconst(0), sel(fcmp(FCMP_OEQ, lo, finf(0)), fconst(1), z));
-    struct ir_val *a = atan01(z);
-    a = sel(fcmp(FCMP_OGT, ay, ax), subf(fconst(PIO2_HI), subf(a, fconst(PIO2_LO))), a);
-    a = sel(icmp(IR_NE, fbits(IR_AND, x, 0x80000000u), ik(0)), subf(fconst(PI_HI), subf(a, fconst(PI_LO))), a);
+    struct ir_val *a = atan01(z), *half, *whole;
+    if (pi) {
+        a = op2(IR_FMIN, IR_F32, over_pi(a), fconst(0.25f));  // atan01(1) rounds up, a quarter exactly is wanted
+        half = subf(fconst(0.5f), a);
+    } else {
+        half = subf(fconst(PIO2_HI), subf(a, fconst(PIO2_LO)));
+    }
+    a = sel(fcmp(FCMP_OGT, ay, ax), half, a);
+    whole = pi ? subf(fconst(1), a) : subf(fconst(PI_HI), subf(a, fconst(PI_LO)));
+    a = sel(icmp(IR_NE, fbits(IR_AND, x, 0x80000000u), ik(0)), whole, a);
     return sel(fcmp(FCMP_UNO, x, y), addf(x, y), xorsign(a, y));
 }
 
@@ -2316,7 +2350,13 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
         }
     }
     else if (is_fn(name, "atan2"))
-        r = atan2_ir(a, b);
+        r = atan2_ir(a, b, 0);
+    else if (is_fn(name, "atan2pi"))
+        r = atan2_ir(a, b, 1);
+    else if (is_fn(name, "atanpi"))
+        r = atanpi_ir(a);
+    else if (is_fn(name, "asinpi") || is_fn(name, "acospi"))
+        r = asinpi_acospi(a, is_fn(name, "acospi"));
     else if (is_fn(name, "atan")) {  // Apple's flushes a denormal x even in precise maths, and fast's FLT_MIN too
         r = atan_ir(a);
         if (!precise)
