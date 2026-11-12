@@ -38,6 +38,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         await MainActor.run { open() }
     }
 
+    // macOS drops an active app's notifications unless it asks for them
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
+                                            willPresent notification: UNNotification) async -> UNNotificationPresentationOptions {
+        [.banner, .list]
+    }
+
     private func open() {
         if window == nil {
             let w = NSWindow(contentViewController: NSHostingController(rootView: MainView(model: appModel)))
