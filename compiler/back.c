@@ -2817,6 +2817,98 @@ static void loads_first(struct ir_func *f)
     free(ok);
 }
 
+// v, moved to the start of the entry block, ahead of any use
+static void to_entry_start(struct ir_func *f, struct ir_val *v)
+{
+    ir_remove(v);
+    v->block = f->entry;
+    v->prev = NULL;
+    v->next = f->entry->first;
+    f->entry->first->prev = v;
+    f->entry->first = v;
+}
+
+// A helper lane of a fragment quad (one its primitive covers no sample of) runs for its neighbours' derivatives,
+// and its coordinates are extrapolated: a sliver triangle's can make a buffer index of INT_MIN, whose read faults
+// the channel. Its device loads at addresses that follow from the interpolated inputs, whose values reach no
+// derivative, implicit-LOD sample, cross-lane operation or branch, are guarded by its coverage mask.
+static void guard_helper_loads(struct ir_func *f)
+{
+    if (g_info->stage != NVK_FRAGMENT || f->nsubs)
+        return;
+    int n = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            n = v->id >= n ? v->id + 1 : n;
+    char *reach = calloc(n, 1), *varies = calloc(n, 1);
+    int sinks = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next) {
+            int lod = IR_TEXA_FLAGS(v->aux);
+            if (v->op == IR_DERIV || v->op == IR_SHFL || v->op == IR_VOTE ||
+                (v->op == IR_TEX && IR_TEXA_OP(v->aux) == SASS_TEX && SASS_TEXF_LOD(lod) != SASS_LOD_ZERO &&
+                 SASS_TEXF_LOD(lod) != SASS_LOD_LOD)) {
+                reach[v->id] = 1;
+                sinks = 1;
+            }
+        }
+    for (struct ir_block *b = f->entry; sinks && b; b = b->next)
+        if (b->last && b->last->op == IR_CBR)  // a helper lane on another path changes what its quad sees
+            reach[b->last->id] = 1;
+    // what reaches them, back through local memory as a whole
+    for (int changed = 1; changed;) {
+        changed = 0;
+        int local = 0;
+        for (struct ir_block *b = f->entry; b; b = b->next)
+            for (struct ir_val *v = b->first; v; v = v->next)
+                local |= v->op == IR_LDL && reach[v->id];
+        for (struct ir_block *b = f->entry; b; b = b->next)
+            for (struct ir_val *v = b->first; v; v = v->next) {
+                if (!reach[v->id] && !(local && v->op == IR_STL))
+                    continue;
+                if (!reach[v->id])
+                    changed = reach[v->id] = 1;
+                for (unsigned i = 0; i < v->nsrc; i++)
+                    if (v->src[i] && !reach[v->src[i]->id])
+                        changed = reach[v->src[i]->id] = 1;
+            }
+    }
+    // what follows from the interpolated inputs (a uniform address is the same in every lane of the quad)
+    for (int changed = 1; changed;) {
+        changed = 0;
+        for (struct ir_block *b = f->entry; b; b = b->next)
+            for (struct ir_val *v = b->first; v; v = v->next) {
+                int any = v->op == IR_IPA;
+                for (unsigned i = 0; i < v->nsrc && !any; i++)
+                    any = v->src[i] && varies[v->src[i]->id];
+                if (any && !varies[v->id])
+                    changed = varies[v->id] = 1;
+            }
+    }
+    struct ir_val *covered = NULL;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next) {
+            if (v->op != IR_LDG || reach[v->id] || v->nsrc != 1 || !varies[v->src[0]->id])
+                continue;
+            if (!covered) {
+                struct ir_val *mask = ir_add(f->entry, IR_S2R, IR_I32, 0);
+                mask->imm = SR_PIXLD(SASS_PIXLD_COVMASK);
+                covered = ir_op2(f->entry, IR_CMP, IR_PRED, mask, ir_const(f->entry, IR_I32, 0));
+                covered->aux = IR_NE;
+                to_entry_start(f, covered);
+                to_entry_start(f, covered->src[1]);
+                to_entry_start(f, mask);
+            }
+            struct ir_val **src = ir_alloc(2 * sizeof(*src));
+            src[0] = v->src[0];
+            src[1] = covered;
+            v->src = src;
+            v->nsrc = 2;
+        }
+    free(varies);
+    free(reach);
+}
+
 static void spill_values(struct ir_func *f)
 {
     if (!g_nspill_ids)
@@ -5011,6 +5103,7 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
 {
     g_info = (struct airc_info *)info;
     airc_widen_shared(f, info);
+    guard_helper_loads(f);
     spill_values(f);
     g_nmops = 0;
     g_nvregs = 0;
