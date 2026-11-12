@@ -3495,6 +3495,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     // what the 3D class can't draw to (see the init) is drawn to a block-linear shadow: loaded from the attachment
     // before the first draw, stored back at the end
     struct nvgpu_copy2d _load[8], _store[8];  // linear -> shadow, shadow -> linear; bytes 0 when not wanted
+    struct nvgpu_copy2d _zload, _zstore;  // the same for a depth texture apart from its stencil texture
 }
 @end
 
@@ -3522,13 +3523,25 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     _visibility = descriptor.visibilityResultBuffer ? [(MTLIOAccelBuffer *)descriptor.visibilityResultBuffer gpuAddress] : 0;
     malachite_keep(cb, descriptor.stencilAttachment.texture);
 
-    // depth and stencil share one target (a combined format); either attachment names it
+    // depth and stencil share one target (a combined format); either attachment names it. A Depth32Float texture
+    // beside a Stencil8 one (as Apple's GL makes them) draws to the stencil texture, which is kept in the combined
+    // format: the depth is copied into it before the first draw and back at the end
     MTLRenderPassDepthAttachmentDescriptor *da = descriptor.depthAttachment;
     MTLRenderPassStencilAttachmentDescriptor *sa = descriptor.stencilAttachment;
-    MalachiteTexture *z = (MalachiteTexture *)(da.texture ? da.texture : sa.texture);
+    MalachiteTexture *dt = (MalachiteTexture *)da.texture, *st = (MalachiteTexture *)sa.texture;
+    struct malachite_sub ds;
+    bool apart = dt && st && dt != st && da.texture.pixelFormat == MTLPixelFormatDepth32Float &&
+                 sa.texture.pixelFormat == MTLPixelFormatStencil8 && [dt isKindOfClass:[MalachiteTexture class]] &&
+                 [st isKindOfClass:[MalachiteTexture class]] && !dt->_samples && !st->_samples &&
+                 malachite_sub(dt, da.level, da.slice, 0, &ds);
+    if (apart) {
+        malachite_depth_kind(cb, dt);
+        malachite_depth_kind(cb, st);
+    }
+    MTLRenderPassAttachmentDescriptor *za = apart || !da.texture ? (MTLRenderPassAttachmentDescriptor *)sa : da;
+    MalachiteTexture *z = (MalachiteTexture *)za.texture;
     struct malachite_sub zs;
-    if (z && [z isKindOfClass:[MalachiteTexture class]] && z->_zt_format &&
-        malachite_sub(z, da.texture ? da.level : sa.level, da.texture ? da.slice : sa.slice, 0, &zs)) {
+    if (z && [z isKindOfClass:[MalachiteTexture class]] && z->_zt_format && malachite_sub(z, za.level, za.slice, 0, &zs)) {
         _zattached = z;
         _pass.zt = [(MTLIOAccelBuffer *)z->_backing gpuAddress] + zs.offset;
         _pass.zt_format = z->_zt_format;
@@ -3538,7 +3551,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         _pass.zt_kind = z->_zt_kind;
         _pass.zt_compress = ((MalachiteBuffer *)z->_backing)->_one_image;
         _pass.zt_layer_pitch = z->_image ? (uint32_t)z->_layer_stride : 0;
-        _pass.zt_layers = z->_image ? z->_layers - (uint32_t)(da.texture ? da.slice : sa.slice) : 1;
+        _pass.zt_layers = z->_image ? z->_layers - (uint32_t)za.slice : 1;
         objc_setAssociatedObject(z->_backing, &malachite_kind_key, @YES, OBJC_ASSOCIATION_RETAIN);
         _pass.clear_zs = (da.texture && da.loadAction == MTLLoadActionClear) |
                          (sa.texture && sa.loadAction == MTLLoadActionClear) << 1;
@@ -3565,11 +3578,13 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 
     unsigned ncolour = 0;
     // the pass draws in the area every attachment has
-    MTLRenderPassAttachmentDescriptor *sized[9] = {};
+    MTLRenderPassAttachmentDescriptor *sized[10] = {};
     for (unsigned i = 0; i < 8; i++)
         sized[i] = descriptor.colorAttachments[i];
-    if (_pass.zt)
-        sized[8] = da.texture ? da : sa;
+    if (_pass.zt) {
+        sized[8] = da;
+        sized[9] = sa;
+    }
     for (MTLRenderPassAttachmentDescriptor *a : sized) {
         MalachiteTexture *t = (MalachiteTexture *)a.texture;
         struct malachite_sub s;
@@ -3580,6 +3595,16 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         malachite_grid(t->_samples, &sx, &sy);
         _pass.width = _pass.width ? MIN(_pass.width, s.width / sx) : s.width / sx;
         _pass.height = _pass.height ? MIN(_pass.height, s.height / sy) : s.height / sy;
+    }
+    if (apart && _pass.zt) {  // each depth word to the first of each 8-byte texel, the stencil word left as it is
+        uint64_t depth = [(MTLIOAccelBuffer *)dt->_backing gpuAddress] + ds.offset;
+        const uint32_t x = REMAP_X, none = REMAP_NONE;
+        if (da.loadAction == MTLLoadActionLoad)
+            _zload = (struct nvgpu_copy2d){ depth, _pass.zt, ds.pitch, zs.pitch, _pass.width * 4, _pass.height, 1, 1,
+                                            ds.rows, zs.rows, 0, 0, malachite_remap(x, none, none, none, 4, 1, 2) };
+        if (da.storeAction != MTLStoreActionDontCare)
+            _zstore = (struct nvgpu_copy2d){ _pass.zt, depth, zs.pitch, ds.pitch, _pass.width * 8, _pass.height, 1, 1,
+                                             zs.rows, ds.rows, 0, 0, malachite_remap(x, none, none, none, 4, 2, 1) };
     }
     for (unsigned i = 0; i < 8; i++)
         ncolour += descriptor.colorAttachments[i].texture != nil;
@@ -4563,9 +4588,8 @@ static bool malachite_resolves(MTLStoreAction action)
         d.index_size = (uint32_t)(((id<MTLBuffer>)index).length - offset);
         d.index_format = indexType == MTLIndexTypeUInt32 ? 2 : 1;
     }
-    for (unsigned i = 0; i < 8 && !_drawn; i++)
-        if (_load[i].bytes)
-            malachite_record(_cb, MALACHITE_CMD_COPY_2D, &_load[i], sizeof(_load[i]));
+    if (!_drawn)
+        [self loadAttachments];
     if ((d.target & 127) || (d.pitch & 127) || d.vs_params_size > NVGPU_PARAM_BYTES ||
         d.ps_params_size > NVGPU_PARAM_BYTES || !d.vs || !d.ps || d.nheaders > NVGPU_MAX_TEXTURES ||
         d.nsamplers > NVGPU_MAX_TEXTURES || !d.width || !d.height)
@@ -5853,6 +5877,17 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
          index:index offset:offset type:indexType];
 }
 
+// what the pass's first draw, or its clears when it has none, starts from: the shadows' contents, and a depth
+// texture's apart from its stencil texture
+- (void)loadAttachments
+{
+    for (unsigned i = 0; i < 8; i++)
+        if (_load[i].bytes)
+            malachite_record(_cb, MALACHITE_CMD_COPY_2D, &_load[i], sizeof(_load[i]));
+    if (_zload.bytes)
+        malachite_record(_cb, MALACHITE_CMD_COPY_2D, &_zload, sizeof(_zload));
+}
+
 // a pass with a clear load action and no draws still clears
 - (void)endEncoding
 {
@@ -5862,6 +5897,7 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
         clears |= t.addr && t.clear;
     bool cleared = _pass.width && clears && !_drawn;
     if (cleared) {
+        [self loadAttachments];
         struct nvgpu_draw d = _pass;
         d.pass_first = 1;
         malachite_record(_cb, MALACHITE_CMD_DRAW, &d, sizeof(d));
@@ -5869,6 +5905,8 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
     for (unsigned i = 0; i < 8 && (_drawn || cleared); i++)
         if (_store[i].bytes)
             malachite_record(_cb, MALACHITE_CMD_COPY_2D, &_store[i], sizeof(_store[i]));
+    if (_zstore.bytes && (_drawn || cleared))
+        malachite_record(_cb, MALACHITE_CMD_COPY_2D, &_zstore, sizeof(_zstore));
     for (unsigned i = 0; i < 8; i++)
         if (_resolve[i] && (_drawn || cleared))
             malachite_resolve(_cb, _attached[i], _resolve[i]);
