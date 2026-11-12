@@ -159,6 +159,7 @@ LLVMBool LLVMIsGlobalConstant(LLVMValueRef g);
 LLVMTypeRef LLVMGetAllocatedType(LLVMValueRef alloca);
 LLVMTypeRef LLVMInt32Type(void);
 LLVMTypeRef LLVMInt8Type(void);
+LLVMTypeRef LLVMHalfType(void);
 LLVMValueRef LLVMGetAggregateElement(LLVMValueRef c, unsigned i);  // a constant vector's element i
 unsigned LLVMGetNumMaskElements(LLVMValueRef shuffle);
 int LLVMGetMaskValue(LLVMValueRef shuffle, unsigned i);  // LLVMGetUndefMaskElem() for an undefined lane
