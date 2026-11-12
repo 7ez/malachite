@@ -67,7 +67,7 @@ struct airc_stage_in {
 #define AIRC_TESS_BUFFERS 16
 
 // another module whose functions the shader may call: a pipeline's linked (visible) functions
-#define AIRC_MAX_LINKED 16
+#define AIRC_MAX_LINKED 256
 struct airc_source {
     const void *air;
     size_t len;
