@@ -3519,6 +3519,57 @@ static int simd_lanes(LLVMValueRef call, const char *name)
 // array's layer (a cube's face, to read one), a compare's reference, a gradient's two derivatives and min LOD,
 // then (but for cubes) an offset (whether there is one, then it; a read has no flag), then a sample's LOD (level
 // or bias, its value, a min-LOD clamp), a gather's component, a read's LOD.
+static struct ir_val *texture_size(struct ir_val *texture, int mask)
+{
+    struct ir_val *q = op2(IR_TXQ, IR_I32, konst(IR_I32, 0), texture);
+    q->aux = mask;
+    return op1(IR_I2F, IR_F32, q);
+}
+
+// TXD takes no 3D or cube texture: their gradients become an explicit LOD, to sample at. A cube's coordinate on
+// its face is the other two over the major axis, whose derivatives come by the quotient rule.
+static struct ir_val *gradient_lod(struct ir_val *texture, int cube, LLVMValueRef coord, LLVMValueRef ddx,
+                                   LLVMValueRef ddy)
+{
+    struct ir_val *p[3], *d[2][3], *m[2];
+    for (unsigned c = 0; c < 3; c++) {
+        p[c] = get(coord, c);
+        d[0][c] = get(ddx, c);
+        d[1][c] = get(ddy, c);
+    }
+    if (!cube) {
+        struct ir_val *size[3] = { texture_size(texture, 1), texture_size(texture, 2), texture_size(texture, 4) };
+        for (unsigned k = 0; k < 2; k++) {
+            m[k] = NULL;
+            for (unsigned c = 0; c < 3; c++) {
+                struct ir_val *v = mulf(d[k][c], size[c]);
+                m[k] = m[k] ? madf(v, v, m[k]) : mulf(v, v);
+            }
+        }
+        return mulf(mufu(MUFU_LG2, op2(IR_FMAX, IR_F32, m[0], m[1])), fconst(0.5f));
+    }
+    // the major axis: z, else y, else x where it's the largest; the other two in q order (yz for x, xz for y)
+    struct ir_val *a[3] = { absf(p[0]), absf(p[1]), absf(p[2]) };
+    struct ir_val *z = fcmp(FCMP_OGE, a[2], op2(IR_FMAX, IR_F32, a[0], a[1]));
+    struct ir_val *y = fcmp(FCMP_OGE, a[1], op2(IR_FMAX, IR_F32, a[0], a[2]));
+    struct ir_val *q[3], *dq[2][3];
+    struct ir_val **v[3] = { p, d[0], d[1] }, **w[3] = { q, dq[0], dq[1] };
+    for (unsigned k = 0; k < 3; k++) {
+        w[k][0] = sel(op2(IR_POR, IR_PRED, z, y), v[k][0], v[k][1]);
+        w[k][1] = sel(z, v[k][1], v[k][2]);
+        w[k][2] = sel(z, v[k][2], sel(y, v[k][1], v[k][0]));
+    }
+    struct ir_val *r = mufu(MUFU_RCP, q[2]);
+    for (unsigned k = 0; k < 2; k++) {
+        struct ir_val *dz = mulf(dq[k][2], r);
+        struct ir_val *s = mulf(r, madf(negf(q[0]), dz, dq[k][0])), *t = mulf(r, madf(negf(q[1]), dz, dq[k][1]));
+        m[k] = madf(s, s, mulf(t, t));
+    }
+    struct ir_val *l = texture_size(texture, 1);
+    struct ir_val *lm = mulf(mulf(l, l), op2(IR_FMAX, IR_F32, m[0], m[1]));
+    return madf(mufu(MUFU_LG2, lm), fconst(0.5f), fconst(-1));  // the face spans [-1, 1]: half the texels a unit
+}
+
 static void texture_op(LLVMValueRef call, const char *name)
 {
     int gather = strstr(name, "gather_") != NULL, grad = strstr(name, "_grad.") != NULL;
@@ -3532,7 +3583,7 @@ static void texture_op(LLVMValueRef call, const char *name)
     int legacy = LLVMGetTypeKind(LLVMTypeOf(call)) != LLVMStructTypeKind;
     // the OpenGL renderer's reads name no sampler either: texture, coordinate, level, 0 (a residency flag comes back)
     int bare = read && LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(call, 1))) != LLVMPointerTypeKind;
-    if ((ms && (!read || array)) || (!d1 && !d3 && !cube && !strstr(name, "_2d")) || (grad && (cube || d3)))
+    if ((ms && (!read || array)) || (!d1 && !d3 && !cube && !strstr(name, "_2d")))
         airc_fail("unsupported texture op (%s)", name);
     struct ir_val *texture = cube && read ? faces_handle(LLVMGetOperand(call, 0))
                                           : handle_of(LLVMGetOperand(call, 0), SP_TEXTURE);
@@ -3549,11 +3600,12 @@ static void texture_op(LLVMValueRef call, const char *name)
         layer_val = op2(IR_ADD, IR_I32, cube_index, layer_val);
     }
     struct ir_val *ref = compare ? get(LLVMGetOperand(call, i++), 0) : NULL;
-    LLVMValueRef ddx = NULL, ddy = NULL;
+    LLVMValueRef ddx = NULL, ddy = NULL, grad_min = NULL;
     if (grad) {
         ddx = LLVMGetOperand(call, i++);
         ddy = LLVMGetOperand(call, i);
-        i += legacy ? 1 : 2;  // and the min LOD, which goes
+        grad_min = legacy ? NULL : LLVMGetOperand(call, i + 1);
+        i += legacy ? 1 : 2;  // and the min LOD, which goes (but for a LOD worked out here)
     }
     unsigned ncoord = d3 || (cube && !read) ? 3 : d1 ? 1 : 2;
     struct ir_val *offset = NULL;
@@ -3602,6 +3654,14 @@ static void texture_op(LLVMValueRef call, const char *name)
             lod = min_lod;
             min_lod = NULL;
         }
+    }
+    if (grad && (cube || d3)) {
+        lod = gradient_lod(texture, cube, coord, ddx, ddy);
+        struct ir_val *clamp = grad_min ? get(grad_min, 0) : NULL;
+        if (clamp && !is_konst(clamp, 0))
+            lod = op2(IR_FMAX, IR_F32, lod, clamp);
+        lod_mode = SASS_LOD_LOD;
+        grad = 0;
     }
     if (lod && lod_mode == SASS_LOD_ZERO)
         lod_mode = is_konst(lod, 0) ? SASS_LOD_ZERO : SASS_LOD_LOD;
