@@ -3906,6 +3906,36 @@ static struct ir_val *float_to_bfloat(struct ir_val *x);
 // than to kernel arguments. The dimension is an argument; from 3 on an id is 0 and a size 1, as OpenCL has it. There
 // is no global offset (the dispatch has none), and the work dimension is the last axis longer than 1. 0 for another
 // air.get_ name.
+// OpenCL's shuffle(x, mask) and shuffle2(x, y, mask): lane i is lane mask[i] of x (then of y), the mask taken modulo
+// their lanes
+static void shuffle_lanes(LLVMValueRef in)
+{
+    unsigned nops = (unsigned)LLVMGetNumOperands(in) - 1;
+    LLVMValueRef x = LLVMGetOperand(in, 0), y = nops == 3 ? LLVMGetOperand(in, 1) : NULL;
+    LLVMValueRef mask = LLVMGetOperand(in, nops - 1);
+    unsigned nx = nlanes(LLVMTypeOf(x)), total = y ? 2 * nx : nx;
+    int wide = is_i64(lane_type(LLVMTypeOf(in), 0));
+    for (unsigned l = 0; l < nlanes(LLVMTypeOf(in)); l++) {
+        struct ir_val *m = ibin(IR_AND, get(mask, l), ik(total - 1)), *r = NULL, *h = NULL;
+        for (unsigned k = 0; k < total; k++) {
+            LLVMValueRef from = k < nx ? x : y;
+            struct ir_val *v = get(from, k % nx), *vh = wide ? high_or_zero(from, k % nx) : NULL;
+            if (!r) {
+                r = v;
+                h = vh;
+                continue;
+            }
+            struct ir_val *is = icmp(IR_EQ, m, ik(k));
+            r = sel(is, v, r);
+            if (wide)
+                h = sel(is, vh, h);
+        }
+        set(in, l, r);
+        if (wide)
+            set_high(in, l, h);
+    }
+}
+
 static int workitem(LLVMValueRef in, const char *what)
 {
     static const struct {
@@ -4007,6 +4037,10 @@ static void call(LLVMValueRef in)
     }
     if (simd_op(in, name) || simd_lanes(in, name))
         return;
+    if (!strncmp(name, "air.shuffle.", 12) || !strncmp(name, "air.shuffle2.", 13)) {
+        shuffle_lanes(in);
+        return;
+    }
     if (!strcmp(name, "air.atomic.fence")) {  // whatever the memory and scope: as for the whole device
         ir_add(g_cur, IR_BAR, IR_VOID, 0)->aux = 1;
         return;
