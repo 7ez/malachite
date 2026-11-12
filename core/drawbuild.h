@@ -220,8 +220,10 @@ struct render_draw {
     uint32_t per_sample;     // the pixel stage runs once a sample
     uint32_t ps_depth;       // the pixel stage writes depth
     // layered targets as nvgpu_draw's: layers deep, colour target j's layer_pitch[j] bytes a layer, the vertex
-    // stage picking the layer when shader_layer is set
+    // stage picking the layer when shader_layer is set; each target has target_layers[j] (zt_layers) of them, 0 for
+    // all
     uint32_t layers, layer_pitch[8], zt_layer_pitch, shader_layer;
+    uint32_t target_layers[8], zt_layers;
     // viewports and scissors 1..nviewports - 1 (x, y, width, height, near, far; x, y, width, height), beside 0
     uint32_t nviewports;
     const float (*viewports)[6];
@@ -247,6 +249,15 @@ static inline uint32_t fbits(float f)
 static inline uint32_t draw_restarts(uint32_t primitive, uint32_t restart, int indexed)
 {
     return indexed && (restart == 2 || (!restart && (primitive == 3 || primitive == 5)));
+}
+
+// the layers colour target j (8: the depth/stencil target) is drawn and cleared in: 1 unless the pass is layered
+static inline uint32_t draw_target_layers(const struct render_draw *d, unsigned j)
+{
+    uint32_t has = j < 8 ? d->target_layers[j] : d->zt_layers;
+    if (d->layers <= 1)
+        return 1;
+    return has && has < d->layers ? has : d->layers;
 }
 
 static inline uint32_t draw_restart_index(uint32_t restart, uint32_t restart_index, uint32_t index_format)

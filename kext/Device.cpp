@@ -3762,6 +3762,8 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const void *queue
     r.layers = d->layers;
     __builtin_memcpy(r.layer_pitch, d->layer_pitch, sizeof(r.layer_pitch));
     r.zt_layer_pitch = d->zt_layer_pitch;
+    __builtin_memcpy(r.target_layers, d->target_layers, sizeof(r.target_layers));
+    r.zt_layers = d->zt_layers;
     r.shader_layer = d->shader_layer;
     r.nviewports = d->nviewports;
     r.viewports = d->viewports;
@@ -3773,15 +3775,21 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const void *queue
         r.more[j] = { t->addr, t->pitch, t->format, t->blocklinear, t->write_mask, {} };
         __builtin_memcpy(r.more[j].blend, t->blend, sizeof(t->blend));
     }
+    // each target cleared in the layers it has
+    uint32_t layers = r.layers;
     if (d->target && d->clear) {
+        r.layers = draw_target_layers(&r, 0);
         render_clear(&c->compute_ch, &r, 0, d->clear_rgba, nullptr, c->compute_semva, ++c->compute_seq);
         c->draw_pending = c->compute_seq;
     }
     for (unsigned j = 0; j < 7; j++)
         if (d->more[j].addr && d->more[j].clear) {
+            r.layers = layers;
+            r.layers = draw_target_layers(&r, j + 1);
             render_clear(&c->compute_ch, &r, j + 1, d->more[j].clear_rgba, nullptr, c->compute_semva, ++c->compute_seq);
             c->draw_pending = c->compute_seq;
         }
+    r.layers = layers;
     // draws into the same targets go on without waiting on each other, as a pass's draws may, unless one reads what
     // the ones before it drew (serialize); other targets are a new pass, which may sample what the last one drew
     uint64_t targets[9] = { d->target, d->zt };

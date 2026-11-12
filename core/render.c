@@ -162,7 +162,7 @@ static unsigned zt_bind(uint32_t *push, const struct render_draw *d)
         d->zt_layer_pitch >> 2,
         MTHD(0, R_SET_ZT_SELECT, 1), 1,
         // the Z/S hardware has no tile width: the width is the row stride in pixels; one layer, or an array
-        MTHD(0, R_SET_ZT_SIZE_A, 3), d->zt_width, d->zt_height, d->layers > 1 ? d->layers : (1 | 1 << 16),
+        MTHD(0, R_SET_ZT_SIZE_A, 3), d->zt_width, d->zt_height, d->layers > 1 ? draw_target_layers(d, 8) : (1 | 1 << 16),
         MTHD(0, R_SET_ZT_LAYER, 1), 0,
         // not sparse
         MTHD(0, R_SET_ZCULL, 1), d->zt_zcull,
@@ -274,7 +274,7 @@ int render_clear_zs(struct chan *ch, const struct render_draw *d, const struct g
     };
     put(push + n, w, sizeof(w) / 4);
     n += sizeof(w) / 4;
-    for (uint32_t l = 1; l < d->layers; l++) {  // a layered target's other layers
+    for (uint32_t l = 1; l < draw_target_layers(d, 8); l++) {  // a layered target's other layers
         if (n + 2 > sizeof(push) / 4) {
             chan_push(ch, push, n);
             n = 0;
