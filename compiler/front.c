@@ -187,6 +187,9 @@ static struct table {
 static unsigned g_data_param;
 static unsigned char *g_data;
 static unsigned g_data_cap;
+// an OpenCL kernel's global work offset and work_dim, as read so far, and the param their buffer is at (0 for none)
+static struct ir_val *g_cl_offsets[4];
+static unsigned g_cl_offsets_param;
 
 // threadgroup variables, laid out one after another (16-byte aligned) from shared address 0
 static struct {
@@ -4261,25 +4264,49 @@ static void shuffle_lanes(LLVMValueRef in)
     }
 }
 
+static unsigned hidden_arg(enum nvk_arg_kind kind, unsigned index, unsigned *off);
+
+// word i of what OpenCL's renderer binds at buffer 0 for a dispatch: the global work offset's x, y and z, then
+// work_dim; a hidden buffer argument, AIRC_CL_OFFSETS, only in a kernel that asks
+static struct ir_val *cl_offsets(unsigned i)
+{
+    if (!g_cl_offsets[i]) {
+        if (!g_cl_offsets_param)
+            g_cl_offsets_param = hidden_arg(NVK_ARG_BUFFER, AIRC_CL_OFFSETS, &g_param_end);
+        struct ir_val *at = cbuf(IR_I64, g_cl_offsets_param);
+        g_cl_offsets[i] = ir_add(g_prologue, IR_LDG, IR_I32, 1);
+        g_cl_offsets[i]->src[0] = at;
+        g_cl_offsets[i]->imm = 4 * i;
+        g_cl_offsets[i]->aux = 4;
+    }
+    return g_cl_offsets[i];
+}
+
+// axis l of a work-item value: offset 1 for the global work offset itself, 2 for kind's value past it
+static struct ir_val *workitem_axis(enum nvk_arg_kind kind, int offset, unsigned l)
+{
+    if (offset == 1)
+        return cl_offsets(l);
+    struct ir_val *v = thread_value(kind, l);
+    return offset ? ibin(IR_ADD, v, cl_offsets(l)) : v;
+}
+
 static int workitem(LLVMValueRef in, const char *what)
 {
     static const struct {
         const char *name;
         enum nvk_arg_kind kind;
         int size;  // 1 for a size, which is 1 past the axes
+        int offset;
     } fn[] = {
-        { "global_id.", NVK_ARG_TID, 0 },       { "local_id.", NVK_ARG_TG_TID, 0 },
-        { "group_id.", NVK_ARG_TG_POS, 0 },     { "global_size.", NVK_ARG_GRID_SIZE, 1 },
-        { "local_size.", NVK_ARG_TG_SIZE, 1 },  { "num_groups.", NVK_ARG_GROUPS, 1 },
+        { "global_id.", NVK_ARG_TID, 0, 2 },     { "local_id.", NVK_ARG_TG_TID, 0, 0 },
+        { "group_id.", NVK_ARG_TG_POS, 0, 0 },   { "global_size.", NVK_ARG_GRID_SIZE, 1, 0 },
+        { "local_size.", NVK_ARG_TG_SIZE, 1, 0 }, { "num_groups.", NVK_ARG_GROUPS, 1, 0 },
+        { "global_offset.", NVK_ARG_TID, 0, 1 },
     };
     struct ir_val *v = NULL;
-    if (!strncmp(what, "global_offset.", 14)) {
-        v = konst(IR_I32, 0);
-    } else if (!strncmp(what, "work_dim", 8)) {
-        struct ir_val *y = op2(IR_CMP, IR_PRED, thread_value(NVK_ARG_GRID_SIZE, 1), konst(IR_I32, 1));
-        struct ir_val *z = op2(IR_CMP, IR_PRED, thread_value(NVK_ARG_GRID_SIZE, 2), konst(IR_I32, 1));
-        y->aux = z->aux = IR_GT;
-        v = sel(z, konst(IR_I32, 3), sel(y, konst(IR_I32, 2), konst(IR_I32, 1)));
+    if (!strncmp(what, "work_dim", 8)) {
+        v = cl_offsets(3);
     } else {
         unsigned i = 0;
         while (i < sizeof(fn) / sizeof(fn[0]) && strncmp(what, fn[i].name, strlen(fn[i].name)))
@@ -4289,14 +4316,14 @@ static int workitem(LLVMValueRef in, const char *what)
         LLVMValueRef dim = LLVMGetOperand(in, 0);
         if (LLVMIsAConstantInt(dim)) {
             uint64_t d = LLVMConstIntGetZExtValue(dim);
-            v = d < 3 ? thread_value(fn[i].kind, (unsigned)d) : konst(IR_I32, fn[i].size);
+            v = d < 3 ? workitem_axis(fn[i].kind, fn[i].offset, (unsigned)d) : konst(IR_I32, fn[i].size);
         } else {
             struct ir_val *d = get(dim, 0);
             v = konst(IR_I32, fn[i].size);
             for (int l = 2; l >= 0; l--) {
                 struct ir_val *is = op2(IR_CMP, IR_PRED, d, konst(IR_I32, l));
                 is->aux = IR_EQ;
-                v = sel(is, thread_value(fn[i].kind, (unsigned)l), v);
+                v = sel(is, workitem_axis(fn[i].kind, fn[i].offset, (unsigned)l), v);
             }
         }
     }
@@ -7584,6 +7611,8 @@ void airc_front(void *module, void **linked, const char *const *linked_names, un
     g_picked = NULL;
     g_tables = NULL;
     g_data_param = 0;
+    memset(g_cl_offsets, 0, sizeof(g_cl_offsets));
+    g_cl_offsets_param = 0;
 
     LLVMValueRef arglist;
     g_entry_fn = stage_function(&arglist);

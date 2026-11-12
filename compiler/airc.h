@@ -66,6 +66,10 @@ struct airc_stage_in {
 #define AIRC_TESS_BUFFER(i) (0x180 + 8 * (i))
 #define AIRC_TESS_BUFFERS 16
 
+// the buffer index of an OpenCL kernel's hidden argument for its global work offset and work_dim (OpenCL's renderer
+// binds them at 0, the kernel's own buffers from 3), only in a kernel that reads either
+#define AIRC_CL_OFFSETS 30
+
 // another module whose functions the shader may call: a pipeline's linked (visible) functions
 #define AIRC_MAX_LINKED 256
 struct airc_source {

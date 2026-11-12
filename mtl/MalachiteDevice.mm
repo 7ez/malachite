@@ -2991,6 +2991,15 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
         if (a->kind == NVK_ARG_TEXTURE && a->access && a->index < MALACHITE_BINDINGS &&
             [_textures[a->index] isKindOfClass:[MalachiteTexture class]])  // an image over one of OpenCL's buffers
             malachite_written(_cb, ((MalachiteTexture *)_textures[a->index])->_backing);
+        // the global work offset and work_dim, which the renderer binds at 0
+        if (a->kind == NVK_ARG_BUFFER && a->index == AIRC_CL_OFFSETS) {
+            static const uint32_t none[4] = { 0, 0, 0, 1 };
+            if (_buffers[0])
+                out[a->index] = _buffers[0];
+            else
+                malachite_upload(_cb, none, sizeof(none), &out[a->index]);
+            continue;
+        }
         if (a->kind != NVK_ARG_BUFFER || a->index + MALACHITE_CL_FIRST >= 31)
             continue;
         out[a->index] = _buffers[a->index + MALACHITE_CL_FIRST];
@@ -6672,6 +6681,12 @@ struct malachite_compiled {
 };
 
 // the arguments of a compiled function that resources bind to
+// the compiler's hidden argument for an OpenCL kernel's global work offset, which no one binds by its index
+static bool malachite_hidden_offsets(const struct nvk_arg *a, const char *name)
+{
+    return a->kind == NVK_ARG_BUFFER && a->index == AIRC_CL_OFFSETS && !name[0];
+}
+
 static NSArray<MalachiteArgument *> *malachite_arguments(const struct malachite_compiled *k)
 {
     NSMutableArray *args = [NSMutableArray array];
@@ -6679,7 +6694,8 @@ static NSArray<MalachiteArgument *> *malachite_arguments(const struct malachite_
         unsigned kind = k->h.args[i].kind;
         // threadgroup memory too: OpenCL takes an argument's index from its place in this list, and a __local one
         // left out moved every one after it
-        if (kind != NVK_ARG_BUFFER && kind != NVK_ARG_TEXTURE && kind != NVK_ARG_SAMPLER && kind != NVK_ARG_THREADGROUP)
+        if ((kind != NVK_ARG_BUFFER && kind != NVK_ARG_TEXTURE && kind != NVK_ARG_SAMPLER && kind != NVK_ARG_THREADGROUP) ||
+            malachite_hidden_offsets(&k->h.args[i], k->arg_names[i].name))
             continue;
         MalachiteArgument *a = [MalachiteArgument new];
         a.name = @(k->arg_names[i].name);
@@ -6735,8 +6751,9 @@ static NSArray<MalachiteArgument *> *malachite_cl_program_arguments(const struct
     NSMutableArray *args = [NSMutableArray array];
     for (uint32_t i = 0; i < k->h.nargs; i++) {
         const struct nvk_arg *a = &k->h.args[i];
-        if (a->kind != NVK_ARG_BUFFER && a->kind != NVK_ARG_THREADGROUP && a->kind != NVK_ARG_TEXTURE &&
-            a->kind != NVK_ARG_SAMPLER)
+        if ((a->kind != NVK_ARG_BUFFER && a->kind != NVK_ARG_THREADGROUP && a->kind != NVK_ARG_TEXTURE &&
+             a->kind != NVK_ARG_SAMPLER) ||
+            malachite_hidden_offsets(a, k->arg_names[i].name))
             continue;
         MalachiteArgument *arg = [MalachiteArgument new];
         arg.name = @(k->arg_names[i].name);
