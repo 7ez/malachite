@@ -3186,6 +3186,11 @@ static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, c
             const struct nvk_arg *a = &pipeline->_kernel.args[i];
             if (a->kind == NVK_ARG_BUFFER && a->index < 31) {
                 os_log(OS_LOG_DEFAULT, "Malachite trace:   buffer %u: %#llx", a->index, buffers[a->index]);
+            } else if (a->kind == NVK_ARG_THREADGROUP) {
+                uint32_t at;
+                memcpy(&at, d.params + a->cbuf_off - 0x160, 4);
+                os_log(OS_LOG_DEFAULT, "Malachite trace:   threadgroup %u: at %u, %u bytes of %u", a->index, at,
+                       threadgroup && a->index < 31 ? threadgroup[a->index] : 0, d.shared_size);
             } else if (a->kind == NVK_ARG_TEXTURE && a->index < NVGPU_MAX_TEXTURES && textures[a->index]) {
                 MalachiteTexture *t = (MalachiteTexture *)textures[a->index];
                 id<MTLTexture> mt = (id<MTLTexture>)textures[a->index];
