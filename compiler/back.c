@@ -1116,6 +1116,70 @@ static void find_readonly_loads(struct ir_func *f)
     free(root);
 }
 
+// a global access's address as base + scale * (index + k) + off, the constants added to the index taken out of it
+struct access {
+    const struct ir_val *base, *index;
+    uint32_t k;
+    int64_t scale, off;
+    int ext;
+};
+
+static struct access access_of(const struct ir_val *v)
+{
+    struct access a = { .off = v->imm };
+    const struct ir_val *p = v->src[0];
+    for (; p->op == IR_ADDI; p = p->src[0])
+        a.off += p->imm;
+    if (p->op == IR_ADDR) {
+        a.scale = p->imm;
+        a.ext = p->aux;
+        a.index = p->src[1];
+        while ((a.index->op == IR_ADD || a.index->op == IR_SUB) && a.index->src[1]->op == IR_CONST) {
+            uint32_t c = (uint32_t)a.index->src[1]->imm;
+            a.k += a.index->op == IR_ADD ? c : -c;
+            a.index = a.index->src[0];
+        }
+        p = p->src[0];
+    }
+    a.base = p;
+    return a;
+}
+
+// Do two global accesses (aux their bytes) miss each other: off one base and index, a few elements apart? An
+// index that wraps round between them puts them 2^32 elements apart instead, which misses too.
+static int apart(const struct ir_val *x, const struct ir_val *y)
+{
+    struct access a = access_of(x), b = access_of(y);
+    int32_t dk = (int32_t)(b.k - a.k);
+    if (a.base != b.base || a.index != b.index || a.scale != b.scale || a.ext != b.ext || dk < -65536 || dk > 65536)
+        return 0;
+    int64_t d = dk * a.scale + b.off - a.off;
+    return d >= x->aux || -d >= y->aux;
+}
+
+// A global store that a later one in its block writes over goes, as long as nothing between could read the word
+// (a load but a read-only one or one elsewhere, a texture, an atomic) or make it seen (a barrier, a call). Some
+// kernels add a sum up in their output buffer, a store a term.
+static void drop_overwritten_stores(struct ir_func *f)
+{
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first, *next; v; v = next) {
+            next = v->next;
+            if (v->op != IR_STG)
+                continue;
+            for (struct ir_val *w = v->next; w; w = w->next) {
+                if (w->op == IR_STG && w->src[0] == v->src[0] && w->imm == v->imm && w->aux == v->aux &&
+                    w->nsrc == v->nsrc) {
+                    ir_remove(v);
+                    break;
+                }
+                if ((w->op == IR_LDG && !g_readonly_load[w->id] && !apart(w, v)) || w->op == IR_TEX ||
+                    w->op == IR_ATOM || w->op == IR_BAR || w->op == IR_CALL || w->op == IR_KILL)
+                    break;
+            }
+        }
+}
+
 // source i of a memory op: a global address off a uniform base is the offset (RZ for none), the base m->ur
 static int vreg_of_address(struct ir_val *v, unsigned i, struct mop *m)
 {
@@ -4678,6 +4742,8 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
         }
     g_fn = f;
     g_win_end = 0;
+    find_readonly_loads(f);
+    drop_overwritten_stores(f);
     plan_regions(f);
     find_fused_compares(f);
     g_no_mods = airc_pass_off("AIRC_NOMODS");
@@ -4689,7 +4755,6 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
     find_reductions(f);
     phi_outside(f);
     find_uniform_bases(f);
-    find_readonly_loads(f);
     g_noffsets = 0;
     memset(g_region_start, 0, sizeof(g_region_start));
     memset(g_region_end, 0, sizeof(g_region_end));
