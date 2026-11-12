@@ -647,6 +647,7 @@ static bool malachite_opencl_memory(void *ptr)
         t->_pitch = (uint32_t)bytesPerRow;
         t->_type = descriptor.textureType;
         t->_usage = descriptor.usage;
+        t->_width = descriptor.width;  // the base keeps 16 bits of it, a texture buffer's can be millions
     }
     return malachite_swizzled(t, descriptor.swizzle);  // CoreAnimation reads its one-channel surfaces through one
 }
@@ -1631,7 +1632,7 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
     } else {
         // made as the IOSurface textures are, in case these rows aren't ones the base takes
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
-                                                                                     width:[super width]
+                                                                                     width:[self width]
                                                                                     height:1
                                                                                  mipmapped:NO];
         d.usage = self.usage;
@@ -1673,7 +1674,7 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
 
 - (NSUInteger)width
 {
-    return _image ? MAX(_width >> _view_min, 1u) : [super width];
+    return _image ? MAX(_width >> _view_min, 1u) : _width ? _width : [super width];
 }
 
 - (NSUInteger)height
