@@ -31,6 +31,9 @@
 #include <vector>
 #import "../accel/commands.h"
 #import "../compiler/airc.h"
+extern "C" {
+#import "../compiler/llvm_lite.h"
+}
 #import "../core/drawbuild.h"
 #import "../core/texdesc.h"
 #import "../gpu_bridge.h"
@@ -6785,6 +6788,173 @@ static void malachite_hook_function_reflection(void)
         malachite_reflection_orig = method_setImplementation(m, (IMP)malachite_function_reflection);
 }
 
+static std::vector<LLVMValueRef> malachite_md(LLVMValueRef node)
+{
+    std::vector<LLVMValueRef> ops(LLVMGetMDNodeNumOperands(node));
+    LLVMGetMDNodeOperands(node, ops.data());
+    return ops;
+}
+
+static bool malachite_md_is(LLVMValueRef v, const char *s)
+{
+    unsigned len;
+    const char *m = LLVMGetMDString(v, &len);
+    return m && len == strlen(s) && !memcmp(m, s, len);
+}
+
+// the integers after key in a node, as {..., key, i32 a, i32 b, ...}; false for none
+static bool malachite_md_ints(const std::vector<LLVMValueRef> &ops, const char *key, uint64_t *a, uint64_t *b)
+{
+    for (size_t i = 0; i + 1 < ops.size(); i++) {
+        if (!malachite_md_is(ops[i], key) || !LLVMIsAConstantInt(ops[i + 1]))
+            continue;
+        *a = LLVMConstIntGetZExtValue(ops[i + 1]);
+        if (b)
+            *b = i + 2 < ops.size() && LLVMIsAConstantInt(ops[i + 2]) ? LLVMConstIntGetZExtValue(ops[i + 2]) : 1;
+        return true;
+    }
+    return false;
+}
+
+// A struct_type_info node's resources, at base bytes and ids into the argument buffer; returns how many ids it spans.
+// Each member is {offset, size (of an element), array length or 0, type name, name}, then for a resource an
+// indirect_argument node with its [[id(n)]]. A struct member (an array of them as metal::array) has its own
+// struct_type_info just before it and its first id as an integer after.
+static uint64_t malachite_air_members(LLVMValueRef node, uint64_t base, uint64_t first,
+                                      std::vector<struct malachite_arg> &out)
+{
+    std::vector<LLVMValueRef> s = malachite_md(node);
+    LLVMValueRef nested = NULL;
+    uint64_t span = 0;
+    for (size_t j = 0; j < s.size();) {
+        if (malachite_md_is(s[j], "air.struct_type_info") && j + 1 < s.size()) {
+            nested = s[j + 1];
+            j += 2;
+            continue;
+        }
+        if (!LLVMIsAConstantInt(s[j]) || j + 4 >= s.size()) {
+            j++;
+            continue;
+        }
+        uint64_t offset = base + LLVMConstIntGetZExtValue(s[j]), size = LLVMConstIntGetZExtValue(s[j + 1]);
+        uint64_t n = MAX(LLVMConstIntGetZExtValue(s[j + 2]), 1ull);
+        for (j += 5; j + 1 < s.size() && !LLVMIsAConstantInt(s[j]); j++) {
+            if (malachite_md_is(s[j], "air.struct_type_info")) {
+                nested = s[++j];
+                continue;
+            }
+            if (!malachite_md_is(s[j], "air.indirect_argument"))
+                continue;
+            uint64_t id, count;
+            if (LLVMIsAConstantInt(s[j + 1])) {
+                id = LLVMConstIntGetZExtValue(s[j + 1]);
+                uint64_t step = 0;
+                for (uint64_t e = 0; nested && e < n; e++)
+                    step = malachite_air_members(nested, offset + e * size, first + id + e * step, out);
+                span = MAX(span, id + n * step);
+                nested = NULL;
+            } else if (malachite_md_ints(malachite_md(s[j + 1]), "air.location_index", &id, &count)) {
+                out.push_back({ first + id, n, offset, size, MTLDataTypeNone });
+                span = MAX(span, id + n);
+            }
+            j++;
+        }
+    }
+    return span;
+}
+
+// The layout of the argument buffer at [[buffer(index)]] as the function's AIR has it. nil unless the argument is an
+// argument buffer.
+static MalachiteArgumentLayout *malachite_air_layout(NSData *air, NSUInteger index)
+{
+    const uint8_t *bc = (const uint8_t *)air.bytes;
+    size_t len = air.length;
+    if (len > 20 && bc[0] == 0xde && bc[1] == 0xc0 && bc[2] == 0x17 && bc[3] == 0x0b) {  // Apple's wrapper
+        uint32_t off, size;
+        memcpy(&off, bc + 8, 4);
+        memcpy(&size, bc + 12, 4);
+        if ((size_t)off + size > len)
+            return nil;
+        bc += off;
+        len = size;
+    }
+    LLVMMemoryBufferRef mb = LLVMCreateMemoryBufferWithMemoryRange((const char *)bc, len, "air", 0);
+    LLVMModuleRef mod;
+    if (LLVMParseBitcode2(mb, &mod)) {
+        LLVMDisposeMemoryBuffer(mb);
+        return nil;
+    }
+    MalachiteArgumentLayout *layout = nil;
+    // the module is the function's own: its one entry
+    std::vector<LLVMValueRef> entries;
+    for (const char *stage : { "air.kernel", "air.vertex", "air.fragment" }) {
+        std::vector<LLVMValueRef> e(LLVMGetNamedMetadataNumOperands(mod, stage));
+        LLVMGetNamedMetadataOperands(mod, stage, e.data());
+        entries.insert(entries.end(), e.begin(), e.end());
+    }
+    for (LLVMValueRef node : entries) {
+        std::vector<LLVMValueRef> entry = malachite_md(node);
+        for (LLVMValueRef arg : entry.size() > 2 ? malachite_md(entry[2]) : std::vector<LLVMValueRef>()) {
+            std::vector<LLVMValueRef> a = malachite_md(arg);
+            uint64_t at, length, align = 8;
+            if (a.size() < 2 || !malachite_md_is(a[1], "air.indirect_buffer") ||
+                !malachite_md_ints(a, "air.location_index", &at, NULL) || at != index ||
+                !malachite_md_ints(a, "air.arg_type_size", &length, NULL))
+                continue;
+            malachite_md_ints(a, "air.arg_type_align_size", &align, NULL);
+            std::vector<struct malachite_arg> members;
+            for (size_t i = 0; i + 1 < a.size(); i++)
+                if (malachite_md_is(a[i], "air.struct_type_info"))
+                    malachite_air_members(a[i + 1], 0, 0, members);
+            layout = [MalachiteArgumentLayout new];
+            layout->_nargs = members.size();
+            layout->_args = (struct malachite_arg *)calloc(members.size() ?: 1, sizeof(struct malachite_arg));
+            std::copy(members.begin(), members.end(), layout->_args);
+            layout->_length = length;
+            layout->_alignment = MAX(align, 8u);
+            break;
+        }
+        if (layout)
+            break;
+    }
+    LLVMDisposeModule(mod);
+    LLVMDisposeMemoryBuffer(mb);
+    return layout;
+}
+
+// An encoder for a function's argument buffer. Metal makes it from the function's reflection, which for our
+// functions has no argument buffers in it (bufferIndex "does not identify an argument buffer", and the process
+// aborts): it comes from the AIR here.
+typedef id (*malachite_encoder_fn)(id, SEL, NSUInteger, __autoreleasing id *, id) __attribute__((ns_returns_retained));
+static malachite_encoder_fn malachite_encoder_orig;
+
+__attribute__((ns_returns_retained)) static id malachite_function_encoder(id self, SEL cmd, NSUInteger index,
+                                                                         __autoreleasing id *reflection, id fr)
+{
+    id<MTLFunction> function = self;
+    if ([function.device isKindOfClass:objc_getClass("MalachiteDevice")]) {
+        NSData *air = ((id(*)(id, SEL))objc_msgSend)(self, NSSelectorFromString(@"bitcodeData"));
+        MalachiteArgumentLayout *layout = air ? malachite_air_layout(air, index) : nil;
+        if (layout) {
+            if (reflection)
+                *reflection = nil;
+            return [[MalachiteArgumentEncoder alloc] initWithLayout:layout device:function.device];
+        }
+    }
+    return malachite_encoder_orig(self, cmd, index, reflection, fr);
+}
+
+static void malachite_hook_function_encoder(void)
+{
+    Method m = class_getInstanceMethod(objc_getClass("_MTLFunction"),
+                                       sel_registerName("newArgumentEncoderWithBufferIndex:reflection:functionReflection:"));
+    if (!m) {
+        os_log(OS_LOG_DEFAULT, "Malachite: no _MTLFunction argument encoder to answer for");
+        return;
+    }
+    malachite_encoder_orig = (malachite_encoder_fn)method_setImplementation(m, (IMP)malachite_function_encoder);
+}
+
 @implementation MalachiteDevice
 
 // A Metal method our classes lack shows up as an unrecognised selector, usually caught and rethrown somewhere that
@@ -6821,6 +6991,7 @@ static void malachite_nothing(const char *cls, const char *protocol, NSArray<NSS
 {
     os_log(OS_LOG_DEFAULT, "MalachiteDriver: bundle loaded, MalachiteDevice registered");
     malachite_prev_pre = objc_setExceptionPreprocessor(malachite_exc_pre);
+    malachite_hook_function_encoder();
 
     // What the device doesn't do and says it doesn't: ray tracing, function pointers and their tables, mesh and
     // object stages, indirect command buffers, counters, tensors, more than one view, Metal 4's attachment maps,
