@@ -29,6 +29,24 @@ static struct ir_val *live(struct ir_val *v)
     return v;
 }
 
+// not c, made before at: a compare's opposite compare (integers EQ and NE, LT and GE, LE and GT; floats the
+// predicate's complement, ordered less than becoming unordered or greater or equal), which a select or a load
+// guard takes in P0 as it is
+static struct ir_val *negated(struct ir_val *c, struct ir_val *at)
+{
+    if (c->op != IR_CMP) {
+        struct ir_val *n = insert_before(at, IR_PNOT, IR_PRED, 1);
+        n->src[0] = c;
+        return n;
+    }
+    struct ir_val *n = insert_before(at, IR_CMP, IR_PRED, 2);
+    int cond = c->aux & 7;
+    n->src[0] = c->src[0];
+    n->src[1] = c->src[1];
+    n->aux = c->aux & IR_FCMP ? c->aux ^ 15 : (c->aux & ~7) | (cond < IR_LT ? cond ^ 1 : 7 - cond);
+    return n;
+}
+
 static void replace_all(struct ir_func *f, struct ir_val *v, struct ir_val *with)
 {
     (void)f;
@@ -475,12 +493,12 @@ static int takes_derivatives(const struct ir_val *v)
 
 // a block a branch of b's alone leads to, of nothing with an effect, going on to m; *deriv set if it takes
 // derivatives
-static int side_of(struct ir_block *s, struct ir_block *b, struct ir_block *m, int *deriv)
+static int side_of(struct ir_block *s, struct ir_block *b, struct ir_block *m, int *deriv, int loads)
 {
     if (s->npreds != 1 || s->preds[0] != b || s->nsucc != 1 || s->succ[0] != m || s == m)
         return 0;
     for (struct ir_val *v = s->first; v; v = v->next) {
-        if (!speculatable(v))
+        if (!speculatable(v) && !(loads && v->op == IR_LDG))
             return 0;
         *deriv |= takes_derivatives(v);
     }
@@ -535,10 +553,39 @@ static void splice(struct ir_block *b, struct ir_block *m)
 // by block id: how many loops it is in, a loop being the blocks from its header to its back edge in layout order
 static unsigned char *g_loops;
 
+// by block id: in an innermost loop that loads, leaves only at its back edge and whose ifs hold nothing but
+// arithmetic and loads, FLATTEN_LOOP_VALUES values at most: flattened whole it is one block, which can be unrolled
+// to have its loads in flight together. An if of more than FLATTEN_LOOP_SIDE values is flattened only when it runs
+// unless two integers are equal (a loop over all elements that skips its own): another may run on few trips, and
+// flattened it costs every trip (a collision test's response)
+#define FLATTEN_LOOP_VALUES 40
+#define FLATTEN_LOOP_SIDE 8
+static unsigned char *g_flat_loop;
+
+static int flat_loop(struct ir_block *h, struct ir_block *latch, const int *pos)
+{
+    unsigned n = 0, loads = 0;
+    for (struct ir_block *c = h; c != latch->next; c = c->next) {
+        if (g_loops[c->id] != g_loops[h->id])
+            return 0;
+        for (unsigned i = 0; c != latch && i < c->nsucc; i++)
+            if (pos[c->succ[i]->id] < pos[h->id] || pos[c->succ[i]->id] > pos[latch->id])
+                return 0;
+        for (struct ir_val *v = c->first; v; v = v->next) {
+            if (c != h && !speculatable(v) && v->op != IR_LDG && v->op != IR_PHI && v->op != IR_CBR)
+                return 0;
+            n += v->op != IR_PHI && v->op != IR_BR && v->op != IR_CBR;
+            loads += v->op == IR_LDG;
+        }
+    }
+    return loads && n <= FLATTEN_LOOP_VALUES;
+}
+
 static void find_loops(struct ir_func *f)
 {
     int *pos = ir_alloc(f->nblocks * sizeof(*pos)), n = 0;
     g_loops = ir_alloc(f->nblocks);
+    g_flat_loop = ir_alloc(f->nblocks);
     for (struct ir_block *b = f->entry; b; b = b->next)
         pos[b->id] = n++;
     for (struct ir_block *b = f->entry; b; b = b->next)
@@ -546,6 +593,11 @@ static void find_loops(struct ir_func *f)
             if (pos[b->succ[i]->id] <= pos[b->id])
                 for (struct ir_block *c = b->succ[i]; c != b->next; c = c->next)
                     g_loops[c->id] += g_loops[c->id] < 255;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (unsigned i = 0; i < b->nsucc; i++)
+            if (pos[b->succ[i]->id] < pos[b->id] && flat_loop(b->succ[i], b, pos))
+                for (struct ir_block *c = b->succ[i]; c != b->next; c = c->next)
+                    g_flat_loop[c->id] = 1;
 }
 
 // A derivative (or an implicit-LOD sample) needs its whole quad, and a branch that splits the quad leaves it a
@@ -560,10 +612,10 @@ static int flatten(struct ir_func *f, struct ir_block *b)
     if (!t || t->op != IR_CBR || b->succ[0] == b->succ[1])
         return 0;
     struct ir_block *s[2] = { b->succ[0], b->succ[1] }, *m = NULL;
-    int deriv = 0, side[2] = { 0, 0 };
+    int deriv = 0, side[2] = { 0, 0 }, loads = g_flat_loop[b->id];
     for (int k = 0; k < 2 && !m; k++) {  // if
         deriv = 0;
-        if (side_of(s[k], b, s[!k], &deriv)) {
+        if (side_of(s[k], b, s[!k], &deriv, loads)) {
             m = s[!k];
             side[k] = 1;
         }
@@ -571,7 +623,7 @@ static int flatten(struct ir_func *f, struct ir_block *b)
     if (!m) {  // if/else
         deriv = 0;
         m = s[0]->nsucc == 1 ? s[0]->succ[0] : NULL;
-        if (!m || !side_of(s[0], b, m, &deriv) || !side_of(s[1], b, m, &deriv))
+        if (!m || !side_of(s[0], b, m, &deriv, loads) || !side_of(s[1], b, m, &deriv, loads))
             return 0;
         side[0] = side[1] = 1;
     }
@@ -579,8 +631,35 @@ static int flatten(struct ir_func *f, struct ir_block *b)
     for (int k = 0; k < 2; k++)
         for (struct ir_val *v = side[k] ? s[k]->first : NULL; v; v = v->next)
             n += v->op != IR_BR;
-    if (!deriv && (!g_loops[b->id] || n > FLATTEN_VALUES))
+    struct ir_val *c = t->src[0];
+    int cond = c->op == IR_CMP && !(c->aux & IR_FCMP) ? c->aux & 7 : -1;
+    int unequal = (cond == IR_EQ && side[1] && !side[0]) || (cond == IR_NE && side[0] && !side[1]);
+    if (loads && n > FLATTEN_LOOP_SIDE && !unequal)
+        loads = 0;
+    if (!deriv && (!g_loops[b->id] || (n > FLATTEN_VALUES && !loads)))
         return 0;
+    // a load runs only where its path was taken, so it reads nothing the branch kept it from
+    for (int k = 0; k < 2; k++) {
+        struct ir_val *taken = NULL;
+        for (struct ir_val *v = side[k] ? s[k]->first : NULL; v; v = v->next) {
+            if (v->op != IR_LDG)
+                continue;
+            if (!taken)
+                taken = k ? negated(t->src[0], t) : t->src[0];
+            if (v->nsrc > 1) {
+                struct ir_val *both = insert_before(v, IR_PAND, IR_PRED, 2);
+                both->src[0] = v->src[1];
+                both->src[1] = taken;
+                v->src[1] = both;
+            } else {
+                struct ir_val **src = ir_alloc(2 * sizeof(*src));
+                src[0] = v->src[0];
+                src[1] = taken;
+                v->src = src;
+                v->nsrc = 2;
+            }
+        }
+    }
     for (int k = 0; k < 2; k++)
         if (side[k])
             move_to(s[k], b);
@@ -1728,7 +1807,7 @@ static int remat_size(const struct ir_val *v, int depth, int *anchors)
             return -1;
         break;
     }
-    if (v->op == IR_LDG && !g_loads_pure)
+    if (v->op == IR_LDG && (!g_loads_pure || v->nsrc > 1))
         return -1;
     if (!depth)
         return -1;
