@@ -890,6 +890,149 @@ static void find_folds(struct ir_func *f)
         }
 }
 
+// A logic operation whose operands are logic operations nothing else reads, in its block, is one LOP3 when they
+// come to three inputs at most: two registers and a constant (or its complement) as the immediate, or three
+// registers; zero and all ones take no input. A sign mask and xor, a copysign, bits packed into a word.
+#define LOP3_A 0xf0  // the table's pattern for source a, b and c
+#define LOP3_B 0xcc
+#define LOP3_C 0xaa
+
+struct lop3 {
+    struct ir_val *reg[3];  // the sources read as a, as c, as b
+    int nreg, has_imm;
+    uint32_t imm;  // b, when it is the immediate
+    uint8_t root, lut;
+};
+static struct lop3 *g_lop3;  // by IR id
+static unsigned char *g_lop3_in;  // by IR id: made inside the root that reads it, for the one being built
+
+static int is_logic(const struct ir_val *v)
+{
+    return (v->op == IR_AND || v->op == IR_OR || v->op == IR_XOR) && (v->type == IR_I32 || v->type == IR_F32);
+}
+
+// u's table over the sources taken so far (and any it adds), -1 when it needs too many
+static int lop3_eval(struct ir_val *u, struct ir_val *root, struct lop3 *l)
+{
+    if (u == root || g_lop3_in[u->id]) {
+        int x = lop3_eval(u->src[0], root, l), y = x < 0 ? -1 : lop3_eval(u->src[1], root, l);
+        if (y < 0)
+            return -1;
+        return u->op == IR_AND ? x & y : u->op == IR_OR ? x | y : x ^ y;
+    }
+    if (u->op == IR_CONST) {
+        uint32_t k = (uint32_t)u->imm;
+        if (!k || k == ~0u)
+            return k ? 0xff : 0;
+        if (!l->has_imm && l->nreg < 3) {
+            l->has_imm = 1;
+            l->imm = k;
+        }
+        return l->has_imm && k == l->imm ? LOP3_B : l->has_imm && k == ~l->imm ? (~LOP3_B & 0xff) : -1;
+    }
+    static const int pattern[3] = { LOP3_A, LOP3_C, LOP3_B };
+    for (int i = 0; i < l->nreg; i++)
+        if (l->reg[i] == u)
+            return pattern[i];
+    if (l->nreg == (l->has_imm ? 2 : 3))
+        return -1;
+    l->reg[l->nreg] = u;
+    return pattern[l->nreg++];
+}
+
+// an operand made in the root: a few values back at most, so that its own operands aren't kept live much longer
+#define LOP3_NEAR 8
+
+static int lop3_inner(const struct ir_val *u, const struct ir_val *root)
+{
+    struct ir_val *in;
+    if (!is_logic(u) || u->block != root->block || g_use_count[u->id] != 1 || g_folded[u->id] || g_lop3_in[u->id] ||
+        byte_select(u, &in) >= 0)
+        return 0;
+    int k = 0;
+    for (const struct ir_val *w = root->prev; w && w != u && k <= LOP3_NEAR; w = w->prev)
+        k++;
+    return k <= LOP3_NEAR;
+}
+
+static void find_lop3(struct ir_func *f)
+{
+    int n = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            if (v->id >= n)
+                n = v->id + 1;
+    free(g_lop3);
+    free(g_lop3_in);
+    g_lop3 = calloc(n, sizeof(*g_lop3));
+    g_lop3_in = calloc(n, 1);
+    unsigned char *taken = calloc(n, 1);  // made inside some root
+    struct ir_val *in;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->last; v; v = v->prev) {
+            if (!is_logic(v) || taken[v->id] || g_folded[v->id] || g_late_def[v->id] || byte_select(v, &in) >= 0 ||
+                byte_convert(v, &in))
+                continue;
+            // take operands in, one at a time, while the whole still fits
+            struct ir_val *open[16], *inner[16];
+            int nopen = 0, ninner = 0;
+            open[nopen++] = v->src[0];
+            open[nopen++] = v->src[1];
+            while (nopen && ninner < 16) {
+                struct ir_val *u = open[--nopen];
+                if (!lop3_inner(u, v) || taken[u->id])
+                    continue;
+                g_lop3_in[u->id] = 1;
+                struct lop3 l = { 0 };
+                if (lop3_eval(v, v, &l) < 0) {
+                    g_lop3_in[u->id] = 0;
+                    continue;
+                }
+                inner[ninner++] = u;
+                if (nopen < 15) {
+                    open[nopen++] = u->src[0];
+                    open[nopen++] = u->src[1];
+                }
+            }
+            if (!ninner)
+                continue;
+            struct lop3 l = { 0 };
+            l.lut = (uint8_t)lop3_eval(v, v, &l);
+            l.root = 1;
+            g_lop3[v->id] = l;
+            for (int i = 0; i < ninner; i++) {
+                taken[inner[i]->id] = g_folded[inner[i]->id] = 1;
+                g_lop3_in[inner[i]->id] = 0;
+            }
+        }
+    free(taken);
+}
+
+// v as the LOP3 find_lop3 made it
+static int lower_lop3(struct ir_val *v)
+{
+    struct lop3 *l = &g_lop3[v->id];
+    if (!l->root)
+        return 0;
+    v->vreg = new_vreg(1, 1);
+    struct mop *m = emit_mop(MK_LOP3);
+    m->def = v->vreg;
+    m->aux = l->lut;
+    m->src[0] = l->nreg > 0 ? vreg_of(l->reg[0]) : VREG_RZ;
+    int c = l->nreg > 1 ? vreg_of(l->reg[1]) : VREG_RZ;
+    if (l->has_imm) {
+        m->immb = 1;
+        m->imm = l->imm;
+        m->src[1] = c;
+        m->nsrc = 2;
+    } else {
+        m->src[1] = l->nreg > 2 ? vreg_of(l->reg[2]) : VREG_RZ;
+        m->src[2] = c;
+        m->nsrc = 3;
+    }
+    return 1;
+}
+
 static int lower_byte_convert(struct ir_val *v)
 {
     struct ir_val *in, *x = byte_convert(v, &in);
@@ -1365,6 +1508,8 @@ static void lower_value(struct ir_val *v)
         if ((v->op == IR_MUL && g_mul_fused[v->id]) || g_late_def[v->id] || g_folded[v->id])
             break;  // made by the instruction that reads it, or at the end of its loop
         if (v->op == IR_ADD && lower_mul_add(v))
+            break;
+        if (is_logic(v) && lower_lop3(v))
             break;
         struct ir_val *in;
         int sel = byte_select(v, &in);
@@ -3997,12 +4142,16 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             c = sched(s, 2, 0, d, 1, 0);
             sched_push(sass_imadhi_rr(d, s[0], s[1], m->aux, c), s, 2, d, 0, FIXED_LAT);
             break;
-        case MK_LOP3:
+        case MK_LOP3: {
             c = sched(s, m->nsrc, 0, d, 1, 0);
-            sched_push(m->immb ? sass_imm(sass_lop3(d, s[0], 0, (uint8_t)m->aux, c), (uint32_t)m->imm)
-                               : sass_lop3(d, s[0], s[1], (uint8_t)m->aux, c),
-                       s, m->nsrc, d, 0, FIXED_LAT);
+            struct sass_insn in = m->immb ? sass_imm(sass_lop3(d, s[0], 0, (uint8_t)m->aux, c), (uint32_t)m->imm)
+                                          : sass_lop3(d, s[0], s[1], (uint8_t)m->aux, c);
+            int rc = m->immb ? (m->nsrc > 1 ? 1 : 0) : (m->nsrc > 2 ? 2 : 0);  // a third source after a and b
+            if (rc > 0)
+                in.hi = (in.hi & ~0xffull) | s[rc];
+            sched_push(in, s, m->nsrc, d, 0, FIXED_LAT);
             break;
+        }
         case MK_PRMT:
             c = sched(s, 1, 0, d, 1, 0);
             sched_push(sass_prmt(d, s[0], (uint16_t)m->imm, SASS_RZ, c), s, 1, d, 0, FIXED_LAT);
@@ -4883,6 +5032,7 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
     find_folds(f);
     find_reductions(f);
     phi_outside(f);
+    find_lop3(f);
     find_uniform_bases(f);
     g_noffsets = 0;
     memset(g_region_start, 0, sizeof(g_region_start));
