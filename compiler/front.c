@@ -840,6 +840,8 @@ static void scan_uses(LLVMValueRef fn, LLVMValueRef root, int64_t base, struct p
             } else if (op == LLVMSelect && is_ptr(LLVMTypeOf(in))) {
                 if (ptr_root(LLVMGetOperand(in, 1)) == root || ptr_root(LLVMGetOperand(in, 2)) == root)
                     s->dynamic = 1;
+            } else if (op == LLVMPtrToInt && ptr_root(LLVMGetOperand(in, 0)) == root) {
+                s->dynamic = 1;  // its address as a number, which only memory has
             } else if (op == LLVMCall) {
                 LLVMValueRef callee = LLVMGetCalledValue(in);
                 const char *name = callee ? LLVMGetValueName(callee) : NULL;
