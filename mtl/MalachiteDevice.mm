@@ -4839,6 +4839,7 @@ enum {
     FAST_BASE_VERTEX = 0x1434,
     FAST_SAMPLER_POOL = 0x155c,
     FAST_HEADER_POOL = 0x1574,
+    FAST_RESTART = 0x1644,
     FAST_INDEX_ADDRESS = 0x17c8,
     FAST_STREAM_INSTANCE = 0x1880,
     FAST_STREAM_FORMAT = 0x1c00,
@@ -5206,6 +5207,11 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
         *w++ = FAST_MTHD(FAST_VERTEX_ID_BASE, 1);
         *w++ = (uint32_t)d.base_vertex;
     }
+    uint32_t restarts = draw_restarts(d.primitive, d.restart, d.index != 0);
+    if (restarts != draw_restarts(l.primitive, l.restart, l.index != 0)) {
+        *w++ = FAST_MTHD(FAST_RESTART, 1);
+        *w++ = restarts;
+    }
     *w++ = FAST_MTHD(FAST_DRAW_CONTROL, 2);
     *w++ = d.primitive | 1 << 9;
     *w++ = d.instances;
@@ -5230,6 +5236,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
 
     memcpy(_last.streams, d.streams, sizeof(d.streams));
     _last.heap = d.heap;
+    _last.primitive = d.primitive;
     _last.index = d.index;
     _last.index_size = d.index_size;
     _last.base_vertex = d.base_vertex;
