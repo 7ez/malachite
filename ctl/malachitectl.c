@@ -1,6 +1,5 @@
-// malachitectl <fwdir> [start|stop|disp|show|pmcycle|shot <file>]... -- hand Gpu its firmware and drive it; output goes to the kernel log.
-// "shot <file.ppm>" saves what the lit head shows, "h264 <clip.h264> <dir>", "hevc <clip.hevc> <dir>",
-// "av1 <clip.obu> <dir>", "vp9 <clip.ivf> <dir>" and "vp8 <clip.ivf> <dir>" decode a clip on NVDEC into dir.
+// malachitectl <fwdir> [start|stop|disp|show|pmcycle|shot <file.ppm>|<codec> <clip> <dir>]...
+// Loads Gpu's firmware and drives it, logging to the kernel log. codec: h264, hevc, av1 (OBUs), vp9 or vp8 (IVF).
 #include <IOKit/IOKitLib.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -71,7 +70,7 @@ static void write_ppm(const char *path, const struct malachite_frame *f, const u
         return;
     }
     fprintf(out, "P6\n%u %u\n255\n", f->width, f->height);
-    // the top byte of a 10-bit sample, which P010 keeps in the high bits
+    // P010 keeps a sample's top bits in its high byte
     const uint8_t *uv = nv12 + (size_t)f->width * f->height * f->bps;
     for (uint32_t y = 0; y < f->height; y++) {
         for (uint32_t x = 0; x < f->width; x++) {
@@ -96,9 +95,8 @@ static int by_display(const void *a, const void *b)
     return (x->poc > y->poc) - (x->poc < y->poc);
 }
 
-// Decode clip on NVDEC, write its pictures in display order to dir as frameNN.ppm and frames.nv12, and check each
-// picture's CRC-32 against the lines of clip with .crc for its extension, if there is one (made from
-// a software decoder's NV12, or P010 for 10-bit, ffmpeg -i clip.h264 -f rawvideo -pix_fmt nv12)
+// Writes pictures in display order to dir as frameNN.ppm and frames.nv12, checked against the CRC-32 lines of the clip's
+// .crc file if there is one, made from a software decoder's NV12 (P010 for 10-bit).
 static int decode(io_connect_t conn, int codec, const char *name, const char *clip, const char *dir)
 {
     size_t len;
@@ -111,7 +109,7 @@ static int decode(io_connect_t conn, int codec, const char *name, const char *cl
     kern_return_t kr = IOConnectCallScalarMethod(conn, MALACHITE_VIDEO_DECODE, args, 6, NULL, NULL);
     free(stream);
     const struct malachite_frames *hdr = (const void *)out;
-    uint32_t n = hdr->count;  // what the kernel got out, failure or not
+    uint32_t n = hdr->count;  // set on failure too
     if (kr)
         fprintf(stderr, "%s: %#x after %u pictures\n", name, kr, n);
 
@@ -195,7 +193,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    // the folder of <fwdir> with this GPU family's bootloader and booters, if it isn't <fwdir> itself
+    // the GPU family's bootloader and booters may be in a subfolder
     char famdir[1024];
     snprintf(famdir, sizeof(famdir), "%s", argv[1]);
     CFTypeRef dir = IORegistryEntryCreateCFProperty(svc, CFSTR("MalachiteFirmwareDir"), kCFAllocatorDefault, 0);
@@ -223,7 +221,7 @@ int main(int argc, char **argv)
             ret |= shot(conn, argv[++a]) != 0;
             continue;
         }
-        // the codec numbers of NVVIDEO_OPEN
+        // in NVVIDEO_OPEN's order
         static const char *const codecs[] = { "h264", "hevc", "av1", "vp9", "vp8" };
         int codec = 0;
         while (codec < 5 && strcmp(argv[a], codecs[codec]))
