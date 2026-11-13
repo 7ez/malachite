@@ -10,8 +10,9 @@ static const struct chip chips[] = {
       64 * 1024, ".fwsignature_tu11x", NULL, "Turing's FWSEC, booter and GSP boot, QMD v2 and sm75 shaders" },
     { 0x172, 0x177, "GA10x", 0xc56f, 0xc797, 0xc7c0, 0xc7b5, 0xc561, 0xc7b0, 0xc670, 0xc67d, 0xc67e, 0xc67b, 0xc67a,
       99 * 1024, ".fwsignature_ga10x", NULL, NULL },
+    // boots the way GA10x does, with Ada's own booters and bootloader; untested
     { 0x192, 0x197, "AD10x", 0xc56f, 0xc997, 0xc9c0, 0xc7b5, 0xc561, 0xc9b0, 0xc770, 0xc77d, 0xc67e, 0xc67b, 0xc67a,
-      99 * 1024, ".fwsignature_ad10x", "ad10x", "testing on an Ada card" },
+      99 * 1024, ".fwsignature_ad10x", "ad10x", NULL },
 };
 
 static const struct {
