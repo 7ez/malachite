@@ -1691,8 +1691,9 @@ bool Gpu::start(IOService *provider)
     uint32_t boot0 = rd32(&gpu, NV_PMC_BOOT_0), chipset = NV_CHIPSET(boot0);
     log_msg("Malachite: BAR0 %llu MB, PMC_BOOT_0 0x%08x chipset 0x%x\n", bar0->getLength() >> 20, boot0, chipset);
     gpu.chip = chip_find(chipset);
-    if (!gpu.chip) {
-        log_msg("Malachite: chipset 0x%x not supported\n", chipset);
+    if (!gpu.chip || gpu.chip->missing) {
+        log_msg("Malachite: chipset 0x%x not supported%s%s\n", chipset, gpu.chip ? ", needs " : "",
+                gpu.chip ? gpu.chip->missing : "");
         OSSafeReleaseNULL(bar0);
         return false;
     }

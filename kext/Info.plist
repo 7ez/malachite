@@ -53,7 +53,7 @@
 			<string>IOPCIDevice</string>
 			<key>IOUserClientClass</key>
 			<string>MalachiteUserClient</string>
-			<!-- any NVIDIA display controller; start() takes Turing and later -->
+			<!-- any NVIDIA display controller; start() takes the families core/chip.c drives -->
 			<key>IOPCIClassMatch</key>
 			<string>0x03000000&amp;0xff000000</string>
 			<key>IOPCIMatch</key>
@@ -81,7 +81,7 @@
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
 			<!-- coexists with MalachiteGpu via a distinct match category -->
-			<!-- any NVIDIA display controller; start() takes Turing and later -->
+			<!-- any NVIDIA display controller, whatever the chip -->
 			<key>IOPCIClassMatch</key>
 			<string>0x03000000&amp;0xff000000</string>
 			<key>IOPCIMatch</key>
@@ -99,7 +99,7 @@
 			<string>MalachiteGraphicsControl</string>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
-			<!-- any NVIDIA display controller; start() takes Turing and later -->
+			<!-- any NVIDIA display controller, whatever the chip -->
 			<key>IOPCIClassMatch</key>
 			<string>0x03000000&amp;0xff000000</string>
 			<key>IOPCIMatch</key>
