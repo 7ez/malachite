@@ -8623,6 +8623,10 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     for (unsigned loc = 0; loc < 32 && !why; loc++) {
         if (!((td.point_inputs | td.patch_inputs) >> loc & 1))
             continue;
+        if (loc == 31) {  // a vertex descriptor has 31 attributes, and asking for another aborts
+            why = @"attribute 31";
+            break;
+        }
         MTLVertexAttributeDescriptor *a = vd.attributes[loc];
         MTLVertexBufferLayoutDescriptor *l = vd.layouts[a.bufferIndex];
         uint32_t f = malachite_vertex_format(a.format, false);
