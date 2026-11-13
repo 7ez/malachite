@@ -1,6 +1,4 @@
-// The slice of the LLVM-C API airc uses, implemented over our own bitcode reader (llvm_lite.c) so airc can
-// run where there is no libLLVM - the Metal plugin. Same names and semantics as
-// llvm-c/Core.h for the functions declared here; anything else is not implemented.
+// The part of llvm-c/Core.h airc uses, over our own bitcode reader, as the Metal plugin has no libLLVM
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -89,7 +87,7 @@ typedef enum {
     LLVMFence,
 } LLVMOpcode;
 
-// numerically identical to the bitcode / CmpInst::Predicate encoding
+// same numbers as the bitcode's CmpInst::Predicate
 typedef enum {
     LLVMIntEQ = 32,
     LLVMIntNE,
@@ -160,7 +158,7 @@ LLVMTypeRef LLVMGetAllocatedType(LLVMValueRef alloca);
 LLVMTypeRef LLVMInt32Type(void);
 LLVMTypeRef LLVMInt8Type(void);
 LLVMTypeRef LLVMHalfType(void);
-LLVMValueRef LLVMGetAggregateElement(LLVMValueRef c, unsigned i);  // a constant vector's element i
+LLVMValueRef LLVMGetAggregateElement(LLVMValueRef c, unsigned i);
 unsigned LLVMGetNumMaskElements(LLVMValueRef shuffle);
 int LLVMGetMaskValue(LLVMValueRef shuffle, unsigned i);  // LLVMGetUndefMaskElem() for an undefined lane
 int LLVMGetUndefMaskElem(void);
@@ -185,7 +183,7 @@ LLVMValueRef LLVMGetNextInstruction(LLVMValueRef v);
 LLVMValueRef LLVMGetBasicBlockTerminator(LLVMBasicBlockRef bb);
 
 LLVMOpcode LLVMGetInstructionOpcode(LLVMValueRef v);
-LLVMBool LLVMCanContract(LLVMValueRef v);  // a floating-point instruction with the contract or fast flag
+LLVMBool LLVMCanContract(LLVMValueRef v);  // contract or fast flag
 LLVMBool LLVMGetNUW(LLVMValueRef v);
 LLVMBool LLVMGetNSW(LLVMValueRef v);
 int LLVMGetNumOperands(LLVMValueRef v);
@@ -193,7 +191,7 @@ LLVMValueRef LLVMGetOperand(LLVMValueRef v, unsigned i);
 LLVMIntPredicate LLVMGetICmpPredicate(LLVMValueRef v);
 LLVMRealPredicate LLVMGetFCmpPredicate(LLVMValueRef v);
 LLVMValueRef LLVMGetCalledValue(LLVMValueRef call);
-// attributes: only noinline, readonly, noalias and "air-buffer-no-alias" are known
+// only noinline, readonly, noalias and "air-buffer-no-alias" are known
 typedef struct ll_value *LLVMAttributeRef;
 typedef unsigned LLVMAttributeIndex;
 enum { LLVMAttributeFunctionIndex = ~0u };
@@ -203,7 +201,7 @@ LLVMAttributeRef LLVMGetStringAttributeAtIndex(LLVMValueRef fn, LLVMAttributeInd
 LLVMValueRef LLVMGetCondition(LLVMValueRef br);
 unsigned LLVMGetNumSuccessors(LLVMValueRef term);
 LLVMBasicBlockRef LLVMGetSuccessor(LLVMValueRef term, unsigned i);
-LLVMValueRef LLVMGetSwitchCaseValue(LLVMValueRef sw, unsigned i);  // i = the successor, from 1
+LLVMValueRef LLVMGetSwitchCaseValue(LLVMValueRef sw, unsigned i);  // i is the successor, from 1
 unsigned LLVMCountIncoming(LLVMValueRef phi);
 LLVMValueRef LLVMGetIncomingValue(LLVMValueRef phi, unsigned i);
 LLVMBasicBlockRef LLVMGetIncomingBlock(LLVMValueRef phi, unsigned i);
