@@ -1,14 +1,8 @@
-// A VideoToolbox H.264, H.265, AV1, VP9 and VP8 decoder on NVDEC. MalachiteDriver registers NVDecH264_CreateInstance,
-// NVDecHEVC_CreateInstance, NVDecAV1_CreateInstance, NVDecVP9_CreateInstance and NVDecVP8_CreateInstance with
-// VideoToolbox in the processes Metal loads it into (VideoToolbox doesn't take them from /Library/Video/Plug-Ins,
-// Info.plist or not), and VideoToolbox makes a decoder with one per decompression session. The stream is parsed here
-// (core/h264.c, core/hevc.c, core/av1.c, core/vp9.c, core/vp8.c), each picture set up here (core/nvdec.c) and decoded
-// by the kernel (NVVideoUserClient) into block-linear surfaces this process maps, which are detiled into the
-// session's NV12 (P010 for 10-bit H.265, AV1 and VP9) pixel buffers.
-//
-// The decoder object is a CoreMedia derived object; the class layouts are what Apple's own decoder bundles hand
-// CMDerivedObjectCreate (AppleGVAHEVCDecoder: base class version 1, decoder class version 2/3), pack(4).
-// core headers go before the system's: core/plat.h declares memcpy and friends, which string.h may make macros of
+// VideoToolbox decoders on NVDEC. MalachiteDriver registers the NVDec*_CreateInstance factories in each process Metal
+// loads it into, as VideoToolbox ignores /Library/Video/Plug-Ins. Streams are parsed and pictures set up here, decoded
+// by the kernel into block-linear surfaces mapped here, then detiled into NV12 (P010 for 10-bit).
+// Class layouts are those Apple's decoder bundles pass CMDerivedObjectCreate (base version 1, decoder 2/3), pack(4).
+// core headers first: core/plat.h declares memcpy and friends, which string.h may make macros of
 #include "../core/nvdec.h"
 #include "../kext/abi.h"
 
@@ -81,9 +75,9 @@ void log_msg(const char *fmt, ...)
     static os_log_t log;
     if (!log)
         log = os_log_create("pl.aochi.NVVideo", "decoder");
-    // error-level, so log show has them whatever the process's log settings
+    // error level, so log show has them whatever the process's settings
     os_log_error(log, "NVVideo: %{public}s", buf);
-    // for test tools (vtdec), which can't tell otherwise which decoder VideoToolbox picked
+    // vtdec can't otherwise tell which decoder VideoToolbox picked
     if (getenv("NVVIDEO_LOG"))
         fprintf(stderr, "NVVideo: %s\n", buf);
 }
@@ -104,16 +98,16 @@ struct decoder {
     io_connect_t conn;
     struct nvdec_stream stream;
     uint32_t pictures;
-    uint32_t nal_len;  // bytes in front of each NAL unit of a sample
-    uint8_t *annexb;   // a sample as Annex-B, or as it is for AV1
+    uint32_t nal_len;  // length field size before each NAL unit
+    uint8_t *annexb;   // the sample as Annex-B; as is for AV1
     size_t annexb_size;
-    // the kernel's decode buffers, as mapped here
+    // the kernel's decode buffers, mapped
     uint32_t width_mbs, height_mbs, bps, slots;
     uint64_t bits_size;
     uint8_t *setup, *bits;
     const uint8_t *surf[NVDEC_SLOTS];
     struct nvdec_surface layout;
-    // NVDEC didn't finish a picture: the frames after it fail at once rather than each waiting for it
+    // NVDEC didn't finish a picture: later frames fail at once instead of each timing out
     bool broken;
 };
 
@@ -145,8 +139,8 @@ static void unmap_buffers(struct decoder *d)
     d->width_mbs = d->height_mbs = d->slots = 0;
 }
 
-// the kernel's buffers for pictures like info's, with surfaces for `slots` reference pictures and the picture being
-// decoded and a bitstream buffer that holds an uncompressed picture, or min_bits if more
+// surfaces for `slots` references plus the current picture; the bitstream buffer fits an uncompressed picture or
+// min_bits, whichever is more
 static int open_buffers(struct decoder *d, const struct nvdec_pic *info, uint32_t slots, uint64_t min_bits)
 {
     unmap_buffers(d);
@@ -176,7 +170,6 @@ static int open_buffers(struct decoder *d, const struct nvdec_pic *info, uint32_
     return d->setup && d->bits && d->bits_size >= bits ? 0 : -1;
 }
 
-// NAL units behind start codes at *o, which the parameter sets of a configuration record fit in
 static void put_nal(uint8_t **o, const uint8_t *nal, size_t size)
 {
     *(*o)++ = 0;
@@ -186,7 +179,7 @@ static void put_nal(uint8_t **o, const uint8_t *nal, size_t size)
     *o += size;
 }
 
-// the parameter sets of an avcC atom (ISO 14496-15 5.3.3.1), through the parser
+// avcC: ISO 14496-15 5.3.3.1
 static int parse_avcc(struct decoder *d, const uint8_t *p, size_t len, uint8_t **o)
 {
     if (len < 7 || p[0] != 1)
@@ -209,7 +202,7 @@ static int parse_avcc(struct decoder *d, const uint8_t *p, size_t len, uint8_t *
     return 0;
 }
 
-// the parameter sets of an hvcC atom (ISO 14496-15 8.3.3.1), through the parser
+// hvcC: ISO 14496-15 8.3.3.1
 static int parse_hvcc(struct decoder *d, const uint8_t *p, size_t len, uint8_t **o)
 {
     if (len < 23 || p[0] != 1)
@@ -232,7 +225,7 @@ static int parse_hvcc(struct decoder *d, const uint8_t *p, size_t len, uint8_t *
     return 0;
 }
 
-// the configuration OBUs of an av1C atom (AV1 in ISOBMFF 2.3.3), which are OBUs with their sizes like the samples'
+// av1C: AV1 in ISOBMFF 2.3.3; its OBUs carry sizes like the samples'
 static int parse_av1c(const uint8_t *p, size_t len, uint8_t **o)
 {
     if (len < 4 || p[0] != 0x81)
@@ -242,13 +235,13 @@ static int parse_av1c(const uint8_t *p, size_t len, uint8_t **o)
     return 0;
 }
 
-// A vpcC atom (VP Codec ISO Media File Format Binding 2.2, version 1): VP9 and VP8 have no parameter sets, so the
-// stream is taken to be of the format's size and the atom's bit depth until its first key frame. 4:2:0 only.
+// vpcC version 1 (VP Codec ISO Media File Format Binding 2.2). With no parameter sets, the format's size and bit depth
+// hold until the first key frame. 4:2:0 only.
 static int parse_vpcc(struct decoder *d, const uint8_t *p, size_t len, CMVideoDimensions dim)
 {
     if (len < 12 || p[0] != 1 || dim.width <= 0 || dim.height <= 0)
         return -1;
-    uint32_t depth = p[6] >> 4, chroma = p[6] >> 1 & 7;  // chroma 0 and 1 are 4:2:0, sited apart
+    uint32_t depth = p[6] >> 4, chroma = p[6] >> 1 & 7;  // chroma 0 and 1: 4:2:0, differently sited
     if (chroma > 1 || (depth != 8 && (depth != 10 || d->stream.codec == NVDEC_VP8)))
         return -1;
     nvdec_stream_size(&d->stream, (uint32_t)dim.width, (uint32_t)dim.height, depth);
@@ -257,7 +250,7 @@ static int parse_vpcc(struct decoder *d, const uint8_t *p, size_t len, CMVideoDi
 
 static int parse_config(struct decoder *d, const uint8_t *p, size_t len)
 {
-    // a start code is three bytes and a length field two
+    // 3-byte start codes replace 2-byte length fields
     uint8_t *out = malloc(len * 2), *o = out;
     int r;
     switch (d->stream.codec) {
@@ -278,7 +271,7 @@ static int parse_config(struct decoder *d, const uint8_t *p, size_t len)
     return r < 0 ? -1 : 0;
 }
 
-// the pixel buffers the session's pool makes: a picture's size and bit depth
+// sets what the session's pool makes
 static OSStatus set_output(VTVideoDecoderSession session, int32_t width, int32_t height, uint32_t bps)
 {
     int32_t pixel_format = bps == 2 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
@@ -331,7 +324,7 @@ static OSStatus start_session(CMBaseObjectRef obj, VTVideoDecoderSession session
     if (vpx ? parse_vpcc(d, p, len, dim) : parse_config(d, p, len))
         return kVTVideoDecoderBadDataErr;
 
-    // the buffers take a while to make: here, not in the first frame
+    // the buffers are slow to make, so not in the first frame
     struct nvdec_pic info;
     if (!nvdec_stream_params(&d->stream, &info))
         return kVTVideoDecoderBadDataErr;
@@ -347,8 +340,7 @@ static OSStatus start_session(CMBaseObjectRef obj, VTVideoDecoderSession session
     return noErr;
 }
 
-// a sample's NAL units with start codes instead of lengths; an AV1 sample is OBUs with their sizes already, a VP9 or
-// VP8 one a frame or superframe
+// length-prefixed NAL units to start codes; AV1, VP9 and VP8 samples pass as they are
 static int to_stream(struct decoder *d, CMSampleBufferRef sample, size_t *len)
 {
     CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sample);
@@ -358,7 +350,7 @@ static int to_stream(struct decoder *d, CMSampleBufferRef sample, size_t *len)
         free(in);
         return -1;
     }
-    // a start code is at most two bytes more than the shortest length field
+    // a start code is at most two bytes longer than a length field
     if (d->annexb_size < size * 3 + 16) {
         free(d->annexb);
         d->annexb_size = size * 3 + 16;
@@ -396,11 +388,11 @@ static CVPixelBufferRef picture_out(struct decoder *d, const struct nvdec_pic *p
     CVPixelBufferPoolRef pool = VTDecoderSessionGetPixelBufferPool(d->session);
     if (!pool || CVPixelBufferPoolCreatePixelBuffer(NULL, pool, &pb))
         return NULL;
-    // a VP9 stream's bit depth is its format's until its first key frame says otherwise
+    // VP9 bit depth may change at the first key frame
     OSType format = pic->bps == 2 ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
                                   : kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
-    // A stream can change its picture size without a new format (a video call raising its resolution): each frame
-    // comes out at its own size, not the format's. Detiled into a bigger buffer, it showed in a corner of green.
+    // Streams can change size without a new format, so each frame goes out at its own size; in a bigger buffer it
+    // shows in a corner of green.
     if (CVPixelBufferGetPixelFormatType(pb) != format || CVPixelBufferGetWidth(pb) != pic->crop.width ||
         CVPixelBufferGetHeight(pb) != pic->crop.height) {
         CVPixelBufferRelease(pb);
@@ -428,7 +420,7 @@ static int decode_picture(struct decoder *d, const struct nvdec_pic *pic)
     uint32_t slots = pic->slots;
     if (pic->existing)
         return 0;
-    if (pic->slot >= slots)  // an H.264 stream keeping more references than it said
+    if (pic->slot >= slots)  // H.264 keeping more references than declared
         slots = NVDEC_SLOTS;
     if ((pic->width_mbs != d->width_mbs || pic->height_mbs != d->height_mbs || pic->bps != d->bps ||
          pic->slot >= d->slots || pic->bytes + 64 > d->bits_size) &&
@@ -471,8 +463,8 @@ static OSStatus decode_frame(CMBaseObjectRef obj, VTVideoDecoderFrame frame, CMS
                 break;
             }
             d->pictures++;
-            // a sample is one access unit; should one hold more pictures, the first to be shown is the frame (an
-            // AV1 one or a VP9 superframe holds the frames that are hidden, and the one that isn't)
+            // a sample with several pictures (AV1, VP9 superframes: hidden ones plus one shown) outputs the first
+            // shown
             if (!got)
                 st = noErr;
             got = true;
@@ -489,7 +481,7 @@ static OSStatus decode_frame(CMBaseObjectRef obj, VTVideoDecoderFrame frame, CMS
     return noErr;
 }
 
-// VideoToolbox asks the decoder only for the properties it lists here
+// VideoToolbox asks only for properties listed here
 static OSStatus copy_supported_properties(CMBaseObjectRef obj, CFDictionaryRef *out)
 {
     const void *keys[] = { kVTPropertyTypeKey, kVTPropertyReadWriteStatusKey };
@@ -511,7 +503,7 @@ static Boolean can_accept_format_description(CMBaseObjectRef obj, CMFormatDescri
 
 static OSStatus finish_delayed_frames(CMBaseObjectRef obj)
 {
-    return noErr;  // every frame goes out as it's decoded
+    return noErr;  // frames go out as decoded
 }
 
 static OSStatus invalidate(CMBaseObjectRef obj)
@@ -579,14 +571,14 @@ static const struct vtable vtable = { NULL, &base, &decoder };
 static OSStatus create_instance(enum nvdec_codec codec, CFAllocatorRef alloc, CMBaseObjectRef *out)
 {
     const char *name = nvdec_codec_name(codec);
-    // VideoToolbox goes on to its next decoder (Apple's software one) when this fails, but not once a session
-    // started: whatever can keep NVDEC out (a sandbox, no GPU context or channel left) is found out here
+    // VideoToolbox falls back to software only if this fails, not once a session started, so whatever can keep NVDEC
+    // out (sandbox, no GPU context or channel left) must show here
     io_connect_t conn = 0;
     io_service_t svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("MalachiteGpu"));
     kern_return_t kr = svc ? IOServiceOpen(svc, mach_task_self(), MALACHITE_VIDEO_CLIENT, &conn) : KERN_FAILURE;
     if (svc)
         IOObjectRelease(svc);
-    uint64_t none[6] = { 0, 0, 0, 0, codec };  // no buffers: whether the GPU decodes this codec at all
+    uint64_t none[6] = { 0, 0, 0, 0, codec };  // no buffers: only asks if the GPU decodes this codec
     if (!kr && (kr = IOConnectCallScalarMethod(conn, NVVIDEO_OPEN, none, 6, NULL, NULL)))
         IOServiceClose(conn);
     if (kr) {
@@ -642,8 +634,7 @@ __attribute__((visibility("default"))) OSStatus NVDecVP9_CreateInstance(FourChar
     return create_instance(NVDEC_VP9, alloc, out);
 }
 
-// CoreMedia has no VP8 codec type; 'vp08' is the sample entry of VP8 in ISO media files (VP Codec ISO Media File
-// Format Binding 2.1)
+// CoreMedia has no VP8 type; 'vp08' is VP8's ISO media sample entry (VP Codec ISO Media File Format Binding 2.1)
 __attribute__((visibility("default"))) OSStatus NVDecVP8_CreateInstance(FourCharCode codec, CFAllocatorRef alloc,
                                                                         CMBaseObjectRef *out)
 {
