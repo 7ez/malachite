@@ -1,5 +1,4 @@
-// A GPU task: an IOAccelTask is the accelerator's per-client (or kernel) GPU address space and allocation
-// context. IOAccelTask has no pure virtuals and a usable base init(). The address spaces themselves live in Gpu.
+// A client's (or the kernel's) GPU address space; the real one lives in Gpu.
 #pragma once
 #include "IOAccelTask.h"
 
@@ -9,8 +8,7 @@ class Task : public IOAccelTask {
     OSDeclareDefaultStructors(Task)
 
 public:
-    // the task's GPU context in Gpu (its address space and channels), opened with its first mapping; the kernel
-    // task's is Gpu's own, 0
+    // opened at the first mapping; the kernel task's is Gpu's own, 0
     uintptr_t ctx = 0;
     bool kernel = false;
     uintptr_t context();

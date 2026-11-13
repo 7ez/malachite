@@ -17,18 +17,15 @@ class IOAccelCommandQueue : public IOAccelSubmitter2 {
     OSDeclareAbstractStructors(IOAccelCommandQueue)  // structors/metaclass glue: declared, linked to this macOS at load
 
 public:
-    // IOAccelCommandQueue concretely provides these IOAccelSubmitter2 pure virtuals (slots 300-305,308). The ones
-    // whose kernel symbol is exported we just declare (no body) so our vtable links to the real kernel impl. The
-    // unexported ones we reimplement to match the kernel exactly: plain reads of base-populated fields (offsets
-    // from disassembling the kernel methods), so the queue behaves identically - stubbing them to 0 made the queue
-    // fail to create (null owning task).
+    // IOAccelSubmitter2 slots 300-305 and 308: exported ones link to the kernel's; unexported ones copy the kernel's
+    // field reads, as returning 0 fails queue creation (null owning task)
     uint64_t getOwningTask() const override { return *(uint64_t const *)((char const *)this + 0x570); }
     uint64_t getGPUTask() const override { return *(uint64_t const *)((char const *)this + 0x5b0); }
     uint64_t getOwningTaskPid() const override { return *(uint32_t const *)((char const *)this + 0x578); }
-    uint64_t affectedByHardwareReset(bool, unsigned int) override { return 0; }  // kernel: no-op
-    uint64_t shouldHardwareCommandNooped() override { return 0; }                 // kernel: return 0
-    uint64_t retireCommandBuffer(IOAccelEventFence *) override;  // exported - inherit kernel impl
-    uint64_t setSubmissionError(unsigned int) override;          // exported - inherit kernel impl
+    uint64_t affectedByHardwareReset(bool, unsigned int) override { return 0; }
+    uint64_t shouldHardwareCommandNooped() override { return 0; }
+    uint64_t retireCommandBuffer(IOAccelEventFence *) override;  // exported
+    uint64_t setSubmissionError(unsigned int) override;          // exported
 
     virtual uint64_t isOpportunisticWorkload() const;
     virtual uint64_t commandQueueStart();

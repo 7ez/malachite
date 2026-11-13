@@ -14,12 +14,9 @@ namespace malachite::accel {
 
 MalachiteDefineClass(Task, IOAccelTask)
 
-// Placeholder VAs for when Gpu isn't up: allocation still succeeds, but GPU work against one moves no bytes
-// (nothing is mapped there). They start above the 49 bits Gpu hands out, so one can never name a real mapping,
-// which an unmap of it would otherwise drop.
+// for when Gpu isn't up; above Gpu's 49 bits, so unmapping one can't drop a real mapping
 static SInt64 gNextPlaceholderVA = 1ll << 50;
 
-// IOAccelMemoryMap keeps its memory at +0x18
 static IOAccelMemory *map_memory(const IOAccelMemoryMap *map)
 {
     return *(IOAccelMemory * const *)((const char *)map + 0x18);
@@ -39,11 +36,10 @@ void Task::free()
     IOAccelTask::free();
 }
 
-// The base map's allocGPUVirtualAddress asks its task for the VA, then keeps the map on the task's mapping list
-// (which preparing the map later walks); we hand out Gpu's: the map's VRAM or pages, mapped in the GPU vmm.
+// called from the base map's allocGPUVirtualAddress
 uint64_t Task::allocate(const IOAccelMemoryMap *map)
 {
-    // with no context of its own a task's maps would land in the kernel's address space
+    // or its maps would land in the kernel's address space
     if (gGpu && !kernel && !context()) {
         log_msg("Malachite: a buffer is refused, its task has no GPU context\n");
         return 0;
@@ -57,10 +53,10 @@ uint64_t Task::allocate(const IOAccelMemoryMap *map)
             r = gGpu->callPlatformFunction(NVGPU_FN_MAP_VRAM, true, (void *)(uintptr_t)vid->vram,
                                             (void *)(uintptr_t)vid->getLength(), &va, (void *)context());
     } else if (IOMemoryDescriptor *md = mem ? *(IOMemoryDescriptor * const *)((const char *)mem + 0xd0) : nullptr) {
-        if (gGpu)  // IOAccelSysMemory keeps its descriptor at +0xd0
+        if (gGpu)  // IOAccelSysMemory's descriptor at +0xd0
             r = gGpu->callPlatformFunction(NVGPU_FN_MAP, true, md, &va, (void *)context(), nullptr);
     }
-    // a mapping Gpu refused (table or address space full) is an error, not a buffer the GPU can't see
+    // refused (table or address space full) is an error, unlike Gpu not being up
     if (!va && r != kIOReturnNotReady && r != kIOReturnSuccess)
         return 0;
     if (!va) {
@@ -70,7 +66,7 @@ uint64_t Task::allocate(const IOAccelMemoryMap *map)
     return va;
 }
 
-// Gpu finds the mapping by VA, and does nothing for a placeholder it never mapped
+// Gpu ignores placeholders it never mapped
 uint64_t Task::deallocate(const IOAccelMemoryMap *map, unsigned long long va)
 {
     if (va && gGpu)

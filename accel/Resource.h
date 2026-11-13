@@ -1,7 +1,4 @@
-// Resource object behind every MTL allocation. IOAccelResource2 leaves the paging/aperture primitives abstract
-// (kchdr shows them =0 because they're unexported). We mirror the paravirt stubs: paging is a no-op, level offsets
-// and aperture return empty, the IOSurface cache math is 0 (a plain MTLBuffer has no surface).
-// init/initialize/prepare/addToChannel/... stay inherited (exported).
+// The unexported paging and aperture slots are stubs: memory is mapped by Task, not paged.
 #pragma once
 #include "IOAccelResource2.h"
 #include <IOKit/IOLib.h>
@@ -12,8 +9,7 @@ class Resource : public IOAccelResource2 {
     OSDeclareDefaultStructors(Resource)
 
 public:
-    // the display pipe's framebuffer resource: its memory stands in for Framebuffer's scanout and is never mapped for the
-    // GPU, so the base prepare (which maps it, and has no shared context to map it in) is skipped
+    // the display pipe's: never mapped for the GPU, and the base prepare has no shared context to map it in
     bool framebuffer = false;
     uint64_t prepare() override { return framebuffer ? 1 : IOAccelResource2::prepare(); }
     uint64_t complete() override { return framebuffer ? 0 : IOAccelResource2::complete(); }

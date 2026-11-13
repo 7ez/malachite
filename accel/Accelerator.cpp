@@ -34,15 +34,12 @@ static const unsigned kStatsMs = 250;
 
 MalachiteDefineClass(Accelerator, IOGraphicsAccelerator2)
 
-// MetalPluginName is a bundle name, not a path: libsystem_sandbox's gpu_bundle_find_trusted() searches the
-// standard GPU bundle dirs (/Library/GPUBundles, /System/Library/Extensions) for "<name>.bundle".
-// MalachiteDevice is the principal class Metal instantiates from it.
+// a bundle name, not a path: gpu_bundle_find_trusted() looks for "<name>.bundle" in the GPU bundle dirs
 #define kMetalPluginPath  "MalachiteMetal"
 #define kMetalPluginClass "MalachiteDevice"
 
 extern "C" void log_msg(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
-// The LC_UUID of a 64-bit Mach-O, from the load commands at its start
 static bool macho_uuid(const char *path, uint8_t uuid[16])
 {
     const int size = 16384;
@@ -78,9 +75,8 @@ static bool macho_uuid(const char *path, uint8_t uuid[16])
     return found;
 }
 
-// gpu_bundle_find_trusted() looks in /Library/GPUBundles first, and sandboxed processes (browsers' GPU processes) may
-// map code only from the system volume. So a copy the installer put there, of the same build, is named relative to
-// the first folder, and every process loads that one; a macOS update takes it away again.
+// Sandboxed GPU processes may map code only from the system volume, so the installer's copy there is used when it is
+// the same build, named relative to /Library/GPUBundles, which gpu_bundle_find_trusted() searches first.
 static const char *metal_plugin_name()
 {
     // looking a path up before the root is mounted panics in namei
@@ -112,21 +108,17 @@ bool Accelerator::start(IOService *provider)
         return false;
     }
 
-    // Metal.framework reads these off the registered accelerator; set before super::start(), which registers
-    // the service on success.
+    // set before super::start(), which registers the service
     setProperty("MetalPluginName", metal_plugin_name());
     setProperty("MetalPluginClassName", kMetalPluginClass);
-    // OpenGL's renderer bundle: Apple's, which runs GL on whatever Metal device is ours. Boot-arg nvgl=0 leaves
-    // GL apps on Apple's software renderer instead.
+    // Apple's GL-on-Metal renderer; nvgl=0 leaves GL on the software renderer
     uint32_t gl = 1;
     PE_parse_boot_argn("nvgl", &gl, sizeof(gl));
     if (gl)
         setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer");
     setProperty("IOAccelRevision", 2ull, 32);
-    // the display pipe's capabilities (IOAccelDisplayPipe::copyCapabilities reads them from here): WindowServer
-    // presents through it only when it says transactions work. Needs the graphics device control too: without
-    // it CoreDisplay wants a pipe for every display once Framebuffer is online, takes the main one offline and
-    // WindowServer exits, over and over
+    // read by IOAccelDisplayPipe::copyCapabilities: WindowServer presents through the pipe only if transactions
+    // work. Needs GraphicsControl too, or WindowServer exits in a loop once Framebuffer is online.
     OSDictionary *caps = OSDictionary::withCapacity(2);
     if (caps) {
         caps->setObject("DisplayPipeSupported", kOSBooleanTrue);
@@ -135,9 +127,8 @@ bool Accelerator::start(IOService *provider)
         caps->release();
     }
 
-    // allocates the accelerator's locks, calls our factory virtuals (createEventMachine -> newEventMachine,
-    // newDisplayMachine, createKernelGPUTask, createMemoryMap, ...) and fails if any returns 0. Registering
-    // before this panics requestProbe on the null locks.
+    // allocates the locks and calls our factories, failing if any returns 0; registering before this panics
+    // requestProbe on the null locks
     if (!IOGraphicsAccelerator2::start(provider)) {
         IOLog("accel: super::start() bailed (accelerator factories not implemented yet)\n");
         return false;
@@ -156,15 +147,13 @@ bool Accelerator::start(IOService *provider)
         statsTimer->setTimeoutMS(kStatsMs);
     else
         OSSafeReleaseNULL(statsTimer);
-    // base start() does not registerService(); unregistered, Metal's service matching never finds us
+    // the base start() doesn't register, and Metal only finds registered services
     registerService();
-    // without this, command-queue submit (acceleratorWaitEnabled) blocks forever
+    // or submit blocks forever in acceleratorWaitEnabled
     enableAccelerator();
 
-    // Find the Gpu service so the memory map and command queue can drive the GPU (map buffers into the GPU
-    // vmm, run copy-engine blits) over callPlatformFunction. Not waited for: matching of this device is
-    // serial and Gpu's own start is queued behind this one. Until it publishes, buffers get placeholder VAs
-    // and GPU work no-ops.
+    // Not waited for: Gpu's start is queued behind this one. Until it publishes, buffers get placeholder VAs and
+    // GPU work no-ops.
     if (!gGpu) {
         OSDictionary *match = IOService::serviceMatching("MalachiteGpu");
         if (match) {
@@ -192,8 +181,7 @@ bool Accelerator::foundGpu(void *, void *, IOService *gpu, IONotifier *)
     return true;
 }
 
-// Framebuffer is an IOFramebuffer: the display machine builds it a display pipe (createDisplayPipe ->
-// newDisplayPipe), which tags it with our accelerator so WindowServer finds the pipe to present through
+// in screen order, as the display machine numbers pipes in the order it gets framebuffers
 bool Accelerator::foundFramebuffer(void *target, void *ref, IOService *fb, IONotifier *notifier)
 {
     Accelerator *self = (Accelerator *)target;
@@ -267,9 +255,7 @@ void Accelerator::stop(IOService *provider)
 
 uint64_t Accelerator::getStampMemory(unsigned int *count)
 {
-    // IOAccelDevice::deviceStart retains this and createMappingInTask()s it into the Metal client, so it has to
-    // be an IOMemoryDescriptor. The kernel/user-shared buffer holds the stamp page the event machine writes and
-    // user space tests events against.
+    // IOAccelDevice::deviceStart maps this into the Metal client, so it must be an IOMemoryDescriptor
     if (!stampBuf) {
         stampBuf = IOBufferMemoryDescriptor::inTaskWithOptions(
             kernel_task, kIOMemoryKernelUserShared | kIODirectionOutIn,
@@ -280,8 +266,7 @@ uint64_t Accelerator::getStampMemory(unsigned int *count)
             return 0;
         }
         bzero(stampBuf->getBytesNoCopy(), kStampCount * sizeof(uint32_t));
-        // the event machine reads each stamp through a table it builds from the page's address, which the base
-        // never hands it: without it, an event with a stamp in it faults when tested
+        // the base never gives the event machine the page's address, so testing a stamped event faults
         IOAccelEventMachine2 *em = event_machine(this);
         if (em && !*(void **)((char *)em + 0x28))
             em->setStampBaseAddress((volatile unsigned int *)stampBuf->getBytesNoCopy());
@@ -292,8 +277,7 @@ uint64_t Accelerator::getStampMemory(unsigned int *count)
     return (uint64_t)stampBuf;
 }
 
-// IOGraphicsAccelerator2 keeps its event machine and fence machine here, and the fence machine the interrupt event
-// source that sends the completions of command buffers whose events are done
+// IOGraphicsAccelerator2's event and fence machines, and the fence machine's completion event source
 class IOAccelFenceMachine;
 static IOAccelEventMachine2 *event_machine(IOGraphicsAccelerator2 *a)
 {
@@ -332,8 +316,7 @@ void Accelerator::stampEvent(IOAccelEvent *event, uintptr_t ctx, bool app)
     IOLockUnlock(stampLock);
 }
 
-// in order behind the stamps before it, after the draws ctx has queued so far; into the page now if there's nothing
-// to wait for
+// held behind earlier stamps and ctx's queued draws; written at once if there's nothing to wait for
 void Accelerator::queueStamp(int index, uint32_t value, uintptr_t ctx)
 {
     volatile uint32_t *page = (volatile uint32_t *)stampBuf->getBytesNoCopy();
@@ -359,8 +342,7 @@ void Accelerator::queueStamp(int index, uint32_t value, uintptr_t ctx)
         stampTimer->setTimeoutUS(250);
 }
 
-// the stamps whose draws are done into the page, each timeline in its order; their waiters told and the fences looked
-// at again. Retired ones are left with index -1 until the head passes them.
+// writes stamps whose draws are done, in order per timeline; retired ones keep index -1 until the head passes them
 unsigned Accelerator::retireStamps()
 {
     volatile uint32_t *page = (volatile uint32_t *)stampBuf->getBytesNoCopy();
@@ -438,12 +420,12 @@ void Accelerator::publishStats(OSObject *owner, IOTimerEventSource *timer)
     self->lastBusyUs = s.busy_us;
     self->lastNowUs = s.now_us;
 
-    // a copy of what is in there now: the accelerator base keeps keys of its own in the dictionary
+    // copied, as the base keeps keys of its own in there
     OSDictionary *cur = OSDynamicCast(OSDictionary, self->getProperty("PerformanceStatistics"));
     OSDictionary *d = cur ? OSDynamicCast(OSDictionary, cur->copyCollection()) : OSDictionary::withCapacity(10);
     if (!d)
         return;
-    // an NVIDIA GPU has no tiler, so the three utilisations are the one measure of the graphics engine
+    // no tiler: all three are the graphics engine's
     put_number(d, "Device Utilization %", util);
     put_number(d, "Renderer Utilization %", util);
     put_number(d, "Tiler Utilization %", util);
@@ -461,19 +443,16 @@ void Accelerator::publishStats(OSObject *owner, IOTimerEventSource *timer)
 
 uint64_t Accelerator::newEventMachine()
 {
-    // init(this, ratio, flags) is called on it by IOGraphicsAccelerator2::createEventMachine()
     return (uint64_t)OSTypeAlloc(EventMachine);
 }
 
 uint64_t Accelerator::newDisplayMachine()
 {
-    // start() calls init(this) on it
     display = OSTypeAlloc(DisplayMachine);
     return (uint64_t)display;
 }
 
-// Base IOAccelTask::init(accel, flags, rangeAllocators): tasks get range allocators (flags 1) as a real
-// driver's do, though nothing is carved from them: Task::allocate hands out Gpu's VAs
+// range allocators as a real driver's tasks have, though Task::allocate hands out Gpu's VAs instead
 static uint64_t make_task(Accelerator *accel, IORangeAllocator **ranges, bool kernel)
 {
     Task *task = OSTypeAlloc(Task);
@@ -487,7 +466,6 @@ static uint64_t make_task(Accelerator *accel, IORangeAllocator **ranges, bool ke
     return (uint64_t)task;
 }
 
-// Kernel GPU address space
 uint64_t Accelerator::createKernelGPUTask()
 {
     for (IORangeAllocator *&r : ranges)
@@ -496,19 +474,15 @@ uint64_t Accelerator::createKernelGPUTask()
     return make_task(this, ranges, true);
 }
 
-// Per-client GPU address space. IOAccelShared2::init needs this non-null when Metal opens the shared user
-// client (type 6) for its command-buffer shmem, or the open fails and lazyInitialize blocks.
+// without one, opening the shared user client (type 6) fails and Metal's lazyInitialize blocks
 uint64_t Accelerator::createUserGPUTask() { return make_task(this, ranges, false); }
 
-// The type-8 command-queue user client Metal submits through
 uint64_t Accelerator::newCommandQueue() { return (uint64_t)OSTypeAlloc(CommandQueue); }
 
 uint64_t Accelerator::populateAccelConfig(IOAccelConfig *config)
 {
-    // The device's get_config external method (selector 0) returns this to Metal; an all-zero config makes
-    // Metal reject the device (init returns nil) even though every selector succeeds. Field offsets and values
-    // mirror AppleParavirtAccelerator's populateAccelConfig; the config lives in the accelerator at the
-    // offsets get_config reads (config+0x8 == accel+0xc90, ...).
+    // get_config (selector 0) hands this to Metal, which rejects an all-zero one. Values are Apple's paravirtual
+    // accelerator's; config+0x8 is accel+0xc90.
     static const char kName[] = "Malachite";
     const char *name = kName;
     uint8_t *c = (uint8_t *)config;
@@ -535,7 +509,6 @@ uint64_t Accelerator::configureDevice(IOPCIDevice *device)
     return 1;
 }
 
-// the VRAM Gpu read from the GPU
 uint64_t Accelerator::tmpTotalVRAM()
 {
     OSNumber *n = gGpu ? OSDynamicCast(OSNumber, gGpu->getProperty("MalachiteVRAMBytes")) : nullptr;

@@ -1,10 +1,5 @@
-// The accelerator's event machine. IOGraphicsAccelerator2 tracks GPU completion through per-channel "stamps"
-// (monotonic counters in a shared page): an IOAccelEvent is done once its channel's stamp has reached the value
-// recorded for it, and Metal and IOPresentment test that in user space against the shared page.
-//
-// Apple's IOAccelEventMachineFast2 does all the event bookkeeping; a driver only writes a stamp's new value once
-// the work before it is done. Accelerator::writeStamp holds it back until the GPU has finished the draws queued so
-// far, then writes it and tells the event and fence machines.
+// An IOAccelEvent is done once its channel's stamp, a counter in a page user space tests, reaches its value.
+// IOAccelEventMachineFast2 does the bookkeeping; Accelerator::writeStamp holds each stamp back until its draws are done.
 #pragma once
 #include "IOAccelEventMachineFast2.h"
 
@@ -18,7 +13,7 @@ class EventMachine : public IOAccelEventMachineFast2 {
 public:
     uint64_t init(IOGraphicsAccelerator2 *accel, unsigned int ratio, int flags) override;
     uint64_t writeStamp(int stamp, vendevtCommandRec *, unsigned int value) override;
-    // no barriers between channels: there is one queue, run in order
+    // one queue, run in order: no barriers needed
     uint64_t prepareBarrier(vendevtBarrierRec *) override { return 0; }
     uint64_t completeBarrier(vendevtBarrierRec *) override { return 0; }
     uint64_t writeBarrierElement(vendevtBarrierRec *, int, unsigned int) override { return 0; }

@@ -29,9 +29,7 @@ class IOGraphicsAccelerator2 : public IOService {
     OSDeclareAbstractStructors(IOGraphicsAccelerator2)  // structors/metaclass glue: declared, linked to this macOS at load
 
 public:
-    // Non-virtual exported helper (not in the vtable): marks the accelerator "enabled" (sets the 0x2 bit at
-    // +0xc78). Command-queue submit calls acceleratorWaitEnabled(), which blocks until this is set, so a driver
-    // must call it after start() or every submit hangs.
+    // non-virtual: sets bit 0x2 at +0xc78, which every submit waits for
     uint64_t enableAccelerator();
 
     virtual uint64_t acceleratorDidLock(char const*, int);

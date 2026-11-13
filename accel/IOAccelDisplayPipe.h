@@ -57,8 +57,7 @@ public:
     virtual uint64_t framebuffer_did_power_on();
     virtual uint64_t framebuffer_terminated();
 
-    // exported non-virtual helpers (added by hand): a vblank, which also completes transactions once their
-    // interrupt is enabled, and a transaction interrupt on its own
+    // exported, added by hand; a vblank also completes transactions once their interrupt is enabled
     void signalVBLInterrupt(void *);
     void signalTransactionInterrupt(void *);
 
@@ -68,15 +67,13 @@ static_assert(sizeof(IOAccelDisplayPipe) == 0x318, "IOAccelDisplayPipe size must
 
 class IOSurface;
 
-// a gamma table a transaction carries: per entry, red, green and blue as floats
 class IOAccelDisplayPipeGammaTable2 {
 public:
     unsigned int getTableCount() const;
     void getTableEntry(unsigned int index, float *r, float *g, float *b) const;
 };
 
-// A display transaction: per plane, the IOSurface WindowServer wants shown, and the pipe's gamma tables, which the
-// dirty bits say came with it. Only the accessors are declared.
+// accessors only; the dirty bits say which gamma tables came with it
 class IOAccelDisplayPipeTransaction2 {
 public:
     enum { kDirtyPipePreGamma = 0x20, kDirtyPipePostGamma = 0x80 };

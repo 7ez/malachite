@@ -1,6 +1,4 @@
-// System (host/DMA) memory resource for MTLBuffer shared storage. IOAccelSysMemory is concrete for the heavy
-// lifting (wire/getPhysicalSegment etc. - exported, inherited); we only supply the three unexported IOAccelMemory
-// getters, mirroring the kernel: length from this+0x40, tag forwarded to the backing IOMemoryDescriptor at +0xd0.
+// Shared storage. Only the unexported getters, as the kernel does them: length at +0x40, tag on the descriptor at +0xd0.
 #pragma once
 #include "IOAccelSysMemory.h"
 #include <IOKit/IOMemoryDescriptor.h>

@@ -10,7 +10,7 @@ namespace malachite::accel {
 
 MalachiteDefineClass(GraphicsControl, AppleGraphicsDeviceControl)
 
-// attributes, numbered as AGDC's user client selectors are
+// AGDC user client selectors
 enum {
     kAGDCVendorInfo = 1,
     kAGDCInitFlags = 3,
@@ -33,7 +33,6 @@ struct agdc_timing {
     uint8_t tail[8];
 };
 
-// a framebuffer's link: its timing, and the stream address (port, stream) it goes out on
 struct agdc_link_config {
     int32_t id, group;
     uint64_t flags;
@@ -41,7 +40,7 @@ struct agdc_link_config {
     uint32_t port, stream, state;
 };
 
-// one kind (type, a bit) of a framebuffer's display pipeline capabilities, up to 8 entries
+// one capability type (a bit) of a framebuffer, up to 8 entries
 struct agdc_ext_cap {
     uint32_t fb, type, count;
     uint8_t entry[8][0x32c];
@@ -75,8 +74,7 @@ static void put64(unsigned long *out, size_t at, uint64_t v)
 
 static const uint32_t kMaxFramebuffers = 4;
 
-// Framebuffer's framebuffers, by screen (Malachite's nub for each says which): fb[i] is screen i's, retained, or null;
-// how many there are in a row from screen 0
+// fb[i] is screen i's, retained, or null; returns how many there are in a row from screen 0
 static uint32_t framebuffers(IOService *fb[kMaxFramebuffers])
 {
     bzero(fb, kMaxFramebuffers * sizeof(*fb));
@@ -104,8 +102,7 @@ static void release_framebuffers(IOService *fb[kMaxFramebuffers])
         OSSafeReleaseNULL(fb[i]);
 }
 
-// a screen's lit timing, from Malachite's nub for it; before its head lights (WindowServer asks at startup, a minute
-// earlier), 1920x1080 at 60 Hz, the mode Framebuffer guesses too
+// 1080p60 until the head lights, about a minute after WindowServer first asks; Framebuffer guesses the same
 static void lit_timing(uint32_t screen, struct surface_timing *t)
 {
     *t = { 148500, 1920, 280, 88, 44, 1080, 45, 4, 5, 1, 1 };
@@ -122,7 +119,7 @@ static void lit_timing(uint32_t screen, struct surface_timing *t)
     OSSafeReleaseNULL(it);
 }
 
-// the request comes in the buffer the answer goes out in, or a copy of it
+// the request arrives in the answer's buffer, or in a copy
 static bool take_request(const unsigned long *in, unsigned long inSize, unsigned long *out, unsigned long *outSize,
                          size_t size)
 {
@@ -138,7 +135,7 @@ uint64_t GraphicsControl::vendor_doDeviceAttribute(unsigned int attr, unsigned l
                                                      IOExternalMethodArguments *args)
 {
     switch (attr) {
-    case kAGDCVendorInfo:  // version, name, PCI vendor and device, and a type (2) IOPresentment accepts
+    case kAGDCVendorInfo:  // type 2 is one IOPresentment accepts
         if (!out || !outSize || *outSize != 0x2c)
             return kIOReturnBadArgument;
         bzero(out, 0x2c);
@@ -147,15 +144,14 @@ uint64_t GraphicsControl::vendor_doDeviceAttribute(unsigned int attr, unsigned l
         put32(out, 0x24, 0x10de | (uint32_t)device_id << 16);  // PCI vendor, device
         put32(out, 0x28, 2);
         return kIOReturnSuccess;
-    case kAGDCInitFlags:  // what AppleGPUWrangler may switch on: framebuffers and accelerator (both exist already)
+    case kAGDCInitFlags:  // framebuffers and accelerator, both up already
         if (out && outSize && *outSize == 4) {
             put32(out, 0, 3);
             return kIOReturnSuccess;
         }
         return inSize == 4 ? kIOReturnSuccess : kIOReturnBadArgument;
     case kAGDCGPUCapability: {
-        // the framebuffers, in display pipe order, which is screen order (Accelerator gives screen i's pipe i), each on
-        // a port of its own from 1; the base turns the pointers into registry IDs
+        // in pipe order (= screen order), ports from 1; the base turns the pointers into registry IDs
         if (!out || !outSize || *outSize != 0xdc)
             return kIOReturnBadArgument;
         bzero(out, 0xdc);
@@ -171,7 +167,7 @@ uint64_t GraphicsControl::vendor_doDeviceAttribute(unsigned int attr, unsigned l
         release_framebuffers(fb);  // registered, so they outlive this call
         return kIOReturnSuccess;
     }
-    case kAGDCLinkConfig: {  // a framebuffer's link: its lit mode on stream 0 of its port
+    case kAGDCLinkConfig: {  // the lit mode on stream 0 of the framebuffer's port
         if (!take_request(in, inSize, out, outSize, sizeof(agdc_link_config)))
             return kIOReturnBadArgument;
         agdc_link_config *l = (agdc_link_config *)out;
@@ -208,20 +204,19 @@ uint64_t GraphicsControl::vendor_doDeviceAttribute(unsigned int attr, unsigned l
         return kIOReturnSuccess;
     }
     case kAGDCExtendedCapability: {
-        // only the plane scaler, which IOPresentment can't do without: one plane, scanned out at the mode's size
-        // (the entry's layout is known only this far: two scaler records, each a count, the largest and smallest
-        // height and width, and a ratio pair)
+        // IOPresentment needs the plane scaler: one plane at the mode's size. Layout known only this far: two records
+        // of count, max and min height and width, ratio pair.
         if (!take_request(in, inSize, out, outSize, sizeof(agdc_ext_cap)))
             return kIOReturnBadArgument;
         agdc_ext_cap *c = (agdc_ext_cap *)out;
         IOService *fb[kMaxFramebuffers];
         uint32_t n = framebuffers(fb);
         release_framebuffers(fb);
-        if (c->fb >= (n ? n : 1))  // framebuffer 0 before Framebuffer is up, as WindowServer may ask then
+        if (c->fb >= (n ? n : 1))  // WindowServer may ask for 0 before Framebuffer is up
             return kIOReturnNotFound;
         if (c->type == kAGDCCapGamma) {
-            // the head's output LUT, which CoreDisplay otherwise applies in a shader of its own on every frame: one
-            // table of up to 1024 entries per channel on plane 0, values 0 to 1 (as AMD's driver describes its own)
+            // the head's output LUT, or CoreDisplay applies gamma in a shader every frame: 1024 entries per channel
+            // on plane 0, values 0 to 1
             bzero(c->entry, sizeof(c->entry));
             c->count = 1;
             unsigned long *e = (unsigned long *)c->entry[0];

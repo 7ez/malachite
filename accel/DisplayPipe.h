@@ -1,9 +1,6 @@
-// The accelerator's display pipe for Framebuffer, which is how WindowServer shows its frames on a GPU it composites with:
-// it renders each frame into an IOSurface and hands it over in a transaction. We start copying the frame onto the
-// surface the head scans out (NVGpuPresent), on a thread of ours so WindowServer carries on with its next frame, and
-// report the transaction done once the copy has landed. The base pipe completes transactions and tells clients about
-// vblanks only when signalled: the head's vblank interrupt does both, and a 60 Hz timer stands in for it while the
-// head isn't lit.
+// WindowServer hands each frame over as an IOSurface in a transaction; a thread of ours copies it to the scanout so
+// WindowServer can start the next. The base only completes transactions and reports vblanks when signalled: the
+// head's vblank does that, or a 60 Hz timer while the head is unlit.
 #pragma once
 #include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOWorkLoop.h>
@@ -26,17 +23,16 @@ class DisplayPipe : public IOAccelDisplayPipe {
     IOAccelDisplayMachine *machine = nullptr;
     IOGraphicsAccelerator2 *accel = nullptr;
     uint32_t inactive = 0;  // ticks spent inactive
-    uint32_t screen = 0;    // Malachite's screen the pipe's framebuffer shows: its index (Accelerator::foundFramebuffer)
-    IOAccelDisplayPipeTransaction2 *copying = nullptr;  // the transaction whose frame is being copied
-    uint32_t fence = 0;                                 // and its copy's
-    // the frame the thread is presenting: its surface, kept until it is done, the call it makes, and its answer
+    uint32_t screen = 0;    // = pipe index
+    IOAccelDisplayPipeTransaction2 *copying = nullptr;
+    uint32_t fence = 0;  // copying's copy
     thread_call_t present_call = nullptr;
-    OSObject *presenting = nullptr;
+    OSObject *presenting = nullptr;  // surface held until the copy is done
     struct nvgpu_present request = {};
     volatile int present_busy = 0;
     IOReturn present_result = kIOReturnSuccess;
 
-    uint64_t last_head_vblank = 0;  // mach time of the head's last vblank, 0 before the first
+    uint64_t last_head_vblank = 0;  // mach time, 0 before the first
 
     static void present_run(thread_call_param_t self, thread_call_param_t);
     static void head_vblank(void *pipe);

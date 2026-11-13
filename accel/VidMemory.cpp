@@ -6,7 +6,7 @@ namespace malachite::accel {
 
 MalachiteDefineClass(VidMemory, IOAccelVidMemory)
 
-// the base allocates at page-in, which our resources don't do (Task allocates at the first mapping instead)
+// Task allocates at the first mapping, not at page-in as the base expects
 void VidMemory::free()
 {
     _RESERVEDIOAccelSysMemory2();
@@ -25,8 +25,7 @@ uint64_t VidMemory::getPhysicalSegment(unsigned long long offset, unsigned long 
     return vram + offset;
 }
 
-// An IOSurface's resource gets one of length 0 (it has no VRAM copy; the display reads the surface's own pages), and
-// wiring it - which every display transaction does for its planes - must still succeed.
+// An IOSurface's is length 0 (no VRAM copy), and every display transaction wires it, so that must succeed.
 uint64_t VidMemory::_RESERVEDIOAccelSysMemory1()
 {
     if (!getLength())

@@ -7,7 +7,7 @@
 
 #include <kern/clock.h>
 
-// IOSurface ships no kernel header; these are its exported accessors
+// IOSurface has no kernel header
 class IOSurface {
 public:
     IOMemoryDescriptor *getMemoryDescriptor() const;
@@ -24,8 +24,7 @@ MalachiteDefineClass(DisplayPipe, IOAccelDisplayPipe)
 
 static const uint32_t kFrameUS = 16667;
 
-// How WindowServer's frames are paced, for kern.malachite_power: where a transaction comes in between two vblanks, how
-// long it takes, and how long WindowServer thinks before the next
+// WindowServer's frame pacing, for kern.malachite_power
 static struct {
     uint64_t submits, gap_us[7], phase_us[5], busy_us, think_us, think_n;
     uint64_t last_submit, last_done;
@@ -104,7 +103,6 @@ void DisplayPipe::free()
     if (gGpu)
         gGpu->callPlatformFunction(NVGPU_FN_PIPE_VBL, true, nullptr, nullptr, (void *)(uintptr_t)screen, nullptr);
     if (present_call) {
-        // the thread's frame, if one is in flight, finishes first
         for (int i = 0; __atomic_load_n(&present_busy, __ATOMIC_ACQUIRE) && i < 4000; i++)
             IODelay(50);
         thread_call_cancel(present_call);
@@ -121,9 +119,8 @@ void DisplayPipe::free()
     IOAccelDisplayPipe::free();
 }
 
-// The framebuffer resource's memory, which a mode change asks for: the base gives none (concrete drivers map their
-// scanout), and a pipe without one never turns active. Ours only has to exist and prepare: frames reach Framebuffer's
-// scanout by the copy in submitTransaction, not through it.
+// A pipe without framebuffer memory never turns active, and the base gives none. Ours only has to exist: frames reach
+// the scanout by the copy in submitTransaction.
 uint64_t DisplayPipe::initFramebufferResource(unsigned int index, IOAccelResource2 *res)
 {
     if (Resource *r = OSDynamicCast(Resource, res))
@@ -134,13 +131,13 @@ uint64_t DisplayPipe::initFramebufferResource(unsigned int index, IOAccelResourc
     return mem;
 }
 
-// the base's active flag (IOAccelDisplayPipe::isActive): transactions are aborted while it's clear
+// IOAccelDisplayPipe::isActive; transactions are aborted while it's clear
 static bool pipe_active(const IOAccelDisplayPipe *p)
 {
     return *((const volatile uint8_t *)p + 0x298) != 0;
 }
 
-// the head's own vblank, which is when frames are flipped and a client's pacing should tick
+// frames flip on the head's vblank, so clients pace on it
 void DisplayPipe::head_vblank(void *pipe)
 {
     DisplayPipe *self = (DisplayPipe *)pipe;
@@ -151,16 +148,15 @@ void DisplayPipe::head_vblank(void *pipe)
 void DisplayPipe::vblank(OSObject *owner, IOTimerEventSource *sender)
 {
     DisplayPipe *self = (DisplayPipe *)owner;
-    // A display mode change makes a pipe active, and only does once the framebuffer has a mode to show, which Framebuffer
-    // gets from Malachite a minute after boot, behind the display machine's back: tell it again each second until
-    // the pipe takes transactions.
+    // Only a mode change makes a pipe active, and only once the framebuffer has a mode, which Framebuffer gets about a
+    // minute after boot without the display machine knowing: repeat it each second until then.
     if (!pipe_active(self) && self->machine && ++self->inactive % 60 == 0) {
         self->machine->display_mode_will_change(self->screen);
         self->machine->display_mode_did_change(self->screen);
         if (pipe_active(self))
             IOLog("DisplayPipe: active after a mode change\n");
     }
-    // the timer stands in for a head that isn't lit, and while the head's vblanks come it only checks on them
+    // stands in for an unlit head
     uint64_t ns;
     absolutetime_to_nanoseconds(mach_absolute_time() - self->last_head_vblank, &ns);
     if (!self->last_head_vblank || ns > 100000000)
@@ -168,7 +164,7 @@ void DisplayPipe::vblank(OSObject *owner, IOTimerEventSource *sender)
     sender->setTimeoutUS(kFrameUS);
 }
 
-// a float's bits as the head's LUT takes the value, 0x10000 standing for 1.0, clamped to 0..1
+// float bits to the LUT's fixed point, 0x10000 = 1.0, clamped to 0..1
 static uint32_t lut_value(uint32_t f)
 {
     int exp = (int)(f >> 23 & 0xff) - 127;
@@ -179,7 +175,7 @@ static uint32_t lut_value(uint32_t f)
     return ((f & 0x7fffff) | 0x800000) >> (7 - exp);
 }
 
-// CoreDisplay's table, any size, resampled to the head's output LUT
+// CoreDisplay's table is any size; resampled to the head's
 void DisplayPipe::set_gamma(const IOAccelDisplayPipeGammaTable2 *table)
 {
     unsigned n = table->getTableCount();
@@ -232,11 +228,11 @@ uint64_t DisplayPipe::submitTransaction(IOAccelDisplayPipeTransaction2 *t)
     if (s && logged++ < 4)
         IOLog("DisplayPipe: transaction: surface %#x %ux%u\n", s->getSurfaceID(), s->getWidth(), s->getHeight());
     if (!s || !gGpu)
-        return kIOReturnSuccess;  // nothing to show on the plane
-    // the previous frame is done by now: WindowServer waits for its transaction before the next one
+        return kIOReturnSuccess;
+    // normally done already: WindowServer waits for each transaction before the next
     for (int i = 0; __atomic_load_n(&present_busy, __ATOMIC_ACQUIRE) && i < 4000; i++)
         IODelay(50);
-    // one that is stuck is still using the request and the surface: this frame is dropped, not put under it
+    // a stuck one still uses the request and surface, so this frame is dropped
     if (__atomic_load_n(&present_busy, __ATOMIC_ACQUIRE))
         return kIOReturnSuccess;
     pace_submit(last_head_vblank);
@@ -259,7 +255,7 @@ void DisplayPipe::present_run(thread_call_param_t p0, thread_call_param_t)
               self->request.pitch, r);
     self->fence = self->request.fence;
     self->present_result = r;
-    // the copy lands within a fraction of a vblank, and the frame is done with when it has, not at the next vblank
+    // the copy takes a fraction of a frame; complete then, not at the next vblank
     for (int i = 0; r == kIOReturnSuccess && i < 250 &&
                     gGpu->callPlatformFunction(NVGPU_FN_FENCE, true, (void *)(uintptr_t)self->fence, nullptr, nullptr,
                                                 nullptr) == kIOReturnBusy;
@@ -272,7 +268,7 @@ void DisplayPipe::present_run(thread_call_param_t p0, thread_call_param_t)
     self->signalTransactionInterrupt(nullptr);
 }
 
-// asked again on every vblank until it says so, and on the thread's signal
+// polled on every vblank and on the present thread's signal
 uint64_t DisplayPipe::isTransactionComplete(IOAccelDisplayPipeTransaction2 *t)
 {
     if (t != copying)

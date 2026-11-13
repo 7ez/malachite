@@ -14,8 +14,7 @@ class IOAccelEventMachineFast2 : public IOAccelEventMachine2 {
     OSDeclareAbstractStructors(IOAccelEventMachineFast2)  // structors/metaclass glue: declared, linked to this macOS at load
 
 public:
-    // Fast2's own versions of IOAccelEventMachine2's virtuals (added by hand: kchdr lists only the new slots), all
-    // exported, so a subclass inherits Apple's event and stamp bookkeeping instead of writing its own
+    // Fast2's exported overrides, added by hand as kchdr lists only new slots
     uint64_t init(IOGraphicsAccelerator2*, unsigned int, int) override;
     uint64_t getClientTestEventFunc() override;
     uint64_t initEvent(IOAccelEvent*) override;

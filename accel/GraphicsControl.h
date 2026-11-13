@@ -1,10 +1,6 @@
-// The GPU's graphics device control (AGDC) object. WindowServer finds display pipes through IOPresentment, which
-// lists a GPU's framebuffers by asking its AppleGraphicsDeviceControl over a user client (vendor info, then the
-// framebuffer list) and pairs them with the IOAccelerator under the same PCI device. Without one, CoreDisplay sees
-// no pipe for Framebuffer and composites without the GPU. Like Apple's paravirtual GPU control it holds the PCI device's
-// framebuffer match category, which keeps IONDRVFramebuffer off the firmware's framebuffer (CoreDisplay can't open
-// that one, and aborts when an AGDC GPU has a framebuffer it can't open). The attributes answered are the ones
-// IOPresentment and AppleGPUWrangler ask for, with the paravirtual GPU's values where nothing says otherwise.
+// IOPresentment lists a GPU's framebuffers through its AGDC; without one CoreDisplay composites without the GPU.
+// Holding the framebuffer match category keeps IONDRVFramebuffer off the firmware framebuffer, which CoreDisplay
+// can't open and aborts over. Values follow Apple's paravirtual GPU where nothing says otherwise.
 #pragma once
 #include "AppleGraphicsDeviceControl.h"
 
@@ -14,7 +10,7 @@ class GraphicsControl : public AppleGraphicsDeviceControl {
     OSDeclareDefaultStructors(GraphicsControl)
 
     uint32_t unknown = 0;  // unsupported attributes logged
-    uint16_t device_id = 0;  // the GPU's PCI device ID, for the vendor info
+    uint16_t device_id = 0;  // PCI
 
 public:
     bool start(IOService *provider) override;

@@ -10,8 +10,7 @@ class IOAccelSysMemory : public IOAccelMemory {
     OSDeclareAbstractStructors(IOAccelSysMemory)  // structors/metaclass glue: declared, linked to this macOS at load
 
 public:
-    // IOAccelMemory pure getters that IOAccelSysMemory provides concretely (exported); re-declare non-pure so a
-    // subclass isn't abstract and inherits the real impls. (getLength/setTag/getTag are unexported -> subclass body.)
+    // exported, so subclasses inherit them; getLength/setTag/getTag aren't and need subclass bodies
     uint64_t getDirtySize() const override;
     uint64_t getResidentSize() const override;
     uint64_t getPhysicalSegment(unsigned long long, unsigned long long *) override;

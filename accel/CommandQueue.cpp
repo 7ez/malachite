@@ -7,8 +7,7 @@
 #include "Task.h"
 #include <IOKit/IOLib.h>
 
-// A failed command's line, but not every one: a task whose work is refused fails each draw and copy, and logging them
-// all (hundreds of thousands) costs WindowServer time of its own. The first few, then one in a thousand.
+// A refused task fails every command, and logging each costs WindowServer time: the first 20, then one in 1000.
 #include <stdarg.h>
 
 namespace malachite::accel {
@@ -31,18 +30,13 @@ static void failed_log(const char *fmt, ...)
 
 MalachiteDefineClass(CommandQueue, IOAccelCommandQueue)
 
-// The kernel's GPU time for the calling thread (xnu osfmk/i386 and arm64 machine_routines): Activity Monitor's GPU
-// Time and % GPU are task_gpu_utilisation and the coalition's gpu_time, which add these up. Weak, as it is not in
-// every kernel's KPI: without it nothing is charged. Off unless MALACHITE_GPU_STAT is defined: macOS 26 doesn't export
-// it, and kmutil won't link a kext with a weak import it can't tell is tested (OSKextSymbolIsResolved has no header
-// in the SDK), so the auxiliary collection failed to build and none of our kexts loaded.
+// Feeds Activity Monitor's GPU time. Off by default: macOS 26 doesn't export it, and kmutil won't link a kext with a
+// weak import it can't see tested, which fails the whole auxiliary collection.
 #ifdef MALACHITE_GPU_STAT
 extern "C" void ml_gpu_stat_update(uint64_t gpu_ns_delta) __attribute__((weak_import));
 #endif
 
-// The GPU time the task's work has used since its last command buffer, charged to the thread that submits the next
-// one: ml_gpu_stat_update can only bill the current thread, and a retire timer's is the kernel's. A task that
-// stops submitting leaves its last few milliseconds unbilled.
+// Charged at the next submit, as ml_gpu_stat_update bills only the current thread; a task's last few ms go unbilled.
 static void charge_gpu_time(uintptr_t ctx)
 {
 #ifdef MALACHITE_GPU_STAT
@@ -55,8 +49,7 @@ static void charge_gpu_time(uintptr_t ctx)
 #endif
 }
 
-// Empty segment resource list. IOAccelSegmentResourceList's init/prepare/complete are all exported and handle a
-// count-0 header; this only exists to be instantiable (the base is abstract).
+// only so the abstract base can be instantiated; its exported methods handle a count-0 header
 class SegmentResourceList : public IOAccelSegmentResourceList {
     OSDeclareDefaultStructors(SegmentResourceList)
 };
@@ -75,15 +68,13 @@ uint64_t CommandQueue::parseSegmentList(IOAccelShared2 *shared, IOAccelSegmentRe
     return (uint64_t)list;
 }
 
-// the GPU context of the task the queue's work is for: its address space, its channels
 static uintptr_t queue_ctx(const IOAccelCommandQueue *q)
 {
     Task *t = OSDynamicCast(Task, (OSObject *)q->getGPUTask());
     return t ? t->context() : 0;
 }
 
-// a record's payload of `size` bytes, copied out (the segment is memory the client can still write): false when
-// the segment doesn't hold the whole record, or the record doesn't hold the payload
+// copied out, as the client can still write the segment
 static bool record_payload(const IOAccelKernelCommand *cmd, const IOAccelKernelCommand *end, uint32_t len,
                            void *out, size_t size)
 {
@@ -121,7 +112,7 @@ uint64_t CommandQueue::processSegmentKernelCommand(IOAccelSegmentResourceList *r
         } else {
             failed_log("queue: no Gpu, copy skipped\n");
         }
-        return 0;  // handled; leave the queue error word clear so the segment continues
+        return 0;  // a clear error word lets the segment continue
     }
 
     if (h.opcode == MALACHITE_CMD_FILL_BUFFER) {
@@ -183,12 +174,10 @@ uint64_t CommandQueue::processSegmentKernelCommand(IOAccelSegmentResourceList *r
         return 0;
     }
 
-    // Not ours: let the base handle generic command types.
     return IOAccelCommandQueue::processSegmentKernelCommand(resList, cmd, end);
 }
 
-// IOAccelCommandQueue keeps its accelerator here, and the event its command buffers' completion follows: the base
-// copies it into each one's event fence once processCommandBuffer returns
+// +0x5c0 is the accelerator; +0x5c8 the event the base copies into each command buffer's fence afterwards
 static IOGraphicsAccelerator2 *queue_accel(IOAccelCommandQueue *q)
 {
     return *(IOGraphicsAccelerator2 **)((char *)q + 0x5c0);

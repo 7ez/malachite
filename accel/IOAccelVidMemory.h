@@ -14,13 +14,12 @@ class IOAccelVidMemory : public IOAccelMemory {
     OSDeclareAbstractStructors(IOAccelVidMemory)  // structors/metaclass glue: declared, linked to this macOS at load
 
 public:
-    // Exported IOAccelMemory getters provided concretely; re-declare non-pure to inherit (subclass bodies the
-    // unexported getLength/setTag/getTag/getPhysicalSegment and the VRAM hooks).
+    // exported, so subclasses inherit them; getLength/setTag/getTag/getPhysicalSegment and the VRAM hooks aren't
     uint64_t getDirtySize() const override;
     uint64_t getResidentSize() const override;
     uint64_t setPurgeable(unsigned int, unsigned int *) override;
     uint64_t matchForReuse(void *, unsigned long long) override;
-    void free() override;  // exported (slot 18), so a subclass can chain to it
+    void free() override;  // exported (slot 18)
 
     virtual uint64_t wire();
     virtual uint64_t unwire();
