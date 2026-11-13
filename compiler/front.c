@@ -1611,7 +1611,7 @@ static int is_fn(const char *name, const char *base)
     return 0;
 }
 
-static struct ir_val *mufu(int op, struct ir_val *x)
+static struct ir_val *mufu_op(int op, struct ir_val *x)
 {
     struct ir_val *v = op1(IR_MUFU, IR_F32, x);
     v->aux = op;
@@ -1705,6 +1705,24 @@ static struct ir_val *absf(struct ir_val *x)
 static struct ir_val *negf(struct ir_val *x)
 {
     return op1(IR_FNEG, IR_F32, x);
+}
+
+// MUFU flushes denormals in and out: where the arithmetic keeps them, scale them into the normal range around it
+static struct ir_val *mufu(int op, struct ir_val *x)
+{
+    if (!g_info->denorms || op == MUFU_SIN || op == MUFU_COS)
+        return mufu_op(op, x);
+    if (op == MUFU_EX2) {
+        struct ir_val *low = fcmp(FCMP_OLT, x, fconst(-126));
+        struct ir_val *r = mufu_op(op, sel(low, addf(x, fconst(24)), x));
+        return mulf(r, sel(low, fconst(0x1p-24f), fconst(1)));
+    }
+    struct ir_val *tiny = fcmp(FCMP_OLT, absf(x), fconst(0x1p-126f));
+    struct ir_val *r = mufu_op(op, sel(tiny, mulf(x, fconst(0x1p24f)), x));
+    if (op == MUFU_LG2)
+        return addf(r, sel(tiny, fconst(-24), fconst(0)));
+    float k = op == MUFU_RCP ? 0x1p24f : op == MUFU_RSQ ? 0x1p12f : 0x1p-12f;
+    return mulf(r, sel(tiny, fconst(k), fconst(1)));
 }
 
 static struct ir_val *fbits(enum ir_op op, struct ir_val *x, uint32_t mask)
@@ -5808,7 +5826,7 @@ static void fdiv(LLVMValueRef in, unsigned n)
 static struct ir_val *udivmod(struct ir_val *n, struct ir_val *d, int rem)
 {
     struct ir_val *rcp = op1(IR_F2I, IR_I32,
-                             op2(IR_FMUL, IR_F32, mufu(MUFU_RCP, op1(IR_I2F, IR_F32, d)), fconst(4294966784.0f)));
+                             op2(IR_FMUL, IR_F32, mufu_op(MUFU_RCP, op1(IR_I2F, IR_F32, d)), fconst(4294966784.0f)));
     struct ir_val *neg = op2(IR_MUL, IR_I32, rcp, op2(IR_SUB, IR_I32, konst(IR_I32, 0), d));
     rcp = op2(IR_ADD, IR_I32, rcp, op2(IR_MULHI, IR_I32, rcp, neg));
     struct ir_val *q = op2(IR_MULHI, IR_I32, n, rcp);
