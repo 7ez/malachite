@@ -195,9 +195,19 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    // the folder of <fwdir> with this GPU family's bootloader and booters, if it isn't <fwdir> itself
+    char famdir[1024];
+    snprintf(famdir, sizeof(famdir), "%s", argv[1]);
+    CFTypeRef dir = IORegistryEntryCreateCFProperty(svc, CFSTR("MalachiteFirmwareDir"), kCFAllocatorDefault, 0);
+    if (dir) {
+        char sub[64];
+        if (CFStringGetCString(dir, sub, sizeof(sub), kCFStringEncodingUTF8))
+            snprintf(famdir, sizeof(famdir), "%s/%s", argv[1], sub);
+        CFRelease(dir);
+    }
     static const char *const names[] = MALACHITE_FW_NAMES;
     for (int i = 0; i < MALACHITE_FW_COUNT; i++)
-        if (load(conn, argv[1], i, names[i]))
+        if (load(conn, i == MALACHITE_FW_GSP ? argv[1] : famdir, i, names[i]))
             return 1;
 
     static const struct { const char *name; uint32_t selector; } cmds[] = {

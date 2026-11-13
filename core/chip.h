@@ -12,6 +12,7 @@ struct chip {
     uint32_t disp, core, wndw, wimm, curs;  // display root, core channel, window, window immediate, cursor
     uint32_t max_shared;  // bytes of shared memory one CTA may take
     const char *fwsig;    // the GSP-RM ELF's signature section for the chip
+    const char *fwdir;    // folder in 570/ with the family's bootloader and booters, NULL for GA10x's beside gsp.bin
     const char *missing;  // what the driver lacks for the family, NULL once it drives it
 };
 

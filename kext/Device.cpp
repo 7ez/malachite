@@ -1453,6 +1453,8 @@ void Gpu::autostart(thread_call_param_t p0, thread_call_param_t)
 {
     Gpu *self = (Gpu *)p0;
     static const char *const names[] = MALACHITE_FW_NAMES;
+    static const char base[] = "/Library/Application Support/Malachite/570";
+    const char *dir = self->gpu.chip->fwdir;
     IOBufferMemoryDescriptor *fw[MALACHITE_FW_COUNT] = {};
     for (int tries = 0; tries < 600; tries++) {  // the root volume comes up some seconds into boot
         // looking a path up before the root is mounted panics in namei
@@ -1465,7 +1467,11 @@ void Gpu::autostart(thread_call_param_t p0, thread_call_param_t)
         int have = 0;
         for (int i = 0; i < MALACHITE_FW_COUNT; i++) {
             char path[128];
-            snprintf(path, sizeof(path), "/Library/Application Support/Malachite/570/%s", names[i]);
+            // gsp.bin is the same for every family
+            if (dir && i != MALACHITE_FW_GSP)
+                snprintf(path, sizeof(path), "%s/%s/%s", base, dir, names[i]);
+            else
+                snprintf(path, sizeof(path), "%s/%s", base, names[i]);
             if (!fw[i])
                 fw[i] = read_file(path);
             have += fw[i] != nullptr;
@@ -1475,7 +1481,7 @@ void Gpu::autostart(thread_call_param_t p0, thread_call_param_t)
         IOSleep(1000);
     }
     if (!fw[0] || !fw[1] || !fw[2] || !fw[3]) {
-        log_msg("Malachite: no firmware in /Library/Application Support/Malachite/570, waiting for malachitectl\n");
+        log_msg("Malachite: no firmware in %s%s%s, waiting for malachitectl\n", base, dir ? "/" : "", dir ? dir : "");
         for (int i = 0; i < MALACHITE_FW_COUNT; i++)
             OSSafeReleaseNULL(fw[i]);
         return;
@@ -1701,6 +1707,8 @@ bool Gpu::start(IOService *provider)
         OSSafeReleaseNULL(bar0);
         return false;
     }
+    if (gpu.chip->fwdir)
+        setProperty("MalachiteFirmwareDir", gpu.chip->fwdir);
     // what System Information and apps read the GPU's memory from, on the PCI device as other GPUs' drivers put it
     // (without it: 16 MB, the boot framebuffer's); the usable size the VBIOS left, in MB
     if (uint64_t mb = rd32(&gpu, 0x1183a4)) {

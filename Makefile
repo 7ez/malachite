@@ -57,7 +57,7 @@ build/malachitectl: ctl/malachitectl.c kext/abi.h
 FWDIR := /Library/Application Support/Malachite/570
 install-fw:
 	sudo mkdir -p "$(FWDIR)"
-	sudo cp fw/570/*.bin "$(FWDIR)/"
+	sudo cp -R fw/570/ "$(FWDIR)/"
 
 install: install-fw build/malachitectl
 	sudo mkdir -p /usr/local/bin
