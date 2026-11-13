@@ -2983,8 +2983,9 @@ static struct ir_val *ibits(const char *name, LLVMValueRef call, unsigned lane, 
 
 static struct ir_val *imath(const char *name, LLVMValueRef call, unsigned lane)
 {
-    int is_signed = strstr(name, ".s.") || !strncmp(name, "llvm.s", 6) || !strncmp(name, "air.abs.", 8) ||
-                    is_fn(name, "abs");
+    int abs = is_fn(name, "abs");
+    // an unsigned abs (air.abs.u, OpenCL's) is the value itself
+    int is_signed = strstr(name, ".s.") || !strncmp(name, "llvm.s", 6) || (abs && !strstr(name, ".u."));
     unsigned bits = 8 * scalar_bytes(lane_type(LLVMTypeOf(call), lane));
     struct ir_val *a = int_extend(get(LLVMGetOperand(call, 0), lane), bits, is_signed);
     struct ir_val *b = LLVMGetNumOperands(call) > 2 ? int_extend(get(LLVMGetOperand(call, 1), lane), bits, is_signed)
@@ -2994,7 +2995,9 @@ static struct ir_val *imath(const char *name, LLVMValueRef call, unsigned lane)
         r = op2(IR_MAX, IR_I32, a, b);
     else if (!strncmp(name, "air.min.", 8) || is_fn(name, "smin") || is_fn(name, "umin"))
         r = op2(IR_MIN, IR_I32, a, b);
-    else if (!strncmp(name, "air.abs.", 8) || is_fn(name, "abs"))  // max(x, -x)
+    else if (abs && !is_signed)
+        return a;
+    else if (abs)  // max(x, -x)
         r = op2(IR_MAX, IR_I32, a, op2(IR_SUB, IR_I32, konst(IR_I32, 0), a));
     else if (!strncmp(name, "air.clamp.", 10)) {  // min(max(x, lo), hi)
         struct ir_val *hi = int_extend(get(LLVMGetOperand(call, 2), lane), bits, is_signed);
@@ -3245,7 +3248,7 @@ static struct pair64 signed_limit(struct ir_val *sign_word)
 // lane `lane`, where the operands' high words are known; 0 if not
 static int imath64(const char *name, LLVMValueRef call, unsigned lane)
 {
-    int is_signed = strstr(name, ".s.") || !strncmp(name, "air.abs.", 8) || is_fn(name, "abs");
+    int is_signed = strstr(name, ".s.") || !strncmp(name, "llvm.s", 6) || (is_fn(name, "abs") && !strstr(name, ".u."));
     struct pair64 x, y = { 0 }, z = { 0 }, r;
     unsigned nargs = LLVMGetNumOperands(call) - 1;
     if (!pair_at(LLVMGetOperand(call, 0), lane, &x))
