@@ -965,9 +965,13 @@ class Gpu : public IOService
             clean = clean && c->l2_seq && c->l2_begun == cached_begins;
             c->l2_begun = ++cached_begins;
         }
-        // the wait, the L2 operations and the release
-        if (clean || !compute_bridge_init(c) || c->copy_faulted || ce_room(c, 0x300) != kIOReturnSuccess)
+        if (clean)
             return;
+        // the wait, the L2 operations and the release; failing to queue them leaves L2 as dirty as it was
+        if (!compute_bridge_init(c) || c->copy_faulted || ce_room(c, 0x300) != kIOReturnSuccess) {
+            c->l2_seq = 0;
+            return;
+        }
         kick_draws(c);
         // the copy channel runs in order, so only the graphics channel needs waiting for
         if (c->draw_pending && c->draw_pending != c->ce_last && (int32_t)(*c->compute_sem - c->draw_pending) < 0)
@@ -3315,6 +3319,7 @@ void Gpu::recover(gpu_ctx *c)
             *c->compute_sem = c->compute_seq;
             c->ce_pending = c->ce_last = c->draw_pending = 0;
         }
+        c->l2_seq = 0;  // a lost write-back or invalidate counts as done
         memset(c->ce_half_seq, 0, sizeof(c->ce_half_seq));
         c->ce_half = 0;
         vmm_flush(&gpu);
