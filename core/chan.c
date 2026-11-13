@@ -17,6 +17,11 @@
 #define PAGE 0x1000ull
 #define CHAN_BUF (GPFIFO_BYTES + PUSH_SIZE)
 
+#define CE_GET_CE_PCE_MASK 0x20802a02  // NV2080_CTRL_CMD_CE_GET_CE_PCE_MASK
+struct pce_mask {
+    uint32_t engine, mask;
+};
+
 int chan_find_engine(struct gsp *s, const struct rm_client *c, uint32_t want, uint32_t *engine, uint32_t *runlist)
 {
     NV2080_CTRL_FIFO_GET_DEVICE_INFO_TABLE_PARAMS *req = mem_alloc(sizeof(*req));
@@ -31,16 +36,36 @@ int chan_find_engine(struct gsp *s, const struct rm_client *c, uint32_t want, ui
         if (t->entries[i].engineData[ENGINE_INFO_TYPE_RM_ENGINE_TYPE] == RM_ENGINE_TYPE_GR0)
             gr_runlist = t->entries[i].engineData[ENGINE_INFO_TYPE_RUNLIST];
 
+    uint32_t ce[10], ce_runlist[10], n = 0;
     for (uint32_t i = 0; i < t->numEntries; i++) {
         uint32_t type = t->entries[i].engineData[ENGINE_INFO_TYPE_RM_ENGINE_TYPE];
         uint32_t rl = t->entries[i].engineData[ENGINE_INFO_TYPE_RUNLIST];
-        int is_ce = type >= RM_ENGINE_TYPE_COPY0 && type < RM_ENGINE_TYPE_COPY0 + 10;
-        // copy engines sharing the graphics runlist don't run as async copy engines
-        if ((want == CHAN_COPY && is_ce && rl != gr_runlist) || (want == CHAN_GRAPHICS && type == RM_ENGINE_TYPE_GR0)) {
+        if (want == CHAN_GRAPHICS && type == RM_ENGINE_TYPE_GR0) {
             *engine = type;
             *runlist = rl;
             return 0;
         }
+        // copy engines sharing the graphics runlist don't run as async copy engines
+        if (want == CHAN_COPY && type - RM_ENGINE_TYPE_COPY0 < 10 && rl != gr_runlist && n < 10) {
+            ce[n] = type;
+            ce_runlist[n++] = rl;
+        }
+    }
+    // GSP-RM lists logical copy engines it gave no physical ones (their work never runs), and which those are
+    // differs between chips: the first with some, else the first
+    uint32_t pick = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        struct pce_mask q = { ce[i], 0 };
+        const struct pce_mask *m = rm_control(s, c->client, c->subdevice, CE_GET_CE_PCE_MASK, &q, sizeof(q));
+        if (!m || m->mask) {
+            pick = i;
+            break;
+        }
+    }
+    if (n) {
+        *engine = ce[pick];
+        *runlist = ce_runlist[pick];
+        return 0;
     }
     log_msg("chan: no %s engine\n", want == CHAN_COPY ? "async copy" : "graphics");
     return -1;
