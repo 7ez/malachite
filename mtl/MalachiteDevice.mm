@@ -1709,11 +1709,8 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
                                bytes + z * image, stride, in);
         return;
     }
-    // A texture in VRAM: the region alone, through a buffer the GPU copies it to or from. A private buffer can still
-    // have pages the CPU maps, which the GPU never reads (GL's textures written there were sampled as zeros). Taking
-    // the whole surface and putting it back undid the tiles other threads uploaded meanwhile. It also wrote a render
-    // target before its first use gave the memory a compressed kind, which then read those bytes as garbage; the blit
-    // asks for the kind before it copies.
+    // Through the GPU, as the GPU never reads a private buffer's CPU pages (GL textures sampled as zeros). Only the
+    // region: a whole-surface round trip undid other threads' uploads and wrote targets before their compressed kind.
     NSUInteger row = w * (malachite_aspect(self, MTLBlitOptionNone) == MALACHITE_ASPECT_STENCIL ? 1 : s.bpp);
     NSUInteger size = row * h;
     id<MTLBuffer> staging = [backing.device newBufferWithLength:MAX(size * region.size.depth, 1u)
@@ -1792,11 +1789,9 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
 - (void)setOffset:(NSUInteger)offset;
 @end
 
-// An argument buffer's layout, the way airc reads the struct: members in index order at their natural alignment,
-// textures and samplers (their gpuResourceIDs) and buffers (their addresses) 8 bytes each, arrays element after
-// element. Every index an encoder sets goes to one of these.
+// as airc reads the struct: index order, natural alignment, resources 8 bytes each
 struct malachite_arg {
-    NSUInteger index, count;  // the first index, how many (an array's elements)
+    NSUInteger index, count;
     NSUInteger offset, stride;
     MTLDataType type;  // of an element
 };
@@ -1808,7 +1803,6 @@ struct malachite_arg {
 }
 @end
 
-// a member's size and alignment in the struct
 static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
 {
     switch (t) {
@@ -1821,7 +1815,7 @@ static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
     case MTLDataTypeFloat3: case MTLDataTypeFloat4: case MTLDataTypeInt3: case MTLDataTypeInt4: case MTLDataTypeUInt3:
     case MTLDataTypeUInt4: *align = 16; return 16;
     case MTLDataTypeFloat4x4: *align = 16; return 64;
-    default: *align = 8; return 8;  // a texture, sampler or buffer: an ID or address
+    default: *align = 8; return 8;  // an ID or address
     }
 }
 
@@ -1869,11 +1863,9 @@ static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
 }
 @end
 
-// Writes resources into an argument buffer as its layout says: a texture's or sampler's gpuResourceID, a buffer's
-// address, constants in place.
 @interface MalachiteArgumentEncoder : NSObject <MTLArgumentEncoder> {
     MalachiteArgumentLayout *_layout;
-    uint8_t *_at;  // the bound argument buffer's bytes at its offset
+    uint8_t *_at;
 }
 @property (readonly) id<MTLDevice> device;
 @property (copy, atomic) NSString *label;
@@ -1911,7 +1903,6 @@ static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
     [self setArgumentBuffer:buffer offset:offset + element * _layout->_length];
 }
 
-// where argument `index` goes, NULL for one the layout lacks
 - (uint8_t *)slot:(NSUInteger)index
 {
     for (NSUInteger i = 0; i < _layout->_nargs && _at; i++) {
@@ -1975,7 +1966,7 @@ static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
     return nil;
 }
 
-// what an argument buffer can hold that we don't make: left as they are
+// objects we don't encode are left as they are
 - (void)setRenderPipelineState:(id)pipeline atIndex:(NSUInteger)index
 {
 }
@@ -2029,7 +2020,6 @@ static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
 }
 @end
 
-// Sampler base (private). initWithDevice:samplerDescriptor: is real; we keep the descriptor's filtering.
 @interface _MTLSamplerState : NSObject
 - (instancetype)initWithDevice:(id)device samplerDescriptor:(id)descriptor;
 @end
@@ -2040,7 +2030,7 @@ static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
 }
 @end
 @implementation MalachiteSamplerState
-// what an argument buffer holds for the sampler: its descriptor heap entry, as a handle's sampler bits
+// the heap entry in a handle's sampler bits
 - (MTLResourceID)gpuResourceID
 {
     uint32_t samp[8];
@@ -2050,7 +2040,6 @@ static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
 }
 @end
 
-// Depth/stencil state base (private); we keep the descriptor in the 3D class's values.
 @interface _MTLDepthStencilState : NSObject
 - (instancetype)initWithDevice:(id)device depthStencilDescriptor:(id)descriptor;
 @end
@@ -2064,7 +2053,7 @@ static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
 }
 @end
 @implementation MalachiteDepthStencilState
-// the object's address, as the base sampler state answers
+// the address, as the base sampler state answers
 - (uint64_t)uniqueIdentifier
 {
     return (uint64_t)(__bridge void *)self;
@@ -2076,10 +2065,7 @@ static NSUInteger malachite_arg_size(MTLDataType t, NSUInteger *align)
 }
 @end
 
-// Build a TIC from a bound texture's buffer backing and its descriptor. A 1D texture is a 2D one a row high, a 1D
-// array one row per layer (airc samples them that way). An image's view of one level of one layer (or of a 3D
-// texture) is that surface on its own, as surface stores don't look at the view's levels; any other is the whole
-// image with the levels it sees.
+// A single-level, single-layer view is its surface alone, as surface stores ignore the view's levels.
 static int malachite_fill_texture_header(uint32_t out[8], id texture, id cb)
 {
     MalachiteTexture *t = (MalachiteTexture *)texture;
@@ -2139,9 +2125,7 @@ static int malachite_fill_texture_header(uint32_t out[8], id texture, id cb)
     return 0;
 }
 
-// A function's buffer arguments go to const bank 0 at the offsets airc gave them: params + (cbuf_off - 0x160), and
-// so does the address of its constant data, after its code at code.
-// The size can come out past capacity bytes (a draw's 20 buffers), which aren't written: the caller refuses it.
+// The constant data lies after the code. A size past capacity (a draw's 20 buffers) isn't written; the caller refuses it.
 static uint32_t malachite_fill_params(const struct nvk_header *h, const uint64_t buffers[31], uint64_t code,
                                   uint8_t *params, uint32_t capacity)
 {
@@ -2160,9 +2144,7 @@ static uint32_t malachite_fill_params(const struct nvk_header *h, const uint64_t
     return size;
 }
 
-// setBytes: the bytes go after the command buffer's earlier ones in a block of its own, and the block goes back for
-// another command buffer once this one is done. A buffer per call would cost a kernel resource, a GPU mapping and an
-// unmap (which waits for every draw in flight).
+// A buffer per setBytes: would cost a kernel resource, a mapping and an unmap that waits for every draw in flight.
 @interface MalachiteUploads : NSObject {
 @public
     NSMutableArray<id<MTLBuffer>> *_blocks;
@@ -2225,7 +2207,7 @@ static id<MTLBuffer> malachite_upload(id commandBuffer, const void *bytes, NSUIn
     return buf;
 }
 
-// what a slot with no sampler bound reads with: nearest, clamped to the edge, pixel coordinates
+// for a slot with no sampler bound
 static struct samp_desc malachite_default_sampler(void)
 {
     return (struct samp_desc){ .address = { TEX_CLAMP_TO_EDGE, TEX_CLAMP_TO_EDGE, TEX_CLAMP_TO_EDGE } };
@@ -2238,13 +2220,13 @@ static float malachite_half(uint16_t bits)
     return h;
 }
 
-// an LOD clamp as the sampler's 4.8 fixed point
+// 4.8 fixed point
 static uint16_t malachite_lod(float lod)
 {
     return lod <= 0 ? 0 : lod >= 15.99f ? 0xfff : (uint16_t)(lod * 256);
 }
 
-// The sampler with an encoder's LOD clamps in place of its own: one made per pair of clamps, kept with the sampler.
+// an encoder's LOD clamps make a sampler per pair, kept with the original
 static char malachite_clamped_key;
 
 static id malachite_clamped(MalachiteSamplerState *sampler, float lodMin, float lodMax)
@@ -2278,11 +2260,7 @@ static id malachite_clamped(MalachiteSamplerState *sampler, float lodMin, float 
     }
 }
 
-// A constexpr sampler's packed state: the s, t and r address modes in bits 0-2, 3-5 and 6-8 (0 clamp to the border
-// colour, 1 clamp to edge, 2 repeat, 3 mirrored repeat, 4 mirror clamp to edge); mag and min linear in bits 9 and
-// 11, the mip filter in 13-14 (MTLSamplerMipFilter), pixel coordinates in 15, the compare function in 16-19
-// (compare_func's order, 8 for none), max anisotropy - 1 in 20-23, the LOD clamps as halves in 24-39 and 40-55, the
-// border colour in 56-57 (MTLSamplerBorderColor).
+// AIR's packed constexpr sampler; its compare function is in compare_func's order, 8 for none
 static struct samp_desc malachite_const_sampler(uint64_t bits)
 {
     static const enum tex_address address[] = { TEX_BORDER, TEX_CLAMP_TO_EDGE, TEX_WRAP, TEX_MIRROR,
@@ -2294,7 +2272,7 @@ static struct samp_desc malachite_const_sampler(uint64_t bits)
     s.min_linear = bits >> 11 & 1;
     s.mip = (enum tex_mip)(bits >> 13 & 3);
     s.normalized = !(bits >> 15 & 1);
-    // never, less, less_equal, greater, greater_equal, equal, not_equal, always, as MTLCompareFunction
+    // compare_func's order to MTLCompareFunction's
     static const uint8_t compare_fn[8] = { 0, 1, 3, 4, 6, 2, 5, 7 };
     unsigned compare = bits >> 16 & 15;
     s.compare = compare < 8 ? compare_fn[compare] + 1 : 0;
@@ -2305,9 +2283,7 @@ static struct samp_desc malachite_const_sampler(uint64_t bits)
     return s;
 }
 
-// A sampler as the function samples with it: a depth compare's has DEPTH_COMPARE set, with never as its function
-// when it has none (Metal's default, under which no compare passes), and a plain sample's has it clear, as the
-// texture unit wants each; a slot both kinds use keeps the compare.
+// The texture unit wants DEPTH_COMPARE set only for compares, never being Metal's default; a slot used both ways keeps it.
 static struct samp_desc malachite_compare_as_used(const struct nvk_header *h, unsigned slot, struct samp_desc s)
 {
     if (h->compare_samplers >> slot & 1) {
@@ -2325,10 +2301,7 @@ static struct samp_desc malachite_compare_as_used(const struct nvk_header *h, un
     return s;
 }
 
-// The bound textures and samplers as pool descriptors, slot for slot, plus the function's constexpr samplers in
-// the slots airc gave them. -1 on a pixel format we can't describe.
-// What a shader's unbound texture slot reads: Metal leaves it undefined, but a stale or zero header points the
-// texture unit at memory that's no longer mapped, which takes the channel down. One 1x1 texture, kept for good.
+// Metal leaves unbound slots undefined, but a stale or zero header reads unmapped memory and takes the channel down.
 static id malachite_unbound_texture(id<MTLDevice> device)
 {
     static id texture;
@@ -2343,7 +2316,7 @@ static id malachite_unbound_texture(id<MTLDevice> device)
     return texture;
 }
 
-// What the attributes a pipeline can't fetch read: a stream of zeros
+// for attributes a pipeline can't fetch
 static id<MTLBuffer> malachite_zero_buffer(id<MTLDevice> device)
 {
     static id<MTLBuffer> buffer;
@@ -2354,11 +2327,9 @@ static id<MTLBuffer> malachite_zero_buffer(id<MTLDevice> device)
     return buffer;
 }
 
-// A depth texture's memory takes its PTE kind (the generic one included: buffers are made pitch) when it's first a
-// depth target: until then the texture unit faults reading it as that format (UNSUPPORTED_KIND, or an MMU fault at
-// 0x200000 for a ZF32 one uploaded by a blit). So the first time such a texture is read or written otherwise, a
-// pass that draws nothing makes it a depth target first, once for its memory.
-static char malachite_kind_key;  // on a depth texture's memory once it has its kind
+// Depth memory gets its PTE kind only as a depth target, and the texture unit faults on it before (UNSUPPORTED_KIND,
+// or an MMU fault at 0x200000 for a blitted ZF32), so an empty pass targets it before any other use.
+static char malachite_kind_key;
 
 static void malachite_compress_colour(id cb, MalachiteBuffer *b)
 {
@@ -2393,9 +2364,7 @@ static void malachite_depth_kind(id cb, MalachiteTexture *t)
     malachite_record(cb, MALACHITE_CMD_DRAW, &d, sizeof(d));
 }
 
-// A stage's textures and samplers in the pools' 16 slots, from its bindings by Metal index: one bound past them (MPS
-// binds its sources at 64) is in the slot the compiler gave it, its cbuf_off. Only an app's encoder's tables go
-// past 16.
+// Bindings past the pools' 16 slots (MPS binds sources at 64) go to the slot airc gave them in cbuf_off.
 static void malachite_slots(const struct nvk_header *h, __unsafe_unretained const id *textures,
                             __unsafe_unretained const id *samplers, __unsafe_unretained id *slot_tex,
                             __unsafe_unretained id *slot_samp)
@@ -2424,8 +2393,7 @@ static int malachite_fill_pools(__unsafe_unretained id cb, const struct nvk_head
         if (slot >= NVGPU_MAX_TEXTURES)
             continue;
         if (h->args[i].kind == NVK_ARG_TEXTURE && !textures[slot]) {
-            // left all zero, which no header is: the heap gives it entry 0, the unbound texture's, which
-            // is_null_texture() checks for
+            // all zero, which no header is, so the heap gives it entry 0 for is_null_texture()
             memset(headers[slot], 0, 32);
             if (slot + 1 > *nheaders)
                 *nheaders = slot + 1;
@@ -2455,7 +2423,7 @@ static int malachite_fill_pools(__unsafe_unretained id cb, const struct nvk_head
                 *nsamplers = i + 1;
         }
     }
-    if (*nsamplers == 0 && *nheaders) {  // a read uses sampler slot 0; give the pool a valid default there
+    if (*nsamplers == 0 && *nheaders) {  // a read uses sampler slot 0
         struct samp_desc def = malachite_default_sampler();
         tex_fill_sampler(samps[0], &def);
         *nsamplers = 1;
@@ -2470,10 +2438,8 @@ static int malachite_fill_pools(__unsafe_unretained id cb, const struct nvk_head
     return 0;
 }
 
-// The process's descriptor heap: the texture headers and samplers every launch's pools are, which shaders name by
-// index. A sampler takes an entry per distinct state, for good. A texture an argument buffer names (by its
-// gpuResourceID) has an entry of its own for its life, among the first MALACHITE_HEAP_KEPT; a launch's bound textures
-// take entries from blocks of the rest, which a command buffer takes as it needs them and gives back once done.
+// One heap per process. Samplers take an entry per distinct state for good; textures with a gpuResourceID keep one
+// of the first MALACHITE_HEAP_KEPT; bound textures use blocks a command buffer gives back when done.
 enum {
     MALACHITE_HEAP_HEADERS = 1 << 17,
     MALACHITE_HEAP_KEPT = 1 << 14,
@@ -2486,7 +2452,7 @@ static struct {
     os_unfair_lock lock;
     id<MTLBuffer> headers, samplers;
     uint32_t nsamplers;
-    uint8_t kept[MALACHITE_HEAP_KEPT / 8];  // which of the kept entries are taken (entry 0 never is)
+    uint8_t kept[MALACHITE_HEAP_KEPT / 8];
     uint16_t free_blocks[MALACHITE_HEAP_BLOCKS];
     uint32_t nfree;
 } malachite_heap;
@@ -2504,7 +2470,6 @@ static void malachite_heap_init(id<MTLDevice> device)
     });
 }
 
-// a kept header entry, 0 when they're all taken
 static uint32_t malachite_heap_keep(void)
 {
     uint32_t e = 0;
@@ -2530,7 +2495,6 @@ static uint32_t *malachite_heap_header(uint32_t e)
     return (uint32_t *)malachite_heap.headers.contents + 8 * e;
 }
 
-// the sampler entry for a sampler state, the same one for the same state; 0 when the heap is full
 static uint32_t malachite_heap_sampler(const uint32_t samp[8])
 {
     uint32_t (*s)[8] = (uint32_t (*)[8])malachite_heap.samplers.contents, e = 0;
@@ -2548,7 +2512,6 @@ static uint32_t malachite_heap_sampler(const uint32_t samp[8])
     return e;
 }
 
-// a command buffer's header blocks, given back when it completes
 @interface MalachiteHeapBlocks : NSObject {
 @public
     uint16_t _blocks[MALACHITE_HEAP_BLOCKS];
@@ -2559,7 +2522,6 @@ static uint32_t malachite_heap_sampler(const uint32_t samp[8])
 @implementation MalachiteHeapBlocks
 @end
 
-// n consecutive header entries for one launch of cb's; 0 when the heap has none left
 static uint32_t malachite_heap_take(__unsafe_unretained id cb, uint32_t n)
 {
     __unsafe_unretained MalachiteHeapBlocks *b = ((MalachiteCommandBuffer *)cb)->_heap_blocks;
@@ -2591,8 +2553,6 @@ static uint32_t malachite_heap_take(__unsafe_unretained id cb, uint32_t n)
     return e;
 }
 
-// A launch's pools as the heap: its slots' headers copied into entries of cb's, its samplers' entries found, and
-// the indices where its shaders read them. -1 when the heap is full.
 static int malachite_heap_commit(id cb, unsigned int headers[][8], unsigned nheaders, unsigned int samps[][8],
                              unsigned nsamplers, struct nvgpu_heap *h)
 {
@@ -2616,10 +2576,8 @@ static int malachite_heap_commit(id cb, unsigned int headers[][8], unsigned nhea
     return 0;
 }
 
-// A texture a kernel writes at levels that may be past the first gets a run of header entries, one a level, each a
-// view of that level alone, and its handle names the run's start: the shader adds the level to it, as SUST addresses
-// what a header describes and not a level of it. Layered images keep their one header, as a view of a layer's levels
-// doesn't stride between layers as the whole does.
+// SUST ignores a header's levels, so the shader adds the level to a run of single-level headers. Layered images keep
+// one header, as a single-level view doesn't stride between layers.
 static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_unretained const id *textures,
                                 struct nvgpu_heap *heap)
 {
@@ -2634,30 +2592,30 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
         for (uint32_t l = 0; l < t->_levels; l++) {
             id view = [t newTextureViewWithPixelFormat:t->_format textureType:t->_type levels:NSMakeRange(l, 1)
                                                 slices:NSMakeRange(0, t->_layers)];
-            malachite_keep(cb, view);  // which keeps it alive
+            malachite_keep(cb, view);
             malachite_fill_texture_header(malachite_heap_header(e + l), view, cb);
         }
         heap->handles[i] = e;
     }
 }
 
-// Compute encoder base (private). Like the blit base, its encode methods are stubs, so never call super for them.
+// encode methods are stubs, as on the blit base
 @interface MTLIOAccelComputeCommandEncoder : NSObject
 - (instancetype)initWithCommandBuffer:(id)cb;
 @end
 
-#define MALACHITE_BINDINGS 128  // the texture and sampler indices a Metal stage binds
+#define MALACHITE_BINDINGS 128
 
 @interface MalachiteComputeCommandEncoder : MTLIOAccelComputeCommandEncoder <MTLComputeCommandEncoder> {
     __unsafe_unretained id _cb;
     MalachiteComputePipelineState *_pipeline;
-    uint64_t _buffers[31];  // GPU VA (+offset) bound at each [[buffer(n)]] slot
-    __unsafe_unretained id _bound[31];  // and the buffer, for setBufferOffset
-    // by Metal index, which goes to 127; malachite_dispatch puts them in the pools' 16 slots
+    uint64_t _buffers[31];
+    __unsafe_unretained id _bound[31];  // for setBufferOffset
+    // by Metal index; malachite_dispatch puts them in the pools' 16 slots
     __unsafe_unretained id _textures[MALACHITE_BINDINGS];
     __unsafe_unretained id _samplers[MALACHITE_BINDINGS];
-    uint32_t _threadgroup[31];  // each [[threadgroup(n)]] argument's bytes
-    uint64_t _region;  // the stage-in region's GPU VA, laid out as MTLStageInRegionIndirectArguments; 0 for none set
+    uint32_t _threadgroup[31];
+    uint64_t _region;  // as MTLStageInRegionIndirectArguments; 0 for none set
 }
 @end
 
@@ -2670,7 +2628,7 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
     return self;
 }
 
-// as on the blit encoder: dispatches already run in order, each after the work before it is done
+// dispatches already run in order, each after the work before it
 - (void)updateFence:(id)fence
 {
 }
@@ -2720,7 +2678,7 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
         [self setBuffer:buffers[i] offset:offsets[i] atIndex:range.location + i];
 }
 
-// the strides are compiled into a stage-in kernel, which refuses a layout whose stride is dynamic
+// strides are compiled into stage-in kernels, which refuse dynamic ones
 - (void)setBuffer:(id)buffer offset:(NSUInteger)offset attributeStride:(NSUInteger)stride atIndex:(NSUInteger)index
 {
     [self setBuffer:buffer offset:offset atIndex:index];
@@ -2767,7 +2725,6 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
         [self setSamplerState:samplers[i] atIndex:range.location + i];
 }
 
-// resources the kernel reaches through pointers in other buffers (argument buffers): kept like bound ones
 - (void)useResource:(id)resource usage:(MTLResourceUsage)usage
 {
     malachite_keep(_cb, resource);
