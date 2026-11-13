@@ -22,8 +22,7 @@ typedef struct NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS {
     NvU32 currPstate;
 } NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS;
 
-// bGpuIsIdle caps the GPU to its lowest P-state and GPCCLK, false releases the cap; the busy and idle times are the
-// KMD's utilisation since the last call
+// bGpuIsIdle caps the GPU to its lowest P-state and GPCCLK, false lifts it; busy/idle times are since the last call
 #define NV2080_CTRL_CMD_PERF_AGGRESSIVE_PSTATE_NOTIFY (0x2080208f)
 
 typedef struct NV2080_CTRL_PERF_AGGRESSIVE_PSTATE_NOTIFY_PARAMS {

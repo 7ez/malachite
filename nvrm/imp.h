@@ -1,5 +1,5 @@
 #pragma once
-// NVC372_CTRL_CMD_IS_MODE_POSSIBLE on GSP-RM 570: ctrlc372chnc.h, the fields as they are there
+// NVC372_CTRL_CMD_IS_MODE_POSSIBLE of GSP-RM 570, as in ctrlc372chnc.h
 #include "nvtypes.h"
 
 #define NVC372_DISPLAY_SW 0xc372u

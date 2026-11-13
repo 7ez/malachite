@@ -254,7 +254,7 @@ typedef struct NV2080_CTRL_CE_GET_FAULT_METHOD_BUFFER_SIZE_PARAMS {
     NvU32 size;
 } NV2080_CTRL_CE_GET_FAULT_METHOD_BUFFER_SIZE_PARAMS;
 
-// r570 moved this from the internal interface to the GPU one; its old id, 0x20800a42, is now an NVLink control
+// r570's id; the r535 one, 0x20800a42, is now an NVLink control
 #define NV2080_CTRL_GPU_MAX_CONSTRUCTED_FALCONS         0x40
 
 typedef struct NV2080_CTRL_GPU_CONSTRUCTED_FALCON_INFO {
