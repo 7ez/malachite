@@ -133,7 +133,10 @@ int render_clear(struct chan *ch, const struct render_draw *t, unsigned target, 
 {
     uint32_t c[4], w = t->width, h = t->height, push[256];
     memcpy(c, rgba, sizeof(c));
-    unsigned n = draw_target_words(push, t);
+    // the pass before may still be sampling the target: a clear doesn't wait for it as a draw does
+    push[0] = MTHD(0, R_WAIT_FOR_IDLE, 1);
+    push[1] = 0;
+    unsigned n = 2 + draw_target_words(push + 2, t);
     uint32_t clear[] = {
         MTHD(0, R_SET_SURFACE_CLIP_HORIZONTAL, 2), w << 16, h << 16,
         MTHD(0, R_SET_CLEAR_SURFACE_CONTROL, 1), 1u << 4,  // USE_CLEAR_RECT
@@ -259,7 +262,9 @@ int render_clear_zs(struct chan *ch, const struct render_draw *d, const struct g
                     uint32_t stencil, volatile uint32_t *sem, uint64_t sem_va, uint32_t payload)
 {
     uint32_t push[96];
-    unsigned n = draw_aa_words(push, d);
+    push[0] = MTHD(0, R_WAIT_FOR_IDLE, 1);  // as for a colour clear
+    push[1] = 0;
+    unsigned n = 2 + draw_aa_words(push + 2, d);
     n += zt_bind(push + n, d);
     if (z) {
         chan_push(ch, push, n);
