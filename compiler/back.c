@@ -3914,29 +3914,37 @@ static unsigned taken(void)
     return used;
 }
 
-// A scoreboard nothing waits on any more, the one set longest ago first. With none free, the one set longest ago,
-// which is the nearest to done: shared while it is recent, as whatever reads its results then waits a little longer
-// for the new one too; once it is older than a load takes, waited for first instead (*wait), which costs nothing
-// by then and keeps a long wait on the new one off the old results' readers. Never one in avoid: the instruction's
-// own write barrier, which waiting on would lose.
+// A scoreboard nothing waits on any more, the one set longest ago first. With none free, one older than its ops
+// take, waited for first (*wait), which costs nothing by then. Else the oldest of those set for the same kind of op:
+// its results' readers wait for the new one too, and a short op's readers can't afford a memory or texture wait.
+// Never one in avoid: the instruction's own write barrier, which waiting on would lose.
 #define STALE_BAR 150
-static int take_bar(unsigned *wait, unsigned avoid)
+#define STALE_SHORT 30
+static unsigned g_bar_long;  // scoreboards set for a memory or texture op
+static int g_long_op;        // the mop being emitted is one
+static int take_bar(unsigned *wait, unsigned avoid, int lng)
 {
     unsigned used = taken();
-    int best = -1;
+    int best = -1, cost_best = 4;
     for (int b = 0; b < 6; b++) {
         if (avoid >> b & 1)
             continue;
-        int ub = used >> b & 1, ubest = best >= 0 ? (int)(used >> best & 1) : 2;
-        if (ub < ubest || (ub == ubest && g_bar_set[b] < g_bar_set[best]))
+        int bl = g_bar_long >> b & 1;
+        int cost = !(used >> b & 1) ? 0 : g_bar_set[b] + (bl ? STALE_BAR : STALE_SHORT) <= g_cycle ? 1 : 2 + (bl != lng);
+        if (cost < cost_best || (cost == cost_best && g_bar_set[b] < g_bar_set[best])) {
             best = b;
+            cost_best = cost;
+        }
     }
-    if (!(used >> best & 1))
+    if (cost_best == 0)
         g_mem_bars &= ~(1u << best);
-    else if (g_bar_set[best] + STALE_BAR <= g_cycle) {
+    else if (cost_best == 1) {
         *wait |= 1u << best;
         settle(1u << best);
     }
+    if (cost_best < 2)
+        g_bar_long &= ~(1u << best);
+    g_bar_long |= (unsigned)lng << best;
     return best;
 }
 
@@ -3962,7 +3970,7 @@ static uint32_t sched(const uint8_t *srcs, int nsrc, int var_dst, int dst, int d
     settle(c.wait);
     unsigned wait = c.wait;
     if (var_dst) {
-        c.wr = take_bar(&wait, 0);
+        c.wr = take_bar(&wait, 0, g_long_op);
         if (g_mem_op)
             g_mem_bars |= 1u << c.wr;
         for (int k = 0; k < dstw; k++)
@@ -3972,7 +3980,7 @@ static uint32_t sched(const uint8_t *srcs, int nsrc, int var_dst, int dst, int d
     // that is where they go when nothing writes them again before the result would be waited for anyway.
     if (late) {
         if (!var_dst || !g_rd_free || taken() != 0x3f)
-            c.rd = take_bar(&wait, var_dst ? 1u << c.wr : 0);
+            c.rd = take_bar(&wait, var_dst ? 1u << c.wr : 0, 0);
         int b = c.rd >= 0 ? c.rd : c.wr;
         if (g_mem_op)
             g_mem_bars |= 1u << b;
@@ -4279,6 +4287,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
         if (!g_probe) {
             g_mop_np[i] = g_np;
             g_rd_free = g_rd_free_of[i];
+            g_long_op = m->k == MK_TEX || m->k == MK_LDG || m->k == MK_ATOM;
         }
         int d = m->def >= 0 ? hw(m->def) : -1;
         uint8_t s[6];
@@ -5148,6 +5157,8 @@ static int allocate_and_emit(struct ir_func *f, const struct airc_info *info, in
     memset(g_rbar_of, 0, sizeof(g_rbar_of));
     memset(g_wclass, WC_NONE, sizeof(g_wclass));
     memset(g_bar_set, 0, sizeof(g_bar_set));
+    g_bar_long = 0;
+    g_long_op = 0;
     g_mop_np = calloc(g_nmops + 1, sizeof(*g_mop_np));
     g_rd_free_of = calloc(g_nmops + 1, 1);
     g_rd_free = 0;
