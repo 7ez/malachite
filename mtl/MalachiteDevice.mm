@@ -3465,9 +3465,8 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     _visibility = descriptor.visibilityResultBuffer ? [(MTLIOAccelBuffer *)descriptor.visibilityResultBuffer gpuAddress] : 0;
     malachite_keep(cb, descriptor.stencilAttachment.texture);
 
-    // depth and stencil share one target (a combined format); either attachment names it. A Depth32Float texture
-    // beside a Stencil8 one (as Apple's GL makes them) draws to the stencil texture, which is kept in the combined
-    // format: the depth is copied into it before the first draw and back at the end
+    // Depth and stencil share one combined target. Apple's GL makes Depth32Float beside Stencil8, so the stencil
+    // texture is kept combined and the depth copied in before the first draw and back at the end.
     MTLRenderPassDepthAttachmentDescriptor *da = descriptor.depthAttachment;
     MTLRenderPassStencilAttachmentDescriptor *sa = descriptor.stencilAttachment;
     MalachiteTexture *dt = (MalachiteTexture *)da.texture, *st = (MalachiteTexture *)sa.texture;
@@ -3538,7 +3537,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         _pass.width = _pass.width ? MIN(_pass.width, s.width / sx) : s.width / sx;
         _pass.height = _pass.height ? MIN(_pass.height, s.height / sy) : s.height / sy;
     }
-    if (apart && _pass.zt) {  // each depth word to the first of each 8-byte texel, the stencil word left as it is
+    if (apart && _pass.zt) {  // the stencil word stays as it is
         uint64_t depth = [(MTLIOAccelBuffer *)dt->_backing gpuAddress] + ds.offset;
         const uint32_t x = REMAP_X, none = REMAP_NONE;
         if (da.loadAction == MTLLoadActionLoad)
@@ -3578,7 +3577,6 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
             _pass.samples = t->_samples;
             first = false;
         }
-        // a multisampled attachment resolved into another texture at the end (a level and slice of it)
         id<MTLTexture> rt = ca.resolveTexture;
         if (t->_samples && rt && (ca.storeAction == MTLStoreActionMultisampleResolve ||
                                   ca.storeAction == MTLStoreActionStoreAndMultisampleResolve)) {
@@ -3594,12 +3592,11 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
                                    tex_format_info((enum tex_format)f).target, s.rows != 0,
                                    ca.loadAction == MTLLoadActionClear, 0, {}, {} };
         malachite_clear_colour((enum tex_format)f, ca.clearColor, ct.clear_rgba);
-        // a block-linear shadow, copied in and back by the copy engine, for what the 3D class can't render to: a
-        // pitch-linear target beside a depth buffer or another colour target (a pass with one draws nothing to any
-        // of them), or rows or a start not on 128 bytes (an IOSurface 357 pixels wide)
+        // The 3D class draws nothing to a pitch-linear target beside a depth or another colour target, or one whose
+        // rows or start aren't on 128 bytes (an IOSurface 357 pixels wide).
         if (!ct.blocklinear && (_pass.zt || ncolour > 1 || (ct.pitch & 127) || (ct.addr & 127))) {
             uint32_t bytes = _pass.width * tex_format_info((enum tex_format)f).bytes;
-            uint32_t width = (bytes + 63) & ~63u, rows = (_pass.height + 7) & ~7u;  // one-GOB blocks: 64 B x 8 rows
+            uint32_t width = (bytes + 63) & ~63u, rows = (_pass.height + 7) & ~7u;
             id<MTLBuffer> shadow = malachite_shadow(((id<MTLCommandBuffer>)cb).commandQueue, i, (NSUInteger)width * rows);
             [(id<MTLCommandBuffer>)cb addCompletedHandler:^(id<MTLCommandBuffer>) {
                 (void)shadow;
@@ -3607,13 +3604,13 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
             uint64_t sva = [(MTLIOAccelBuffer *)shadow gpuAddress];
             if (((MalachiteBuffer *)shadow)->_one_image)
                 malachite_compress_colour(cb, (MalachiteBuffer *)shadow);
-            // DontCare too: the shadow is stored back whole, and what the pass doesn't draw has to stay as it was
+            // DontCare too: the shadow is stored back whole, and undrawn pixels must survive
             if (ca.loadAction != MTLLoadActionClear)
                 _load[i] = (struct nvgpu_copy2d){ ct.addr, sva, ct.pitch, width, bytes, _pass.height, 0, 1, 0, rows };
             if (ca.storeAction != MTLStoreActionDontCare || malachite_trace)  // the trace dumps every attachment
                 _store[i] = (struct nvgpu_copy2d){ sva, ct.addr, width, ct.pitch, bytes, _pass.height, 1, 0, rows, 0 };
             ct.addr = sva;
-            ct.pitch = 0;  // a block-linear target has none
+            ct.pitch = 0;
             ct.blocklinear = 1;
         } else {
             ct.width = s.width / sx;
@@ -3622,7 +3619,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         _formats[i] = f;
         _attached[i] = t;
         _attached_level[i] = t->_view_min + (uint32_t)ca.level;
-        // for a layered pass: the array layers from the slice on, or a 3D level's depth planes from the attached one
+        // a layered pass draws the layers or depth planes from the attached one on
         if (t->_image && t->_type == MTLTextureType3D) {
             struct malachite_lvl v = malachite_image_level(t->_format, t->_width, t->_height, t->_depth,
                                                            t->_view_min + (uint32_t)ca.level);
@@ -3825,7 +3822,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     _pass.front_ccw = winding == MTLWindingCounterClockwise;
 }
 
-// OpenGL's state, which Apple's GL renderer sets through the encoder
+// set by Apple's GL renderer
 
 - (void)setPointSize:(float)size
 {
@@ -3863,7 +3860,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 {
 }
 
-// a multisampled attachment's resolve target set after the pass began, as the descriptor's would be
+// treated as the descriptor's would be
 - (void)setColorResolveTexture:(id)texture slice:(NSUInteger)slice depthPlane:(NSUInteger)plane
                          level:(NSUInteger)level yInvert:(BOOL)invert atIndex:(NSUInteger)index
 {
@@ -3902,7 +3899,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 - (void)setStencilResolveTexture:(id)texture slice:(NSUInteger)slice depthPlane:(NSUInteger)plane
                            level:(NSUInteger)level yInvert:(BOOL)invert
 {
-    // a pass of its own even into the depth's resolve texture, as each keeps what the other wrote
+    // its own pass even into the depth's resolve texture, as each keeps what the other wrote
     _zresolve[1].to = malachite_resolve_target(texture, level, slice);
     _zresolve[1].stencil = _zresolve[1].to != nil;
 }
@@ -3938,15 +3935,13 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
     _pass.blend_const[3] = alpha;
 }
 
-// draws count their passing samples into the result at offset (boolean mode reads that as passed or not), each
-// going on from the last draw's count while the offset stays the same
+// counts carry on from the last draw's while the offset stays the same; boolean mode reads non-zero as passed
 - (void)setVisibilityResultMode:(MTLVisibilityResultMode)mode offset:(NSUInteger)offset
 {
     _pass.visibility = mode != MTLVisibilityResultModeDisabled && _visibility ? _visibility + offset : 0;
 }
 
-// every command runs to completion in order, and resources stay resident: no ordering or residency to add
-// resources the shaders reach through pointers in other buffers (argument buffers): kept like bound ones
+// commands run to completion in order and resources stay resident, so only keeping them alive is left
 - (void)useResource:(id)resource usage:(MTLResourceUsage)usage
 {
     malachite_keep(_cb, resource);
@@ -4030,7 +4025,7 @@ static bool malachite_resolves(MTLStoreAction action)
     return action == MTLStoreActionMultisampleResolve || action == MTLStoreActionStoreAndMultisampleResolve;
 }
 
-// what the pass left unknown: a resolve into the descriptor's target is only asked for here
+// a resolve into the descriptor's target may be asked for only here
 - (void)setColorStoreAction:(MTLStoreAction)action atIndex:(NSUInteger)index
 {
     if (index >= 8)
@@ -4119,7 +4114,7 @@ static bool malachite_resolves(MTLStoreAction action)
     _pass.scissor[3] = (uint32_t)r.height;
 }
 
-// several, for a vertex function choosing one with [[viewport_array_index]]
+// for [[viewport_array_index]]
 - (void)setViewports:(const MTLViewport *)viewports count:(NSUInteger)count
 {
     if (!count)
@@ -4277,8 +4272,7 @@ static bool malachite_resolves(MTLStoreAction action)
     _factor_scale = scale;
 }
 
-// A patch draw is a draw of a vertex a patch: the tessellation init stage reads the index buffers. The control point
-// count is the pipeline's, or the draw's when the function doesn't give one.
+// a vertex a patch; the tessellation init stage reads the index buffers
 - (void)patches:(NSUInteger)points
           start:(NSUInteger)start
           count:(NSUInteger)count
@@ -4312,7 +4306,7 @@ static bool malachite_resolves(MTLStoreAction action)
            offset:0 instances:instances baseInstance:baseInstance];
 }
 
-// MTLDrawPatchIndirectArguments are laid out as a draw of vertices' are: the kernel reads them as it does those
+// MTLDrawPatchIndirectArguments share the layout of a vertex draw's
 - (void)drawPatches:(NSUInteger)controlPoints
           patchIndexBuffer:(id)patchIndex
     patchIndexBufferOffset:(NSUInteger)patchIndexOffset
@@ -4355,8 +4349,7 @@ static bool malachite_resolves(MTLStoreAction action)
     _indirect = 0;
 }
 
-// The kernel reads the arguments when it runs the draw, after the work before it, which may write them; the
-// draw is encoded with stand-ins
+// earlier work may write the arguments, so the kernel reads them at run time over stand-ins
 - (void)drawPrimitives:(MTLPrimitiveType)type indirectBuffer:(id)buffer indirectBufferOffset:(NSUInteger)offset
 {
     malachite_keep(_cb, buffer);
@@ -4379,8 +4372,7 @@ static bool malachite_resolves(MTLStoreAction action)
     _indirect = 0;
 }
 
-// Every draw call comes here. An indexed one passes the index buffer (from its offset) and its size; first
-// and count are then indices.
+// for an indexed draw, first and count are indices
 - (void)draw:(MTLPrimitiveType)type
          first:(NSUInteger)first
          count:(NSUInteger)count
@@ -4392,7 +4384,7 @@ static bool malachite_resolves(MTLStoreAction action)
           type:(MTLIndexType)indexType
 {
     static const uint32_t topology[] = { 0, 1, 3, 4, 5 };  // point, line, line strip, triangle, triangle strip
-    // a post-tessellation pipeline draws patches only, with a factor buffer
+    // post-tessellation pipelines draw patches only, with a factor buffer
     bool tess = _pipeline && _pipeline->_tess;
     id<MTLBuffer> ti = nil;
     uint32_t ti_regs = 0;
@@ -4415,7 +4407,7 @@ static bool malachite_resolves(MTLStoreAction action)
     struct nvgpu_draw d = _pass;
     d.pass_first = !_drawn;
     d.opengl = opengl_renderer;
-    if (_drawn) {  // the load actions clear once, before the first draw
+    if (_drawn) {  // load actions clear once
         d.clear = 0;
         d.clear_zs = 0;
         for (struct nvgpu_target &t : d.more)
@@ -4465,7 +4457,7 @@ static bool malachite_resolves(MTLStoreAction action)
     }
     memcpy(d.attributes, _pipeline->_attributes, sizeof(d.attributes));
     id<MTLBuffer> zeros = nil;
-    uint32_t used = 0;  // the streams active attributes read, a constant step function's (stride 0) among them
+    uint32_t used = 0;  // stride 0 constant step functions included
     for (int i = 0; i < RENDER_ATTRIBUTES; i++)
         if (d.attributes[i] && !(d.attributes[i] & ATTR_INACTIVE))
             used |= 1u << (d.attributes[i] & 0x1f);
@@ -4477,8 +4469,7 @@ static bool malachite_resolves(MTLStoreAction action)
         d.streams[s].stride = _pipeline->_strides[s] == MALACHITE_DYNAMIC_STRIDE ? _vstrides[b] : _pipeline->_strides[s];
         d.streams[s].size = _vsizes[b];
         d.streams[s].divisor = _pipeline->_divisors[s];
-        // a stream whose buffer isn't bound would leave its attributes fetching from address 0, which faults the
-        // channel (WindowServer, under load): they read zeros instead
+        // fetching from address 0 faults the channel (WindowServer, under load)
         if (!d.streams[s].addr) {
             if (!zeros) {
                 zeros = malachite_zero_buffer(((id<MTLCommandBuffer>)_cb).device);
@@ -4503,7 +4494,7 @@ static bool malachite_resolves(MTLStoreAction action)
         _counted = d.visibility;
     }
     d.primitive = topology[type];
-    if (tess) {  // the vertex function runs as the tessellation stage, after the generated vertex and init stages
+    if (tess) {  // the vertex function runs after the generated vertex and init stages
         d.tess = _pipeline->_tess;
         d.primitive = 0xe;
         d.ts = d.vs;
@@ -4553,13 +4544,13 @@ static bool malachite_resolves(MTLStoreAction action)
                d.stencil_write_mask[0], d.stencil[1][0], d.stencil[1][1], d.stencil[1][2], d.stencil[1][3],
                d.write_mask, d.more[0].write_mask, d.more[0].blend[0], d.more[0].blend[1], d.more[0].blend[2],
                d.more[0].blend[3], d.zt, d.zt_format, d.zt_width, d.zt_height, d.zt_kind, d.width, d.height);
-    if (malachite_trace) {  // the addresses the draw reads, to tell which one an MMU fault was at
+    if (malachite_trace) {  // to tell which address an MMU fault was at
         char streams[256] = "";
         for (unsigned s = 0, n = 0; s < 16 && n < sizeof(streams); s++)
             if (d.streams[s].addr)
                 n += snprintf(streams + n, sizeof(streams) - n, " %u:%#llx/%u/%u", s, d.streams[s].addr,
                               d.streams[s].stride, d.streams[s].size);
-        // and the parameter words that look like our GPU addresses: the buffers bound as arguments
+        // parameter words that look like our GPU addresses
         char params[256] = "";
         const struct {
             const unsigned char *p;
@@ -4576,7 +4567,7 @@ static bool malachite_resolves(MTLStoreAction action)
         char headers[256] = "";
         for (unsigned h = 0, n = 0; h < d.nheaders && h < NVGPU_MAX_TEXTURES && n < sizeof(headers); h++)
             n += snprintf(headers + n, sizeof(headers) - n, " %u:%08x/%08x", h, d.headers[h][1], d.headers[h][2]);
-        for (unsigned t = 0, n = strlen(streams); t < 7 && n < sizeof(streams); t++)  // targets 1..7 too
+        for (unsigned t = 0, n = strlen(streams); t < 7 && n < sizeof(streams); t++)
             if (d.more[t].addr)
                 n += snprintf(streams + n, sizeof(streams) - n, " target%u:%#llx%s", t + 1, d.more[t].addr,
                               _attached[t + 1] && _attached[t + 1]->_surface ? "(iosurface)" : "");
@@ -4596,13 +4587,13 @@ static bool malachite_resolves(MTLStoreAction action)
         char path[96];
         snprintf(path, sizeof(path), "/tmp/malachite-vb-%d-%s-%u.bin", getpid(),
                  [_pipeline->_label stringByReplacingOccurrencesOfString:@"/" withString:@"_"].UTF8String, b);
-        if (w && access(path, F_OK) != 0) {  // each vertex function's first draw, for replaying it
+        if (w && access(path, F_OK) != 0) {  // first draw per vertex function, for replay
             FILE *o = fopen(path, "wb");
             if (o) {
                 fwrite(w, 1, _vsizes[b] < 16384 ? _vsizes[b] : 16384, o);
                 fclose(o);
             }
-            // and the same bytes once the GPU is done with them, to see what changed after the draw was encoded
+            // again after the GPU is done, to see what changed after encoding
             size_t len = _vsizes[b] < 16384 ? _vsizes[b] : 16384;
             id keep = _vbound[b];
             NSString *done = [NSString stringWithFormat:@"%s.done", path];
@@ -4612,10 +4603,10 @@ static bool malachite_resolves(MTLStoreAction action)
             }];
         }
     }
-    // a filtered snapshot also has the targets before the draw and the textures it reads
+    // filtered snapshots add the targets before the draw and the textures it reads
     bool only = false;
     for (NSString *s in malachite_snap_only)
-        only |= malachite_snap && [_pipeline->_label containsString:s];  // malachite_snap is off while the gate's shut
+        only |= malachite_snap && [_pipeline->_label containsString:s];  // off while the gate's shut
     const uint32_t *r = malachite_snap_rect, *sc = d.scissor;
     bool in_rect = r[2] && d.width >= r[0] + r[2] && d.height >= r[1] + r[3] && sc[0] < r[0] + r[2] &&
                    r[0] < sc[0] + sc[2] && sc[1] < r[1] + r[3] && r[1] < sc[1] + sc[3];
@@ -4644,7 +4635,7 @@ static bool malachite_resolves(MTLStoreAction action)
     if (![self fastDraw:d]) {
         malachite_record(_cb, MALACHITE_CMD_DRAW, &d, sizeof(d));
         _last_records = 0;
-        if (_fast && d.count && d.instances) {  // the kernel sends no state for a draw of nothing
+        if (_fast && d.count && d.instances) {  // the kernel sends no state for an empty draw
             MalachiteCommandBuffer *cb = (MalachiteCommandBuffer *)_cb;
             _last = d;
             _last_records = cb->_records;
@@ -4671,12 +4662,10 @@ static bool malachite_resolves(MTLStoreAction action)
         [self snapshot:d suffix:""];
 }
 
-// the trace: the textures a draw reads, level 0 of each, saved like the snapshots
 - (void)snapshotTextures:(const struct nvgpu_draw &)d
 {
     static int draws;
     int n = __sync_fetch_and_add(&draws, 1);
-    // what else the draw reads: its samplers' filters, and the start of each fragment buffer (shared ones)
     for (unsigned slot = 0; slot < NVGPU_MAX_TEXTURES; slot++)
         if ([_samplers[slot] isKindOfClass:[MalachiteSamplerState class]]) {
             const struct samp_desc *sd = &((MalachiteSamplerState *)_samplers[slot])->_desc;
@@ -4697,8 +4686,7 @@ static bool malachite_resolves(MTLStoreAction action)
         MalachiteTexture *t = (MalachiteTexture *)_textures[slot];
         if (![t isKindOfClass:[MalachiteTexture class]] || !t->_backing)
             continue;
-        // an image's levels as the GOBs they are (one-GOB blocks, rows of pitch bytes 8 lines high), level after
-        // level: "W H pitch format label image levels" then each level's "w h pitch rows" line and bytes
+        // image levels stay in GOB layout; the tools untile them
         for (uint32_t level = 0; t->_image && level < t->_levels && level < 6; level++) {
             struct malachite_sub s;
             if (!malachite_sub(t, level, 0, 0, &s) || !s.rows || (uint64_t)s.pitch * s.rows > 64u << 20)
@@ -4749,7 +4737,7 @@ static bool malachite_resolves(MTLStoreAction action)
     }
 }
 
-// colour target n of d with its size, which may be more than the pass's
+// its size may exceed the pass's
 static struct nvgpu_target malachite_target(const struct nvgpu_draw &d, unsigned n)
 {
     struct nvgpu_target ct = { d.target, d.pitch, 0, d.target_blocklinear };
@@ -4764,7 +4752,7 @@ static struct nvgpu_target malachite_target(const struct nvgpu_draw &d, unsigned
     return ct;
 }
 
-// attachment n's texture header, at the memory the pass draws it to
+// at the memory the pass draws it to, which may be a shadow
 - (void)attachment:(unsigned)n header:(unsigned int *)header of:(const struct nvgpu_draw &)d
 {
     struct nvgpu_target ct = malachite_target(d, n);
@@ -4772,9 +4760,7 @@ static struct nvgpu_target malachite_target(const struct nvgpu_draw &d, unsigned
     tex_fill_header(header, &td);
 }
 
-// scratch memory for attachment n's copy, size bytes, one pass after another reusing it: the draws and copies
-// after the one that fills it wait for the ones before. In VRAM, as the attachments are: a copy into memory the GPU
-// reaches over PCIe was most of the copy's time
+// Reused pass after pass, as later draws wait for earlier ones. In VRAM: copying over PCIe was most of the copy's time.
 static uint64_t malachite_scratch(id<MTLDevice> device, unsigned n, NSUInteger size)
 {
     static NSMutableDictionary<NSNumber *, id<MTLBuffer>> *scratch;
@@ -4794,9 +4780,8 @@ static uint64_t malachite_scratch(id<MTLDevice> device, unsigned n, NSUInteger s
     return [(MTLIOAccelBuffer *)buf gpuAddress];
 }
 
-// A copy of a texel size bytes wide drawn as one raw integer of that size: a full-screen triangle whose pixels
-// read the texel and write it out as it is, so any format copies exactly and the copy stays in the 3D channel,
-// whose own draws it waits for, rather than going to the copy engine and back
+// Copies as raw integers copy any format exactly and stay in the 3D channel, ordered with its draws, rather than
+// going to the copy engine and back.
 static const struct {
     uint32_t bytes;
     MTLPixelFormat pixel;
@@ -4844,7 +4829,7 @@ static MalachiteRenderPipelineState *malachite_copy_pipeline(id<MTLDevice> devic
     }
 }
 
-// The GPU methods a fast draw uses, from core/render.c
+// from core/render.c
 #define FAST_MTHD(m, n) (0x20000000u | (uint32_t)(n) << 16 | (uint32_t)(m) >> 2)
 enum {
     FAST_INDEX_SIZE = 0x0238,
@@ -4871,10 +4856,10 @@ enum {
     FAST_BANK_STEP = 0x300,
     FAST_RUN_WORDS = 0x4000,
     FAST_DRAW_WORDS = 1024,    // more than one draw can take
-    FAST_RUN_DRAWS = 256,      // the GPU gets on with them
+    FAST_RUN_DRAWS = 256,      // so the GPU gets started on them
 };
 
-// Room for one more draw in the run's memory, which lives until the command buffer completes.
+// the run's memory lives until the command buffer completes
 static bool malachite_run_room(MalachiteCommandBuffer *cb)
 {
     if (!cb->_run_cpu || cb->_run_cap - cb->_run_used < FAST_DRAW_WORDS) {
@@ -4902,8 +4887,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
     return true;
 }
 
-// The textures and samplers of a draw, as heap entries. A draw with the same pipeline and bindings as the last uses the
-// same ones, unless it reads an attachment, which takes a copy of its own.
+// Reused for the same pipeline and bindings, unless the draw reads an attachment, which needs a fresh copy.
 - (bool)fillPools:(struct nvgpu_draw &)d
 {
     bool cacheable = true;
@@ -4912,25 +4896,22 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
     malachite_slots(fh, _textures, _samplers, textures, samplers);
     if (malachite_fill_pools(_cb, fh, textures, samplers, d.headers, d.samplers, &d.nheaders, &d.nsamplers))
         return false;
-    // [[color(n)]] inputs read the attachment where it's drawn: the shadow, if it has one. CoreAnimation's glass
-    // needs them (zeros leave its material garbage); a read of an attachment the pass hasn't gets zeros
+    // [[color(n)]] inputs read where the attachment is drawn, shadow included; CoreAnimation's glass needs them
     for (uint32_t i = 0; i < fh->nargs; i++) {
         unsigned n = fh->args[i].index, slot = NVK_RENDER_TARGET_SLOT(n);
         if (fh->args[i].kind != NVK_ARG_RENDER_TARGET)
             continue;
         if (n >= 8 || _formats[n] < 0) {
-            memset(d.headers[slot], 0, sizeof(d.headers[slot]));  // the unbound texture's: reads give 0
+            memset(d.headers[slot], 0, sizeof(d.headers[slot]));  // the unbound texture, reading 0
         } else {
             [self attachment:n header:d.headers[slot] of:d];
-            d.serialize = 1;  // it sees everything drawn before it once that's done
+            d.serialize = 1;  // to see everything drawn before
             cacheable = false;
         }
         if (slot + 1 > d.nheaders)
             d.nheaders = slot + 1;
     }
-    // an attachment sampled, through its own texture or another over the same memory and only its level: a
-    // downsample that draws level n of an image while sampling level n - 1, through a view of either or of all its
-    // levels, isn't one (Metal lets a pass read the levels it doesn't draw)
+    // only the drawn level counts, as Metal lets a pass sample the levels it doesn't draw (downsampling)
     for (unsigned slot = 0; slot < d.nheaders; slot++) {
         MalachiteTexture *t = textures[slot];
         if (![t isKindOfClass:[MalachiteTexture class]] || !t->_backing)
@@ -4944,14 +4925,14 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
                 cacheable = false;
             }
     }
-    if (!d.nsamplers && d.nheaders) {  // as malachite_fill_pools gives a pool with headers a sampler 0
+    if (!d.nsamplers && d.nheaders) {  // as in malachite_fill_pools
         struct samp_desc def = malachite_default_sampler();
         tex_fill_sampler(d.samplers[0], &def);
         d.nsamplers = 1;
     }
     if (malachite_heap_commit(_cb, d.headers, d.nheaders, d.samplers, d.nsamplers, &d.heap))
         return false;
-    // the vertex stage's textures: headers of their own in the heap, and a handle table of their own
+    // the vertex stage has its own heap entries and handle table
     unsigned int vheaders[NVGPU_MAX_TEXTURES][8] = {}, vsamplers[NVGPU_MAX_TEXTURES][8] = {}, nvh = 0, nvs = 0;
     __unsafe_unretained id vtextures[NVGPU_MAX_TEXTURES], vsamplers_bound[NVGPU_MAX_TEXTURES];
     malachite_slots(&_pipeline->_vertex, _vtextures, _vsamplers, vtextures, vsamplers_bound);
@@ -4981,8 +4962,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
     return true;
 }
 
-// What a pipeline or the encoder's state changed since the last draw, through the kernel's own code (core/drawbuild.c).
-// Re-sending a group is harmless, as the kernel sends them all every draw.
+// Uses the kernel's own code (core/drawbuild.c); re-sending a group is harmless, the kernel sends them all every draw.
 - (uint32_t)fastState:(const struct nvgpu_draw &)d into:(uint32_t *)push
 {
     struct nvgpu_draw &l = _last;
@@ -5083,7 +5063,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
         r.vs_regs = d.vs_regs;
         r.ps_regs = d.ps_regs;
         n += draw_shader_words(push + n, &r);
-        // code this pass has run needs no flush, and the flush is most of what a change of pipeline costs the GPU
+        // the flush is most of a pipeline change's cost, and code this pass has run needs none
         bool seen = false;
         for (unsigned i = 0; i < 16; i++)
             seen |= _seen_code[i][0] == d.vs && _seen_code[i][1] == d.ps;
@@ -5108,13 +5088,11 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
     return n;
 }
 
-// A later draw of a pass written here as what differs from the one before, with no record for the kernel: a run of
-// them is one record. The targets and what the kernel decides from them must match; anything rarer goes the kernel's
-// way, which sends the lot.
+// Only the difference from the last draw, batched into one kernel record; anything rarer goes the kernel's way.
 - (bool)fastDraw:(const struct nvgpu_draw &)d
 {
     MalachiteCommandBuffer *cb = (MalachiteCommandBuffer *)_cb;
-    // anything sent since, such as a backdrop copy, or another encoder of a parallel pass, left other state behind
+    // anything sent since (a backdrop copy, a parallel pass's other encoder) left other state behind
     if (!_fast || !_last_records || _last_records != cb->_records || cb->_state_of != (__bridge const void *)self)
         return false;
     const struct nvgpu_draw &l = _last;
@@ -5193,8 +5171,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
         *w++ = FAST_MTHD(FAST_INVALIDATE_SHADER, 1);
         *w++ = 1 | 1 << 4 | 1 << 12;
     }
-    // new heap entries were written for this draw, and need the caches to forget the slots. No texture data flush: a
-    // fast draw follows nothing that wrote a texture, or it would have gone the kernel's way
+    // new heap entries; no texture data flush, as nothing that wrote a texture precedes a fast draw
     if (d.heap.headers && memcmp(&d.heap, &l.heap, sizeof(d.heap))) {
         *w++ = FAST_MTHD(FAST_INVALIDATE_HEADER, 1);
         *w++ = 0;
