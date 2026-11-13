@@ -8033,7 +8033,7 @@ static const struct airc_stage_in *malachite_stage_in(MTLStageInputOutputDescrip
     return [self computePipeline:function linked:nil stageIn:nil error:error];
 }
 
-// The other ways in to pipeline creation all come to the ones above. Reflection is only what OpenGL's renderer reads.
+// reflection is only what OpenGL's renderer reads
 - (id)computePipeline:(id<MTLFunction>)function
                linked:(MTLLinkedFunctions *)linked
               stageIn:(MTLStageInputOutputDescriptor *)stageIn
@@ -8043,7 +8043,7 @@ static const struct airc_stage_in *malachite_stage_in(MTLStageInputOutputDescrip
     id state = [self computePipeline:function linked:linked stageIn:stageIn error:error];
     if (reflection)
         *reflection = nil;
-    if (reflection && objc_getAssociatedObject(function, &malachite_arguments_key)) {  // a GL program's
+    if (reflection && objc_getAssociatedObject(function, &malachite_arguments_key)) {
         MalachiteComputeReflection *r = [MalachiteComputeReflection new];
         r.arguments = objc_getAssociatedObject(function, &malachite_arguments_key) ?: @[];
         r.pluginReturnData = objc_getAssociatedObject(function, &malachite_return_key);
@@ -8060,7 +8060,7 @@ static const struct airc_stage_in *malachite_stage_in(MTLStageInputOutputDescrip
     return [self computePipeline:function linked:nil stageIn:nil reflection:reflection error:error];
 }
 
-// a kernel's declared threadgroup size and the descriptor's must agree, as Apple's drivers have it
+// declared and descriptor threadgroup sizes must agree, as on Apple's drivers
 static id malachite_threads_asked(MalachiteComputePipelineState *state, MTLComputePipelineDescriptor *desc, NSError **error)
 {
     NSUInteger ask = desc.maxTotalThreadsPerThreadgroup;
@@ -8129,7 +8129,7 @@ static id malachite_threads_asked(MalachiteComputePipelineState *state, MTLCompu
     if (reflection)
         *reflection = nil;
     if (reflection && (objc_getAssociatedObject(desc.vertexFunction, &malachite_arguments_key) ||
-                       objc_getAssociatedObject(desc.fragmentFunction, &malachite_arguments_key))) {  // a GL program's
+                       objc_getAssociatedObject(desc.fragmentFunction, &malachite_arguments_key))) {
         MalachiteRenderReflection *r = [MalachiteRenderReflection new];
         r.vertexArguments = objc_getAssociatedObject(desc.vertexFunction, &malachite_arguments_key) ?: @[];
         r.fragmentArguments = objc_getAssociatedObject(desc.fragmentFunction, &malachite_arguments_key) ?: @[];
@@ -8158,7 +8158,7 @@ static id malachite_threads_asked(MalachiteComputePipelineState *state, MTLCompu
     handler(ps, r, err);
 }
 
-// what runs for a pipeline without a fragment function (depth only, or no rasterization): nothing
+// for depth-only pipelines and ones without rasterization
 static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
 {
     static id<MTLFunction> fn;
@@ -8201,11 +8201,11 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     state->_fragment = fh;
     state->_vcode = vcode;
     state->_fcode = fcode;
-    // for naming the shaders kern.malachite_prof lists by address
+    // names for kern.malachite_prof's addresses
     os_log_info(OS_LOG_DEFAULT, "Malachite pipeline: vs %{public}@ %#llx ps %{public}@ %#llx", desc.vertexFunction.name,
                 [(MTLIOAccelBuffer *)vcode gpuAddress], desc.fragmentFunction.name,
                 [(MTLIOAccelBuffer *)fcode gpuAddress]);
-    // the AIR as compiled for this pipeline, its functions' linked ones being the pipeline's
+    // with the pipeline's linked functions
     if (malachite_rec_only) {
         objc_setAssociatedObject(state, &malachite_desc_key, [desc copy], OBJC_ASSOCIATION_RETAIN);
         id vair = objc_getAssociatedObject(desc.vertexFunction, &malachite_air_key);
@@ -8218,7 +8218,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
         objc_setAssociatedObject(state, &malachite_air_key, air, OBJC_ASSOCIATION_RETAIN);
     }
 
-    // MTLBlendOperation and MTLBlendFactor in the 3D class's OpenGL-style encoding
+    // the 3D class takes OpenGL-style values
     static const uint32_t op[] = { 0x8006, 0x800a, 0x800b, 0x8007, 0x8008 };
     static const uint32_t factor[] = { 0x4000, 0x4001, 0x4300, 0x4301, 0x4302, 0x4303, 0x4306, 0x4307,
                                        0x4304, 0x4305, 0x4308, 0xc001, 0xc002, 0xc003, 0xc004, 0xc900,
@@ -8260,8 +8260,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     if (vh.stage == NVK_TESS_EVAL)
         return [self tessellation:state descriptor:desc error:error];
 
-    // [[stage_in]] attributes: attribute i reads a stream at its offset. Metal numbers vertex buffers to 30 and the
-    // GPU has 16 streams, so a buffer past them (Roblox binds its vertices from 16) takes a stream no lower one needs
+    // Metal has 31 vertex buffers, the GPU 16 streams; buffers past 15 (some apps bind from 16) take a free stream
     MTLVertexDescriptor *vd = desc.vertexDescriptor;
     uint32_t unread = 0, taken = 0;
     int stream_of[31];
@@ -8294,13 +8293,12 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
         state->_stream_buffer[stream] = (uint8_t)a.bufferIndex;
         state->_strides[stream] =
             l.stride == MTLBufferLayoutStrideDynamic ? MALACHITE_DYNAMIC_STRIDE : (uint32_t)l.stride;
-        // a constant buffer is a per-instance one that never steps
+        // constant: per-instance, never stepping
         state->_divisors[stream] = l.stepFunction == MTLVertexStepFunctionPerInstance ? (uint32_t)l.stepRate
                                    : l.stepFunction == MTLVertexStepFunctionConstant ? UINT32_MAX
                                                                                      : 0;
     }
-    // an attribute left inactive faults the vertex fetch of a shader that reads it, so one we can't fetch reads zeros
-    // from a stream of its own instead
+    // reading an inactive attribute faults the vertex fetch, so unfetchable ones read a zero stream
     int s = 15;
     while (s >= 0 && (state->_strides[s] || state->_divisors[s]))
         s--;
@@ -8314,9 +8312,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     return state;
 }
 
-// A post-tessellation vertex function's pipeline: the tessellator as the descriptor sets it up, and the stages
-// generated to run before the function, the tessellation init stage fetching the control points and per-patch data
-// the vertex descriptor lays out. state, or nil (and *error).
+// The generated init stage fetches control points and per-patch data as the vertex descriptor lays them out.
 - (id)tessellation:(MalachiteRenderPipelineState *)state
         descriptor:(MTLRenderPipelineDescriptor *)desc
              error:(NSError **)error
@@ -8326,7 +8322,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     td.domain = vh->patch_domain;
     td.point_inputs = vh->point_inputs;
     td.patch_inputs = vh->patch_inputs;
-    // without control points read, a thread a patch does; without a count, the draw gives it
+    // with no control points read, one thread a patch; with no count, the draw gives it
     td.points = vh->patch_points ? vh->patch_points : !vh->point_inputs;
     MTLTessellationControlPointIndexType it = desc.tessellationControlPointIndexType;
     td.index_size = it == MTLTessellationControlPointIndexTypeUInt32   ? 4
@@ -8334,8 +8330,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
                                                                        : 0;
     td.factor_step = (uint32_t)desc.tessellationFactorStepFunction;
     td.pow2 = desc.tessellationPartitionMode == MTLTessellationPartitionModePow2;
-    // fractional odd factors go up to the odd number below the maximum, which Metal has even; the tessellator would
-    // otherwise split the segments between it and the next odd one up
+    // fractional odd caps at the odd number below Metal's even maximum, or the tessellator splits segments past it
     td.max_factor = (float)desc.maxTessellationFactor;
     if (desc.tessellationPartitionMode == MTLTessellationPartitionModeFractionalOdd)
         td.max_factor -= 1;
@@ -8344,7 +8339,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     for (unsigned loc = 0; loc < 32 && !why; loc++) {
         if (!((td.point_inputs | td.patch_inputs) >> loc & 1))
             continue;
-        if (loc == 31) {  // a vertex descriptor has 31 attributes, and asking for another aborts
+        if (loc == 31) {  // asking for a 32nd attribute aborts
             why = @"attribute 31";
             break;
         }
@@ -8361,7 +8356,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     state->_td = td;
     if (!why)
         state->_tvcode = malachite_tess_stage(self, NULL, &state->_tv, &why);
-    // a function without a count is checked with its domain's usual one, which its draws will most likely give
+    // without a count, checked with the domain's usual one, which draws most likely give
     uint32_t regs;
     if (!why)
         [state tessInit:(vh->patch_domain ? 4 : 3) device:self regs:&regs why:&why];
@@ -8372,8 +8367,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
             *error = [NSError errorWithDomain:@"Malachite" code:1 userInfo:@{NSLocalizedDescriptionKey : msg}];
         return nil;
     }
-    // MTLTessellationPartitionMode as SPACING: pow2 is integer spacing with the factors rounded up by the init stage.
-    // The viewport flips y, so Metal's clockwise output is the class's TRIANGLES_CCW.
+    // pow2 is integer spacing, the init stage rounding factors up. The viewport flips y, so clockwise is TRIANGLES_CCW.
     static const uint32_t spacing[] = { 0, 0, 1, 2 };
     state->_tess = (vh->patch_domain ? 2 : 1) | spacing[desc.tessellationPartitionMode & 3] << 4 |
                    (desc.tessellationOutputWindingOrder == MTLWindingClockwise ? 3u : 2u) << 8;
@@ -8381,13 +8375,13 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     return state;
 }
 
-// Metal's designated initializer for an IOAccel device. super sets up the ~54 KB of device state from the port.
+// super sets up the ~54 KB of device state from the port
 - (instancetype)initWithAcceleratorPort:(unsigned int)port
 {
     os_log(OS_LOG_DEFAULT, "MalachiteDevice: initWithAcceleratorPort:0x%x", port);
     self = [super initWithAcceleratorPort:port];
     os_log(OS_LOG_DEFAULT, "MalachiteDevice: super init -> %p", (__bridge void *)self);
-    // the file names the process to trace, or is empty for all of them
+    // an empty file traces every process
     NSString *who = malachite_trusted_file("/var/tmp/malachite-trace", false)
                         ? [NSString stringWithContentsOfFile:@"/var/tmp/malachite-trace" encoding:NSUTF8StringEncoding error:nil]
                         : nil;
@@ -8419,22 +8413,19 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
             NSArray<NSString *> *v = [[w substringFromIndex:10] componentsSeparatedByString:@","];
             for (NSUInteger k = 0; k < 4 && k < v.count; k++)
                 malachite_snap_rect[k] = (uint32_t)v[k].intValue;
-            malachite_snap |= !malachite_rec_only;  // with the recorder the rect only picks the draws it records
+            malachite_snap |= !malachite_rec_only;  // with the recorder the rect only picks draws
         }
     malachite_snap_gated = malachite_snap_gate && (malachite_snap || !malachite_rec_only);
     return self;
 }
 
-// the name GSP-RM gave the GPU, which Gpu publishes
-// what Apple's frameworks key vendor behaviour on (the base says Apple): OpenGL's Metal renderer refuses a
-// device it can't place
+// the base says Apple, and OpenGL's Metal renderer refuses a device it can't place
 - (NSString *)vendorName
 {
     return @"NVIDIA";
 }
 
-// What Metal's loader picks a binary archive's slice by (RenderBox loads precompiled shader archives for icons and
-// effects): with none it aborts. A GPU type no archive has a slice for, so every pipeline is compiled from its AIR.
+// Binary archive loading aborts without one; a type no archive has keeps every pipeline compiled from AIR.
 - (id)targetDeviceArchitecture
 {
     static id arch;
@@ -8449,6 +8440,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     return arch;
 }
 
+// the name GSP-RM gave the GPU
 - (NSString *)name
 {
     static NSString *name;
@@ -8465,7 +8457,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     return name;
 }
 
-// OpenCL's compute units (AppleMetalOpenGLRenderer asks for this; without, 8)
+// OpenCL's compute units, which AppleMetalOpenGLRenderer asks for
 - (NSUInteger)gpuCoreCount
 {
     static NSUInteger count;
@@ -8493,21 +8485,19 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     return [self supportsTextureSampleCount:count];
 }
 
-// The GPU drives displays even before Framebuffer's head is lit. WindowServer asks once, at startup (a minute before the
-// head comes up), and composites in software for good if every device says it's headless.
+// WindowServer asks once at startup, before the head is lit, and composites in software for good if all are headless.
 - (BOOL)isHeadless
 {
     return NO;
 }
 
-// Depth24Unorm_Stencil8 is laid out as 32-bit float depth here, so apps are told to take Depth32Float_Stencil8
+// it's laid out as 32-bit float depth here
 - (BOOL)isDepth24Stencil8PixelFormatSupported
 {
     return NO;
 }
 
-// argument buffers hold textures and samplers as descriptor heap indices (their gpuResourceID), which shaders use
-// as handles: any texture of the heap's kept entries, any sampler of its
+// argument buffers hold descriptor heap indices, which shaders use as handles
 - (MTLArgumentBuffersTier)argumentBuffersSupport
 {
     return MTLArgumentBuffersTier2;
@@ -8520,10 +8510,10 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
 
 - (NSUInteger)maxThreadgroupMemoryLength
 {
-    return 48 * 1024;  // shared memory a CTA gets without asking for the larger carve-out
+    return 48 * 1024;  // without the larger carve-out
 }
 
-// the base profile's 16 KB otherwise, which OpenCL reports as the local memory size (OpenCL 1.2 wants 32 KB)
+// OpenCL reports this as local memory, and 1.2 wants 32 KB over the base's 16
 - (NSUInteger)maxComputeThreadgroupMemory
 {
     return [self maxThreadgroupMemoryLength];
@@ -8539,7 +8529,6 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     return 256;
 }
 
-// no sparse textures
 - (MTLSize)sparseTileSizeWithTextureType:(MTLTextureType)type
                              pixelFormat:(MTLPixelFormat)format
                              sampleCount:(NSUInteger)samples
@@ -8555,7 +8544,7 @@ static id<MTLFunction> malachite_no_fragment(id<MTLDevice> device)
     return MTLSizeMake(0, 0, 0);
 }
 
-// the base answers yes at draw, dispatch and blit boundaries, but has no counter set to sample
+// the base says yes but has no counter set to sample
 - (BOOL)supportsCounterSampling:(MTLCounterSamplingPoint)point
 {
     return NO;
