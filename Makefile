@@ -51,7 +51,7 @@ $(OUT)/Info.plist: kext/Info.plist
 	cp $< $@
 
 build/malachitectl: ctl/malachitectl.c kext/abi.h
-	xcrun clang -O2 -Wall $< -framework IOKit -lz -o $@
+	xcrun clang -O2 -Wall $< -framework IOKit -framework CoreFoundation -lz -o $@
 
 # boots GSP-RM at startup: firmware, malachitectl and a LaunchDaemon
 FWDIR := /Library/Application Support/Malachite/570
