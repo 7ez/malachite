@@ -1,7 +1,5 @@
-// airc v2 back end: IR -> machine instructions on virtual registers -> linear-scan register allocation ->
-// SASS. Predicates live as 0/1 integers in GPRs (a single scratch predicate P0 is used inside a compare,
-// select or branch and never stays live), so there is only one register bank to allocate. A fragment shader that
-// discards also keeps P6 for the whole program: set once the thread has demoted to a helper.
+// Predicates live as 0/1 GPRs and P0 never stays live, so there is one register bank to allocate; a discarding
+// fragment shader also holds P6, the demoted flag, throughout.
 #include <stdlib.h>
 #include <string.h>
 #include "airc_int.h"
@@ -29,8 +27,8 @@ enum mkind {
     MK_IMNMX,    // def = min/max(src0, src1) (aux bit0 max, bit1 signed)
     MK_FADD,     // aux bit0: subtract; aux bit1: half
     MK_FMUL,     // aux bit1: half
-    MK_FFMA,     // aux bit1: half; bits 2:3 SASS_RND_*; bit 4: imm is the multiplier (src a, c), bit 5: the addend
-    // (src a, b); FADD and FMUL with bit 4: imm is the second operand (src a only); all three with bit 6: .SAT
+    MK_FFMA,     // aux bit1 half, bits 2:3 SASS_RND_*, bit 4 imm multiplier (bit 4 on FADD/FMUL: imm src b),
+    // bit 5 imm addend, bit 6 .SAT on all three
     MK_FMNMX,    // aux bit0: max
     MK_MUFU,     // aux = MUFU_*
     MK_I2F,      // aux: signed source
@@ -51,8 +49,7 @@ enum mkind {
     MK_FSETP,     // P0 = src0 fcond src1 (aux = FSETP_* | SETP_AND or SETP_OR)
     MK_SEL,       // def = P0 ? src0 : src1
     MK_LDG,       // def = [src0 pair + imm], aux bytes (8 or 16: def is a pair or quad)
-    MK_ATOM,      // def = the old value at [src0 + imm] (a pair global, RZ or a word shared), src1 data, src2 swapped
-                  // in (CAS), aux IR_ATOMA_*; no def: RED (global) or ATOMS to RZ
+    MK_ATOM,      // def = old [src0 + imm], src1 data, src2 CAS value, aux IR_ATOMA_*; no def: RED or ATOMS to RZ
     MK_STG,       // [src0 pair + imm] = src1, aux bytes (8 or 16: src1 is a pair or quad)
     MK_LDS,       // def = shared[src0 + imm] (src0 optional), aux bytes
     MK_STS,       // shared[src0 + imm] = src1, aux bytes
@@ -70,22 +67,18 @@ enum mkind {
     MK_DEMOTE,    // P6 |= src0 (aux: its inverse), or P6 = true without one: the exit drops the fragment
     MK_BSSY,      // convergence barrier imm, the threads meeting again at block `target`
     MK_BSYNC,     // wait at barrier imm for the threads it was set for
-    MK_CALL,      // subroutine imm (entry block `target`): xs into the window, xd out of it; aux the barrier the
-                  // caller's threads meet again at after it, -1 for none
+    MK_CALL,      // subroutine imm at block `target`, xs in, xd out; aux the reconvergence barrier or -1
     MK_ENTRY,     // a subroutine's start: xd out of the window
     MK_RET,       // a subroutine's return: xs into the window
 };
 
-// Subroutines take their arguments and return address in a window of registers from R2: the address in R2 (R2:R3
-// for the RET), the arguments and then the results from R4, each in the slot the IR gives it. A value live where a
-// call, an entry or a return moves them stays out of the window, so the moves clobber nothing; a callee keeps out
-// of every register live across a call to it as well, and the convergence barriers its callers hold.
+// The subroutine window: return address in R2 (R2:R3 for RET), arguments then results from R4. Values live across
+// the moves stay out of it, and a callee avoids its callers' live registers and barriers.
 #define WIN_RA 2
 #define WIN_ARGS 4
 
-// a value moved through the window at slot, or one of these
-#define SLOT_RA (-1)    // the return address
-#define SLOT_KEEP (-2)  // not moved: a value of the caller's the callee reads, which the call keeps live
+#define SLOT_RA (-1)
+#define SLOT_KEEP (-2)  // a caller value the callee reads, kept live rather than moved
 struct xfer {
     int vreg, slot;
 };
@@ -100,35 +93,32 @@ struct mop {
     int immb;    // src1 is the immediate imm instead (LOP3, IADD3, IMAD, IMNMX, FMNMX, SHL, SHR, ISETP, FSETP, SEL)
     int target;  // branch target block id, or -1
     int label;   // branch target mop index (a stub), or -1
-    struct xfer *xs, *xd;  // a call's, entry's or return's sources and definitions beyond src and def
+    struct xfer *xs, *xd;  // window moves of a call, entry or return
     int nxs, nxd;
     int mods;  // float sources' modifiers, MOD_NEG and MOD_ABS two bits a source (FADD, FMUL, FFMA, FSETP)
-    int ur;    // LDG, STG: the uniform register pair holding the base, src0 the offset from it (a pair, a word when
-               // narrow, or VREG_RZ for none); 0 when src0 is the whole address
+    int ur;    // LDG, STG: uniform base pair with src0 the offset (word when narrow, or RZ); 0 if src0 is the address
     int narrow;
-    int readonly;  // LDG: of memory nothing writes while the kernel runs, through the read-only cache
-    int guarded;   // LDG: only where P0 is set
+    int readonly;  // LDG through the read-only cache
+    int guarded;   // LDG under P0
 };
 
-// ISETP's and FSETP's aux: the compare combined with P0's value before it, rather than taken alone
+// ISETP/FSETP aux: combine with the previous P0
 #define SETP_AND 64
 #define SETP_OR 128
 
 #define MAX_MOPS (1 << 17)
 static struct mop g_mops[MAX_MOPS];
 static int g_nmops;
-static int g_block_mop[1 << 16];  // first mop of each block
+static int g_block_mop[1 << 16];
 
-// Volta and later don't bring a warp's threads back together after a branch on their own: a derivative (a quad
-// shuffle) after an if/else would read lanes still on the other side. A conditional branch whose paths meet again
-// without a loop between sets a convergence barrier (BSSY) to that block, and the block waits at it (BSYNC); so
-// does the branch into a loop, to where the lanes meet after it.
-static int g_bssy[1 << 16];     // the barrier a block's branch sets, -1 for none
-static int g_bssy_to[1 << 16];  // and the block the paths meet at
-static int g_bsync[1 << 16][4];  // the barriers a block waits at first, innermost first
+// Volta+ doesn't reconverge after a branch by itself, so a quad shuffle after an if/else would read lanes still on
+// the other side: branches and loop entries set a BSSY to where the paths meet, which BSYNCs there.
+static int g_bssy[1 << 16];     // -1 for none
+static int g_bssy_to[1 << 16];
+static int g_bsync[1 << 16][4];  // innermost first
 static int g_nbsync[1 << 16];
 
-// is any block reachable from b without passing m at or before b in the block order (a loop)?
+// a loop: something at or before b in block order reached from b without passing m
 static int loops_before(struct ir_block *b, struct ir_block *m, const int *order, char *seen, int start)
 {
     for (unsigned i = 0; i < b->nsucc; i++) {
@@ -146,7 +136,7 @@ static int loops_before(struct ir_block *b, struct ir_block *m, const int *order
     return 0;
 }
 
-// marks the blocks of loop h that b is in: those reaching b back up without passing h
+// the blocks of loop h reaching b without passing h
 static void loop_blocks(struct ir_block *b, struct ir_block *h, char *in)
 {
     if (in[b->id])
@@ -158,7 +148,7 @@ static void loop_blocks(struct ir_block *b, struct ir_block *h, char *in)
         loop_blocks(b->preds[i], h, in);
 }
 
-// the barriers of one function (the shader's, or subroutine region - 1's); how many it holds at most at once
+// returns the most barriers the function holds at once
 static int plan_convergence(struct ir_func *f, int region)
 {
     int nb = f->nblocks, words = (nb + 63) / 64, used = 0;
@@ -173,7 +163,7 @@ static int plan_convergence(struct ir_func *f, int region)
             g_bssy[b->id] = -1;
             g_nbsync[b->id] = 0;
         }
-    // post-dominators: each block's set, iterated to a fixed point (the blocks are in reverse postorder)
+    // post-dominators to a fixed point; blocks are in reverse postorder
     uint64_t *pdom = malloc((size_t)nb * words * 8);
     for (int i = 0; i < nb; i++)
         memset(pdom + (size_t)i * words, 0xff, words * 8);
@@ -196,7 +186,7 @@ static int plan_convergence(struct ir_func *f, int region)
             }
         }
     }
-    // a branch's paths meet at its nearest strict post-dominator: the one post-dominated by all the others
+    // paths meet at the nearest strict post-dominator
     char *seen = calloc(nb, 1), *in_loop = calloc(nb, 1);
     int stack[16], depth = 0, ok = 1;
     for (int k = 0; k < n && ok; k++) {
@@ -208,8 +198,7 @@ static int plan_convergence(struct ir_func *f, int region)
             }
             g_bsync[b->id][g_nbsync[b->id]++] = g_bssy[stack[--depth]];
         }
-        // a branch, or the way into a loop: lanes leave a loop when they're done with it, and a barrier or a
-        // shuffle after it must not run before the rest have
+        // lanes leave a loop one by one, and a barrier or shuffle after it must wait for the rest
         struct ir_block *from = b;
         int loop = 0;
         if (b->last && b->last->op == IR_BR) {
@@ -226,7 +215,7 @@ static int plan_convergence(struct ir_func *f, int region)
         } else if (!b->last || b->last->op != IR_CBR) {
             continue;
         }
-        // a loop's lanes meet where it's left for good, past every block of it
+        // past every block of the loop
         struct ir_block *m = NULL;
         int best = -1;
         for (int i = 0; i < nb; i++) {
@@ -243,7 +232,7 @@ static int plan_convergence(struct ir_func *f, int region)
         }
         if (!m || order[m->id] <= k)
             continue;
-        int inside = 0;  // and so the regions within it close before its own
+        int inside = 0;  // inner regions close before it
         for (int i = 0; loop && i < nb; i++)
             inside |= in_loop[i] && order[i] > order[m->id];
         if (inside)
@@ -251,11 +240,11 @@ static int plan_convergence(struct ir_func *f, int region)
         memset(seen, 0, nb);
         if (loops_before(from, m, order, seen, k))
             continue;
-        // a switch's chain of compares, an else-if: the open region's barrier brings these paths together too
+        // a switch's compare chain or an else-if shares the open region's barrier
         if (depth && g_bssy_to[stack[depth - 1]] == m->id)
             continue;
         if (depth && order[m->id] > order[g_bssy_to[stack[depth - 1]]]) {
-            ok = 0;  // not inside the open region: give up on barriers for the function
+            ok = 0;  // not nested, so no barriers for this function
             break;
         }
         if (depth == 15)
@@ -284,10 +273,10 @@ static int plan_convergence(struct ir_func *f, int region)
 
 static struct ir_func *g_fn;
 static int g_nregions;                   // the shader and its subroutines
-static uint32_t g_callees[IR_MAX_SUBS + 1];  // the regions each one calls, a bit each
+static uint32_t g_callees[IR_MAX_SUBS + 1];
 static int g_topo[IR_MAX_SUBS + 1];      // callers before callees
 static int g_bar_base[IR_MAX_SUBS + 1];  // barriers below it are its callers'
-static int g_wrap_bar[IR_MAX_SUBS + 1];  // the barrier its calls reconverge at, -1 for none
+static int g_wrap_bar[IR_MAX_SUBS + 1];  // where its calls reconverge, -1 for none
 
 static void topo_visit(int r, char *seen, int *n)
 {
@@ -308,7 +297,7 @@ static void plan_regions(struct ir_func *f)
                 g_callees[b->func] |= 1u << (v->imm + 1);
     char seen[IR_MAX_SUBS + 1] = { 0 };
     int n = g_nregions;
-    for (int r = 0; r < g_nregions; r++)  // those no call reaches any more have no blocks: they go anywhere
+    for (int r = 0; r < g_nregions; r++)  // unreached regions have no blocks
         if (!seen[r])
             topo_visit(r, seen, &n);
     int used[IR_MAX_SUBS + 1];
@@ -318,7 +307,7 @@ static void plan_regions(struct ir_func *f)
     }
     for (int k = 0; k < g_nregions; k++) {
         int r = g_topo[k], calls = g_callees[r] != 0;
-        if (g_bar_base[r] + used[r] + calls > 16) {  // too deep a chain: this one goes without its own
+        if (g_bar_base[r] + used[r] + calls > 16) {  // out of the 16 barriers: this one goes without
             for (struct ir_block *b = f->entry; b; b = b->next)
                 if (b->func == r) {
                     g_bssy[b->id] = -1;
@@ -348,15 +337,15 @@ static struct mop *emit_mop(enum mkind k)
 
 struct vreg {
     int size, align;  // in hardware registers
-    int next;         // next member of a consecutive cluster, or -1
-    int hw;           // assigned hardware register, -1 before
-    int start, end;   // live range in mop order: first to last mop it is live at, holes and all
-    int seg;          // the first of its live segments (g_segs), -1 for none
-    int ir;           // the IR value this is the register of, for the spiller; -1 for none
+    int next;         // next cluster member, or -1
+    int hw;
+    int start, end;   // in mop order, holes and all
+    int seg;          // first of g_segs, -1 for none
+    int ir;           // IR value id for the spiller, -1 for none
 };
 
 #define MAX_VREGS 65536
-#define VREG_RZ (-2)  // a source that reads RZ
+#define VREG_RZ (-2)
 static struct vreg g_vregs[MAX_VREGS];
 static int g_nvregs;
 
@@ -376,7 +365,6 @@ static int new_vreg(int size, int align)
     return g_nvregs++;
 }
 
-// a cluster of n consecutive registers, aligned; returns the base vreg, members base..base+n-1 as vregs
 static int new_cluster(int n, int align, int *members)
 {
     int base = -1, prev = -1;
@@ -394,12 +382,12 @@ static int new_cluster(int n, int align, int *members)
 }
 
 static struct airc_info *g_info;
-static int g_one;  // a vreg holding the integer 1, for materialising booleans
-static int g_block;  // the block being lowered
-static int g_scratch;  // registers above the allocation: temporaries, and a fragment's colours at its exit
-static int g_exit_regs;  // the most colour registers an exit hands over
-static int g_exit_tmp;   // the register its moves park a value in
-static int g_demote;     // the shader discards: P6 holds the demoted flag
+static int g_one;  // the integer 1, for materialising booleans
+static int g_block;
+static int g_scratch;  // above the allocation: temporaries and exit colours
+static int g_exit_regs;
+static int g_exit_tmp;   // where exit moves park a value
+static int g_demote;     // P6 holds the demoted flag
 
 static int mov_imm(int64_t imm)
 {
@@ -410,8 +398,7 @@ static int mov_imm(int64_t imm)
     return r;
 }
 
-// Constants all sit in the entry block; each block makes its own copy of a value, so none holds a register
-// across the whole shader. An entry left by another block counts as free.
+// per block, so no constant holds a register across the whole shader; another block's entry counts as free
 static struct {
     int64_t imm;
     int block, vreg;
@@ -433,7 +420,7 @@ static int const_vreg(int64_t imm)
     return mov_imm(imm);
 }
 
-// the vreg of an IR value (its lane). An I64 value is a pair cluster; its vreg is the lo member.
+// an I64 is a pair cluster named by its low member
 static int vreg_of(struct ir_val *v)
 {
     if (v->op == IR_CONST || v->op == IR_UNDEF)
@@ -443,7 +430,6 @@ static int vreg_of(struct ir_val *v)
     return v->vreg;
 }
 
-// the pair of a 64-bit value, a constant's made here
 static int pair_of(struct ir_val *v)
 {
     if (v->op != IR_CONST && v->op != IR_UNDEF)
@@ -457,13 +443,11 @@ static int pair_of(struct ir_val *v)
     return r;
 }
 
-// How many times each IR value is read, and whether a value that is read once and was made a few mops back may be
-// made straight into the register it is being copied to (an operand of a texture op, a wide store, a vertex
-// output, which sit in registers of their own in a row). AIRC_NODEFINTO=1 keeps the copy.
+// A value read once, made a few mops back, goes straight into the cluster register it'd be copied to (texture
+// operands, wide stores, vertex outputs). AIRC_NODEFINTO=1 keeps the copy.
 static int *g_use_count;
 static int g_no_define_into;
-// by IR id: a bitcast (an or with 0, which marks the change of type) that is its source's register, or a source one
-// is; phi_into_def leaves them alone, as moving one's register would leave the other's behind
+// bitcasts (or 0) sharing their source's register; phi_into_def skips them so the two don't split
 static unsigned char *g_alias;
 
 static void count_uses(struct ir_func *f)
@@ -548,12 +532,8 @@ static enum mkind binop_kind(struct ir_val *v)
 #define LOP3_OR 0xfc
 #define LOP3_XOR 0x3c
 
-// compares used only as selects' conditions, or as the condition of a branch in their own block: each makes P0 from
-// the compare's operands itself, where a 0/1 register would cost a SEL and an ISETP more (and their latencies, the
-// predicate written twice before the branch can read it). An and or or of two predicates read only as such a
-// condition in its own block is made in P0 the same way, the second operand's compare combined with the first's
-// result (SETP.AND/.OR P0, ..., P0), and its compares in its block are fused into it. AIRC_NOFUSEBR=1 leaves the
-// branches out.
+// Compares read only as a select or same-block branch condition go straight to P0, saving a SEL, an ISETP and their
+// latency; predicate and/or chains do too via SETP.AND/.OR. AIRC_NOFUSEBR=1 leaves branches out.
 static unsigned char *g_cmp_fused;
 
 static int is_pand_or(const struct ir_val *v)
@@ -561,7 +541,6 @@ static int is_pand_or(const struct ir_val *v)
     return v->op == IR_PAND || v->op == IR_POR;
 }
 
-// source i of v is read as P0: a select's condition or a load's guard
 static int is_condition(const struct ir_val *v, unsigned i)
 {
     return (v->op == IR_SEL && i == 0) || (v->op == IR_LDG && i == 1);
@@ -580,8 +559,7 @@ static void find_fused_compares(struct ir_func *f)
         for (struct ir_val *v = b->first; v; v = v->next)
             g_cmp_fused[v->id] = v->op == IR_CMP || is_pand_or(v);
     int branches = !airc_pass_off("AIRC_NOFUSEBR");
-    // one read by another made in P0 in its block is made on the way to that one, a chain of SETP.AND/.OR: so
-    // long as each has a compare or a register to test on one side
+    // a chain of SETP.AND/.OR needs a compare or a register on one side of each link
     for (int again = 1; again;) {
         again = 0;
         for (struct ir_block *b = f->entry; b; b = b->next)
@@ -615,17 +593,14 @@ static void find_fused_compares(struct ir_func *f)
             }
 }
 
-// A float source that is a negation or an absolute value goes into an instruction that has source modifiers as the
-// modifier (FADD, FMUL, FFMA and FSETP do; FMNMX is left alone, its denormal handling with a modifier isn't known),
-// and the LOP3 that would make it is left out when nothing else reads it. A modifier flips or clears the sign bit
-// as the LOP3 did, so a NaN and a signed zero come through the same. AIRC_NOMODS=1 turns it off.
+// fneg/fabs become source modifiers on FADD, FMUL, FFMA and FSETP; FMNMX's denormal handling with one is unknown.
+// They only touch the sign bit like the LOP3, so NaNs and signed zeros match. AIRC_NOMODS=1 turns it off.
 #define MOD_NEG 1
 #define MOD_ABS 2
-static unsigned char *g_mod_needed;  // by IR id: a negation or absolute value something still reads as a register
+static unsigned char *g_mod_needed;  // still read as a register
 static int g_no_mods;
 
-// v without its negations and absolute values, their effect in *mods; v itself when there is nothing to take off
-// (or what is under them is a constant, which stays a constant for the immediate forms)
+// a constant underneath is left alone for the immediate forms
 static struct ir_val *strip_mods(struct ir_val *v, int *mods)
 {
     int inner = 0;
@@ -674,12 +649,10 @@ static void find_needed_mods(struct ir_func *f)
     }
 }
 
-// A float rounded to half and straight back to float (a half texture sample used as a float) is two instructions a
-// value, F2FP and HADD2.F32. Two such roundings that sit near each other make one F2FP.PACK_AB between them, the
-// halves read back from the low and the high half: the roundings are the same conversions. Only a half that
-// nothing but a conversion back reads is paired, so nothing sees the other half. AIRC_NOPACKH=1 turns it off.
-static struct ir_val **g_pair;  // by IR id: the F2H a second of a pair is packed with
-static unsigned char *g_pair_hi, *g_first;  // the second of the two, and the first
+// Two nearby float->half->float roundings share one F2FP.PACK_AB, read back from each half. Only halves nothing but
+// the conversion back reads are paired. AIRC_NOPACKH=1 turns it off.
+static struct ir_val **g_pair;  // the second's partner
+static unsigned char *g_pair_hi, *g_first;
 
 static void find_half_pairs(struct ir_func *f)
 {
@@ -725,16 +698,14 @@ static void find_half_pairs(struct ir_func *f)
     free(bad);
 }
 
-// a constant an instruction takes as its immediate rather than in a register
 static int is_imm(const struct ir_val *v)
 {
     return v->op == IR_CONST && v->type != IR_I64;
 }
 
-// A multiply that only an add in its own block reads is made by the add, as one IMAD (y * width + x, in nearly
-// every kernel's addressing); its operands are read there. A constant addend stays IADD3's immediate.
+// a multiply read only by a same-block add becomes IMAD (y * width + x); a constant addend stays IADD3's immediate
 static unsigned char *g_mul_fused, *g_add_fused;
-static unsigned char *g_late_def;  // made with the phi copies instead (lower_late_def)
+static unsigned char *g_late_def;  // made with the phi copies (lower_late_def)
 
 static void find_fused_muls(struct ir_func *f)
 {
@@ -758,8 +729,7 @@ static void find_fused_muls(struct ir_func *f)
                 }
             }
         }
-    // a sum of registers that only another such sum in its block reads goes into that one's IADD3 as its third
-    // source; a sum made of three takes no fourth
+    // a register sum read only by another same-block sum becomes its IADD3's third source
     free(g_add_fused);
     g_add_fused = calloc(n, 1);
     unsigned char *three = calloc(n, 1);
@@ -822,13 +792,11 @@ static int lower_mul_add(struct ir_val *v)
     return 1;
 }
 
-// Values only one instruction of their block reads, made by it instead (g_folded), one instruction fewer each:
-// a byte or two of a word shifted down and masked, or a low byte or half sign-extended, is one PRMT; a float
-// converted to an unsigned integer and clamped to [0, 255] is F2IP.U8 (byte_convert). An FMUL or FFMA that only a
-// saturate (FADD.SAT x, +0) reads is made with .SAT instead (g_sat): rounded once, flushed and a NaN made 0 alike.
+// Single-reader values folded into their reader: byte extracts and sign extensions into PRMT, a [0, 255] clamped
+// conversion into F2IP.U8, and an FMUL/FFMA under FADD.SAT x, +0 into .SAT, which rounds and flushes alike.
 static unsigned char *g_folded, *g_sat;
 
-// the PRMT selector v is of *word, or -1
+// -1 if v isn't a PRMT of *word
 static int byte_select(const struct ir_val *v, struct ir_val **word)
 {
     if (v->type != IR_I32 || v->nsrc != 2)
@@ -859,10 +827,8 @@ static int is_float(const struct ir_val *v, uint32_t bits)
     return v->op == IR_CONST && (uint32_t)v->imm == bits;
 }
 
-// the float v is F2IP.U8 of, or NULL; *inner the value it is made with, which has to be folded for it (NULL for
-// none). F2IP truncates and saturates, a NaN to 0, so v is an unsigned conversion clamped to 255 after it (F2I makes
-// a NaN or a negative 0), or before (fmin(fmax(x, +0), 255.0): FMNMX makes a NaN 0), or of a saturate times less
-// than 256, which can't leave the range.
+// F2IP saturates a NaN to 0, matching a clamp after F2I or fmin(fmax(x, +0), 255.0) before it, or a saturate
+// times under 256; *inner must fold too.
 static struct ir_val *byte_convert(const struct ir_val *v, struct ir_val **inner)
 {
     struct ir_val *d;
@@ -885,7 +851,7 @@ static struct ir_val *byte_convert(const struct ir_val *v, struct ir_val **inner
     }
     for (int i = 0; x->op == IR_FMUL && i < 2; i++) {
         struct ir_val *s = x->src[i], *k = x->src[!i];
-        // a positive float's bits order as it does: 0 < k < 256.0
+        // positive float bits order as integers: 0 < k < 256.0
         if (s->op == IR_FADD && (s->aux & IR_FADD_SAT) && k->op == IR_CONST && (uint32_t)k->imm > 0 &&
             (uint32_t)k->imm < 0x43800000) {
             *inner = NULL;
@@ -895,7 +861,6 @@ static struct ir_val *byte_convert(const struct ir_val *v, struct ir_val **inner
     return NULL;
 }
 
-// the FMUL or FFMA v saturates, or NULL
 static struct ir_val *sat_source(const struct ir_val *v)
 {
     if (v->op != IR_FADD || !(v->aux & IR_FADD_SAT) || v->type != IR_F32 || v->src[1]->op != IR_CONST ||
@@ -905,7 +870,7 @@ static struct ir_val *sat_source(const struct ir_val *v)
     return (x->op == IR_FMUL || x->op == IR_FFMA) && x->type == IR_F32 ? x : NULL;
 }
 
-// the 0 - x that the signed max(x, 0 - x) v takes, as abs comes from the front end; NULL if v isn't one
+// the front end's abs is max(x, 0 - x)
 static struct ir_val *abs_negation(const struct ir_val *v)
 {
     if (v->op != IR_MAX || !v->aux || v->type != IR_I32)
@@ -936,7 +901,7 @@ static void find_folds(struct ir_func *f)
                 g_folded[in->id] = g_use_count[in->id] == 1 && in->block == b;
             } else if (byte_convert(v, &in)) {
                 if (in) {
-                    struct ir_val *max = in->op == IR_FMIN ? in->src[0] : in;  // fmin(fmax(x, 0), 255) takes both
+                    struct ir_val *max = in->op == IR_FMIN ? in->src[0] : in;
                     g_folded[in->id] = g_folded[max->id] = g_use_count[in->id] == 1 && in->block == b &&
                                                            g_use_count[max->id] == 1 && max->block == b;
                 }
@@ -948,28 +913,27 @@ static void find_folds(struct ir_func *f)
         }
 }
 
-// A logic operation whose operands are logic operations nothing else reads, in its block, is one LOP3 when they
-// come to three inputs at most: two registers and a constant (or its complement) as the immediate, or three
-// registers; zero and all ones take no input. A sign mask and xor, a copysign, bits packed into a word.
-#define LOP3_A 0xf0  // the table's pattern for source a, b and c
+// A tree of single-use same-block logic ops becomes one LOP3 if it has at most three inputs (an immediate counts as
+// b; 0 and ~0 are free), covering copysign, sign masks and bit packing.
+#define LOP3_A 0xf0
 #define LOP3_B 0xcc
 #define LOP3_C 0xaa
 
 struct lop3 {
-    struct ir_val *reg[3];  // the sources read as a, as c, as b
+    struct ir_val *reg[3];  // read as a, c, b
     int nreg, has_imm;
-    uint32_t imm;  // b, when it is the immediate
+    uint32_t imm;  // b
     uint8_t root, lut;
 };
-static struct lop3 *g_lop3;  // by IR id
-static unsigned char *g_lop3_in;  // by IR id: made inside the root that reads it, for the one being built
+static struct lop3 *g_lop3;
+static unsigned char *g_lop3_in;  // inside the root being built
 
 static int is_logic(const struct ir_val *v)
 {
     return (v->op == IR_AND || v->op == IR_OR || v->op == IR_XOR) && (v->type == IR_I32 || v->type == IR_F32);
 }
 
-// u's table over the sources taken so far (and any it adds), -1 when it needs too many
+// -1 when u needs too many inputs
 static int lop3_eval(struct ir_val *u, struct ir_val *root, struct lop3 *l)
 {
     if (u == root || g_lop3_in[u->id]) {
@@ -998,7 +962,7 @@ static int lop3_eval(struct ir_val *u, struct ir_val *root, struct lop3 *l)
     return pattern[l->nreg++];
 }
 
-// an operand made in the root: a few values back at most, so that its own operands aren't kept live much longer
+// only nearby operands fold, so theirs aren't kept live much longer
 #define LOP3_NEAR 8
 
 static int lop3_inner(const struct ir_val *u, const struct ir_val *root)
@@ -1024,14 +988,13 @@ static void find_lop3(struct ir_func *f)
     free(g_lop3_in);
     g_lop3 = calloc(n, sizeof(*g_lop3));
     g_lop3_in = calloc(n, 1);
-    unsigned char *taken = calloc(n, 1);  // made inside some root
+    unsigned char *taken = calloc(n, 1);
     struct ir_val *in;
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->last; v; v = v->prev) {
             if (!is_logic(v) || taken[v->id] || g_folded[v->id] || g_late_def[v->id] || byte_select(v, &in) >= 0 ||
                 byte_convert(v, &in))
                 continue;
-            // take operands in, one at a time, while the whole still fits
             struct ir_val *open[16], *inner[16];
             int nopen = 0, ninner = 0;
             open[nopen++] = v->src[0];
@@ -1066,7 +1029,6 @@ static void find_lop3(struct ir_func *f)
     free(taken);
 }
 
-// v as the LOP3 find_lop3 made it
 static int lower_lop3(struct ir_val *v)
 {
     struct lop3 *l = &g_lop3[v->id];
@@ -1104,10 +1066,8 @@ static int lower_byte_convert(struct ir_val *v)
     return 1;
 }
 
-// An atomic whose old value nothing reads returns none where no barrier, fence or call can follow it: ATOMS to RZ,
-// or RED for global memory (not an exchange, which RED hasn't), neither taking a register or a write barrier. A
-// barrier waits for the atomics before it to land (g_mem_bars), which takes their write barriers, and ptxas turns RED
-// back into ATOMG ahead of a fence too.
+// Unread atomics become RED or ATOMS to RZ, saving a register and write barrier, unless a barrier, fence or call may
+// follow: barriers wait on atomics' write barriers (g_mem_bars), and ptxas also keeps ATOMG before a fence.
 static unsigned char *g_reduce;
 
 static void find_reductions(struct ir_func *f)
@@ -1119,7 +1079,7 @@ static void find_reductions(struct ir_func *f)
                 n = v->id + 1;
     free(g_reduce);
     g_reduce = calloc(n, 1);
-    unsigned char *reach = calloc(f->nblocks, 1);  // a barrier, fence or call can be reached from the block
+    unsigned char *reach = calloc(f->nblocks, 1);  // reaches a barrier, fence or call
     int anywhere = 0;
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v; v = v->next)
@@ -1137,7 +1097,7 @@ static void find_reductions(struct ir_func *f)
             int op = IR_ATOMA_OP(v->aux);
             if (v->op != IR_ATOM || g_use_count[v->id] || op == SASS_ATOM_CAS)
                 continue;
-            // a subroutine's caller may go on to one
+            // a subroutine's caller may reach one
             int later = (op == SASS_ATOM_EXCH && !IR_ATOMA_SHARED(v->aux)) || (b->func && anywhere);
             for (struct ir_val *u = v->next; u && !later; u = u->next)
                 later = u->op == IR_BAR || u->op == IR_CALL;
@@ -1148,25 +1108,21 @@ static void find_reductions(struct ir_func *f)
     free(reach);
 }
 
-// A buffer argument's address is the same in every thread, so it goes into a uniform register pair once, in the
-// prologue, and a load or store off it takes the base from there ([R.64+UR], as NAK addresses buffers): the
-// offset alone is made in registers, by IMAD.WIDE on RZ rather than on the base. That frees the base's pair and the
-// moves that make it, and buffers indexed alike share one offset. The offset stays 64-bit, which keeps a signed
-// index and a buffer past 4 GB right; only an unsigned 32-bit byte offset is used as it is ([R.U32+UR]). An address
-// read other than as a load's or store's (a phi's input, stored, compared, an atomic's) is made whole as before, and
-// so is the base it is made from.
+// Buffer bases are uniform, so they load once into UR pairs and accesses use [R.64+UR] as NAK does, saving a pair
+// per base and sharing offsets. Offsets stay 64-bit for signed indices and buffers past 4 GB, except unsigned 32-bit
+// ones ([R.U32+UR]). An address used other than by a load or store is built whole, with its base.
 #define UR_FIRST 6  // UR4:UR5 hold the memory descriptor
 #define UR_PAIRS 28
-static int *g_ur;  // by IR id: a base's uniform register pair, or the pair an offset is from; 0 for none
+static int *g_ur;  // 0 for none
 static unsigned char *g_whole;  // a base also read as a whole address
-static unsigned char *g_narrow;  // an offset that is its 32-bit index, zero-extended
+static unsigned char *g_narrow;  // a zero-extended 32-bit offset
 static struct {
     int64_t off;  // in const bank 0
     int used;
 } g_ubase[UR_PAIRS];
 static int g_nubase;
 
-// the offsets from a base the block being lowered has made, by index and scale
+// this block's offsets, by index and scale
 static struct offset {
     int block;
     struct ir_val *index;
@@ -1176,8 +1132,7 @@ static struct offset {
 } g_offsets[32];
 static int g_noffsets;
 
-// the operand vectors the block's texture ops have gathered, by their values: a later op on the same handle and
-// LOD (or coordinates) reads the same registers rather than copying them in again
+// texture operand vectors this block gathered, reused by later ops with the same values
 static struct texvec {
     int block, n;
     struct ir_val *val[4];
@@ -1251,7 +1206,7 @@ static void find_uniform_bases(struct ir_func *f)
         for (struct ir_val *u = b->first; u; u = u->next)
             for (unsigned i = 0; i < u->nsrc; i++) {
                 struct ir_val *s = u->src[i];
-                if (s && u->op == IR_ADDR)  // what extends it needs the pair
+                if (s && u->op == IR_ADDR)  // extending it needs the pair
                     g_narrow[s->id] = 0;
                 if (!s || s->op != IR_CBUF || !g_ur[s->id])
                     continue;
@@ -1262,22 +1217,18 @@ static void find_uniform_bases(struct ir_func *f)
             }
 }
 
-// Loads of memory nothing writes while the kernel runs go through the read-only cache (LDG.CONSTANT, __ldg's path).
-// Each global address is followed back to the buffer argument it points into: a load qualifies when the AIR says
-// its buffer is only read and aliases no other argument, and no store or atomic here goes into it or anywhere not
-// traced to one buffer. A texture written may be a view of a buffer, so a kernel that writes one gets none. Kernels
-// only: every launch empties the cache, while draws in a pass may not. The shader's constant data is written once,
-// before it ever runs: its loads qualify in every stage.
-#define ROOT_NONE (-1)  // no address seen yet (a null pointer)
-#define ROOT_ANY (-2)   // one from memory or a parameter, or from more than one buffer
-static unsigned char *g_readonly_load;  // by IR id
+// LDG.CONSTANT for loads from a buffer the AIR marks read-only and unaliased, with no store or untraced write in the
+// kernel. A written texture may view a buffer, so that disables it. Kernels only, as each launch empties the cache
+// and draws in a pass may not; the shader's own constant data qualifies in every stage.
+#define ROOT_NONE (-1)  // a null pointer
+#define ROOT_ANY (-2)   // from memory, a parameter, or several buffers
+static unsigned char *g_readonly_load;
 
 static int meet_root(int a, int b)
 {
     return a == ROOT_NONE ? b : b == ROOT_NONE || a == b ? a : ROOT_ANY;
 }
 
-// the buffer argument read from const bank 0 at off, or -1
 static int buffer_arg_at(int off)
 {
     for (unsigned i = 0; i < g_info->nargs; i++)
@@ -1353,7 +1304,7 @@ static void find_readonly_loads(struct ir_func *f)
     free(root);
 }
 
-// a global access's address as base + scale * (index + k) + off, the constants added to the index taken out of it
+// base + scale * (index + k) + off
 struct access {
     const struct ir_val *base, *index;
     uint32_t k;
@@ -1382,8 +1333,7 @@ static struct access access_of(const struct ir_val *v)
     return a;
 }
 
-// Do two global accesses (aux their bytes) miss each other: off one base and index, a few elements apart? An
-// index that wraps round between them puts them 2^32 elements apart instead, which misses too.
+// same base and index a few elements apart; an index wrapping between them puts them 2^32 apart, still disjoint
 static int apart(const struct ir_val *x, const struct ir_val *y)
 {
     struct access a = access_of(x), b = access_of(y);
@@ -1394,9 +1344,8 @@ static int apart(const struct ir_val *x, const struct ir_val *y)
     return d >= x->aux || -d >= y->aux;
 }
 
-// A global store that a later one in its block writes over goes, as long as nothing between could read the word
-// (a load but a read-only one or one elsewhere, a texture, an atomic) or make it seen (a barrier, a call). Some
-// kernels add a sum up in their output buffer, a store a term.
+// Some kernels accumulate a sum in their output buffer, a store per term; all but the last go if nothing between
+// can read or publish the word.
 static void drop_overwritten_stores(struct ir_func *f)
 {
     for (struct ir_block *b = f->entry; b; b = b->next)
@@ -1417,7 +1366,7 @@ static void drop_overwritten_stores(struct ir_func *f)
         }
 }
 
-// source i of a memory op: a global address off a uniform base is the offset (RZ for none), the base m->ur
+// off a uniform base this is the offset, with the base in m->ur
 static int vreg_of_address(struct ir_val *v, unsigned i, struct mop *m)
 {
     struct ir_val *a = v->src[i];
@@ -1428,7 +1377,7 @@ static int vreg_of_address(struct ir_val *v, unsigned i, struct mop *m)
     return a->op == IR_CBUF ? VREG_RZ : vreg_of(a);
 }
 
-// P0 = the compare c, the constant side as an immediate (so on the right: its operands swapped if need be)
+// an immediate must be on the right, so the compare may be swapped
 static struct mop *emit_setp(const struct ir_val *c)
 {
     struct ir_val *a = c->src[0], *b = c->src[1];
@@ -1461,12 +1410,11 @@ static struct mop *emit_setp(const struct ir_val *c)
     return s;
 }
 
-// P0 = predicate c, a fused compare made from its operands, a 0/1 register tested otherwise
 static struct mop *emit_test(struct ir_val *c)
 {
     if (c->op == IR_CMP && g_cmp_fused[c->id])
         return emit_setp(c);
-    int r = vreg_of(c);  // an and's constant operand is made here, before the ISETP reads it
+    int r = vreg_of(c);  // before the ISETP, as this may emit a constant
     struct mop *s = emit_mop(MK_ISETP);
     s->src[0] = r;
     s->src[1] = VREG_RZ;
@@ -1475,7 +1423,6 @@ static struct mop *emit_test(struct ir_val *c)
     return s;
 }
 
-// P0 = predicate c, where c may also be a fused and or or of two
 static void emit_cond(struct ir_val *c)
 {
     if (is_pand_or(c) && g_cmp_fused[c->id]) {
@@ -1487,8 +1434,7 @@ static void emit_cond(struct ir_val *c)
     }
 }
 
-// the condition the block's last select left in P0, from mop g_p0_at on: a select on the same one after it reads
-// P0 again when nothing between has set it (a vector's lanes, the selects of a flattened if)
+// lets a vector's lanes or a flattened if's selects reuse P0 while nothing has set it since g_p0_at
 static struct ir_val *g_p0_cond;
 static int g_p0_at;
 
@@ -1506,7 +1452,7 @@ static void emit_sel_cond(struct ir_val *c)
 static void lower_value(struct ir_val *v)
 {
     if (v->vreg >= 0)
-        return;  // a prologue value, already produced
+        return;  // a prologue value
     int half = v->type == IR_F16;
     switch (v->op) {
     case IR_CONST:
@@ -1514,7 +1460,7 @@ static void lower_value(struct ir_val *v)
         break;  // made where used (vreg_of)
     case IR_CBUF:
         if (v->type == IR_I64 && g_ur[v->id] && !g_whole[v->id])
-            break;  // only ever a base, read from its uniform pair
+            break;  // only a uniform base
         if (v->type == IR_I64) {
             int m[2];
             v->vreg = new_cluster(2, 2, m);
@@ -1580,7 +1526,7 @@ static void lower_value(struct ir_val *v)
     case IR_FMAX: {
         if ((v->op == IR_MUL && g_mul_fused[v->id]) || (v->op == IR_ADD && g_add_fused[v->id]) ||
             g_late_def[v->id] || g_folded[v->id])
-            break;  // made by the instruction that reads it, or at the end of its loop
+            break;  // made by its reader or at its loop's end
         if (v->op == IR_ADD && (lower_mul_add(v) || lower_add3(v)))
             break;
         struct ir_val *neg = abs_negation(v);
@@ -1614,20 +1560,19 @@ static void lower_value(struct ir_val *v)
         if (lower_byte_convert(v))
             break;
         if ((in = sat_source(v)) && g_sat[in->id]) {
-            v->vreg = in->vreg;  // made saturated
+            v->vreg = in->vreg;
             break;
         }
         v->vreg = new_vreg(1, 1);
         struct mop *m = emit_mop(binop_kind(v));
         m->def = v->vreg;
         struct ir_val *fa = v->src[0], *fb = v->src[1];
-        // a float constant as the second operand goes in the instruction rather than a register
         int imm = !half && (v->op == IR_FADD || v->op == IR_FSUB || v->op == IR_FMUL);
         if (imm && fa->op == IR_CONST && fb->op != IR_CONST && v->op != IR_FSUB) {
             fa = v->src[1];
             fb = v->src[0];
         }
-        // c - x is -x + c in the instruction: the first source negated
+        // c - x as -x + c
         int neg_a = 0;
         if (imm && v->op == IR_FSUB && fa->op == IR_CONST && fb->op != IR_CONST && !airc_pass_off("AIRC_NONEGA")) {
             fa = v->src[1];
@@ -1635,7 +1580,6 @@ static void lower_value(struct ir_val *v)
             neg_a = 1;
         }
         imm = imm && fb->op == IR_CONST && fa->op != IR_CONST;
-        // an integer or logic operand as the immediate: the first one if the operation doesn't care which
         int immb = 0;
         if (!imm && !(v->op == IR_FADD || v->op == IR_FSUB || v->op == IR_FMUL) &&
             (m->k == MK_LOP3 || m->k == MK_IADD3 || m->k == MK_IMAD || m->k == MK_IMNMX || m->k == MK_FMNMX ||
@@ -1653,14 +1597,13 @@ static void lower_value(struct ir_val *v)
             fb = strip_mods(fb, &mb);
             m->mods = ma | mb << 2;
         }
-        // an integer 0 the operation reads is RZ, not a register set to it (0 - x, a negation)
         int rz = v->type == IR_I32 && (m->k == MK_IADD3 || m->k == MK_ISUB || m->k == MK_LOP3 || m->k == MK_IMNMX);
         m->src[0] = rz && fa->op == IR_CONST && !fa->imm ? VREG_RZ : vreg_of(fa);
         m->nsrc = 1;
         if (immb) {
             m->immb = 1;
             m->imm = (uint32_t)fb->imm;
-            if (m->k == MK_ISUB) {  // x - c is x + -c
+            if (m->k == MK_ISUB) {
                 m->k = MK_IADD3;
                 m->imm = (uint32_t)-(int32_t)fb->imm;
             }
@@ -1677,7 +1620,7 @@ static void lower_value(struct ir_val *v)
             m->aux = (v->op == IR_MAX) | (v->aux ? 2 : 0);
         else if (m->k == MK_FADD) {
             m->aux = (v->op == IR_FSUB && !imm) | (half ? 2 : 0) | (imm ? 16 : 0) | (neg_a ? 128 : 0);
-            // the operand made constant can reach here as a register: .SAT works on either form
+            // the constant may have become a register, and .SAT works on either form
             if (v->op == IR_FADD && (v->aux & IR_FADD_SAT))
                 m->aux |= 64;
         } else if (m->k == MK_FMUL)
@@ -1693,7 +1636,7 @@ static void lower_value(struct ir_val *v)
         struct mop *m = emit_mop(MK_FFMA);
         m->def = v->vreg;
         struct ir_val *x[3] = { v->src[0], v->src[1], v->src[2] };
-        int flag = 0;  // a lone float constant goes in the instruction: as the addend, or as the multiplier
+        int flag = 0;
         if (!half) {
             if (x[0]->op == IR_CONST && x[1]->op != IR_CONST) {
                 x[0] = v->src[1];
@@ -1706,7 +1649,7 @@ static void lower_value(struct ir_val *v)
                 x[1] = x[2];
                 x[2] = v->src[0]->op == IR_CONST ? v->src[0] : v->src[1];
             } else if (!airc_pass_off("AIRC_NOFFMA2C") && x[0]->op != IR_CONST && x[1]->op == IR_CONST &&
-                       x[2]->op == IR_CONST) {  // two constants: one in the instruction, one in a register
+                       x[2]->op == IR_CONST) {
                 flag = 32;
             } else if (!airc_pass_off("AIRC_NOFFMA2C") && x[0]->op == IR_CONST && x[1]->op == IR_CONST &&
                        x[2]->op != IR_CONST) {
@@ -1737,7 +1680,7 @@ static void lower_value(struct ir_val *v)
     }
     case IR_FNEG:
     case IR_FABS: {
-        if (v->type == IR_F32 && !g_mod_needed[v->id])  // every reader takes it as a modifier
+        if (v->type == IR_F32 && !g_mod_needed[v->id])
             break;
         v->vreg = new_vreg(1, 1);
         struct mop *m = emit_mop(MK_LOP3_IMM);
@@ -1763,8 +1706,8 @@ static void lower_value(struct ir_val *v)
     case IR_BREV:
     case IR_FLO: {
         if ((v->op == IR_F2H && g_first[v->id]) || g_folded[v->id] || lower_byte_convert(v))
-            break;  // made with its pair, by its clamp, or as F2IP
-        if (v->op == IR_F2H && g_pair[v->id]) {  // the second of a pair: both halves of one register
+            break;
+        if (v->op == IR_F2H && g_pair[v->id]) {
             struct ir_val *lo = g_pair[v->id];
             v->vreg = lo->vreg = new_vreg(1, 1);
             struct mop *m = emit_mop(MK_F2H);
@@ -1793,7 +1736,7 @@ static void lower_value(struct ir_val *v)
             m->aux |= 1;
         break;
     }
-    case IR_SHFL: {  // the whole warp or a quad: clamped at its first lane shifting up, its last otherwise
+    case IR_SHFL: {  // clamped at the first lane shifting up, the last otherwise
         v->vreg = new_vreg(1, 1);
         struct mop *m = emit_mop(MK_SHFL);
         m->def = v->vreg;
@@ -1806,14 +1749,14 @@ static void lower_value(struct ir_val *v)
         m->aux = (v->aux & 3) | ((v->aux & IR_SHFL_QUAD ? 0x1c00 : 0) | ((v->aux & 3) == SASS_SHFL_UP ? 0 : 0x1f)) << 4;
         break;
     }
-    case IR_DERIV: {  // the quad neighbour across x (lane ^ 1) or y (lane ^ 2), then a swizzled subtract
+    case IR_DERIV: {  // the neighbour at lane ^ 1 or ^ 2, then a swizzled subtract
         int n = new_vreg(1, 1);
         struct mop *sh = emit_mop(MK_SHFL);
         sh->def = n;
         sh->src[0] = vreg_of(v->src[0]);
         sh->nsrc = 1;
         sh->imm = v->aux ? 2 : 1;
-        sh->aux = SASS_SHFL_BFLY | 0x1c03 << 4;  // quads of 4 lanes
+        sh->aux = SASS_SHFL_BFLY | 0x1c03 << 4;  // within a quad
         v->vreg = new_vreg(1, 1);
         struct mop *m = emit_mop(MK_FSWZADD);
         m->def = v->vreg;
@@ -1823,7 +1766,7 @@ static void lower_value(struct ir_val *v)
         m->aux = v->aux ? FSWZADD_DDY : FSWZADD_DDX;
         break;
     }
-    case IR_VOTE: {  // through P0, or of every active lane for a constant true
+    case IR_VOTE: {
         int all = v->src[0]->op == IR_CONST && v->src[0]->imm;
         if (!all) {
             struct mop *s = emit_mop(MK_ISETP);
@@ -1854,8 +1797,8 @@ static void lower_value(struct ir_val *v)
         int m[2], wide = v->type == IR_I64;
         v->vreg = wide ? new_cluster(2, 2, m) : new_vreg(1, 1);
         emit_sel_cond(v->src[0]);
-        if (!wide && (is_imm(v->src[1]) || is_imm(v->src[2]))) {  // the constant in the instruction, under !P0 if it is
-            int swap = !is_imm(v->src[2]);  // the true value
+        if (!wide && (is_imm(v->src[1]) || is_imm(v->src[2]))) {
+            int swap = !is_imm(v->src[2]);  // the true value is the constant, so select on !P0
             struct mop *sel = emit_mop(MK_SEL);
             sel->def = v->vreg;
             sel->src[0] = vreg_of(v->src[swap ? 2 : 1]);
@@ -1865,7 +1808,6 @@ static void lower_value(struct ir_val *v)
             sel->aux = swap;
             break;
         }
-        // a 64-bit value is a pair: each half selected
         for (int d = v->vreg, a = wide ? pair_of(v->src[1]) : vreg_of(v->src[1]),
                  b = wide ? pair_of(v->src[2]) : vreg_of(v->src[2]), k = 0;
              k < (wide ? 2 : 1); k++) {
@@ -1924,7 +1866,7 @@ static void lower_value(struct ir_val *v)
         struct mop *w = emit_mop(MK_IMADWIDE);
         w->def = v->vreg;
         w->src[0] = vreg_of(v->src[1]);
-        w->src[1] = VREG_RZ;  // the scale is the immediate
+        w->src[1] = VREG_RZ;
         w->src[2] = from_base ? VREG_RZ : vreg_of(v->src[0]);
         w->nsrc = 3;
         w->immb = 1;
@@ -1950,7 +1892,6 @@ static void lower_value(struct ir_val *v)
     case IR_LDS:
     case IR_LDL: {
         int q[4];
-        // 8 or 16 bytes land in 2 or 4 registers aligned as many, the lanes read through IR_PROJ
         v->vreg = v->aux > 4 ? new_cluster(v->aux / 4, v->aux / 4, q) : new_vreg(1, 1);
         int guarded = v->op == IR_LDG && v->nsrc > 1;
         if (guarded)
@@ -1967,8 +1908,7 @@ static void lower_value(struct ir_val *v)
         break;
     }
     case IR_TEX: {
-        // two source vectors, each aligned as a vector of its size: the handle goes first in TXD's first one,
-        // first in the second one otherwise
+        // the handle leads TXD's first vector and the second vector of the rest
         int txd = IR_TEXA_OP(v->aux) == SASS_TXD, n0 = IR_TEXA_N0(v->aux), nsrc = (int)v->nsrc - 1;
         int k[2] = { n0 + txd, nsrc - n0 + !txd }, vec[2], c[2][4], q[4];
         if (k[0] > 4 || k[1] > 4)
@@ -2000,7 +1940,7 @@ static void lower_value(struct ir_val *v)
             *t = (struct texvec){ g_block, k[j], { 0 }, vec[j] };
             memcpy(t->val, val[j], k[j] * sizeof(*val[j]));
         }
-        v->vreg = new_cluster(4, 2, q);  // R,G in the first pair, B,A in the second, an even base
+        v->vreg = new_cluster(4, 2, q);  // two pairs, R,G and B,A
         struct mop *m = emit_mop(MK_TEX);
         m->def = v->vreg;
         m->src[0] = vec[0];
@@ -2042,7 +1982,7 @@ static void lower_effect(struct ir_val *v)
     case IR_STS:
     case IR_STL: {
         int data;
-        if (v->aux > 4) {  // the 2 or 4 words of a wide store, gathered into registers aligned as many
+        if (v->aux > 4) {
             int c[4];
             data = new_cluster(v->aux / 4, v->aux / 4, c);
             for (int k = 0; k < v->aux / 4; k++)
@@ -2051,7 +1991,7 @@ static void lower_effect(struct ir_val *v)
             data = vreg_of(v->src[1]);
         }
         struct mop *m = emit_mop(v->op == IR_STG ? MK_STG : v->op == IR_STS ? MK_STS : MK_STL);
-        m->src[0] = v->src[0] ? vreg_of_address(v, 0, m) : VREG_RZ;  // a shared or local store may have no base register
+        m->src[0] = v->src[0] ? vreg_of_address(v, 0, m) : VREG_RZ;
         m->src[1] = data;
         m->nsrc = 2;
         m->imm = v->imm;
@@ -2062,8 +2002,7 @@ static void lower_effect(struct ir_val *v)
         emit_mop(MK_BAR)->aux = v->aux;
         break;
     case IR_KILL: {
-        // Metal's discard is a demote: the thread runs on as a helper so its quad's derivatives and implicit-LOD
-        // samples still see it; only its exit kills it, and its memory writes are off
+        // Metal's discard demotes to a helper so the quad's derivatives still see it; memory writes stop
         struct mop *m = emit_mop(MK_DEMOTE);
         if (v->nsrc) {
             m->src[0] = vreg_of(v->src[0]);
@@ -2075,7 +2014,7 @@ static void lower_effect(struct ir_val *v)
     }
     case IR_SUST: {
         int c[4], q[4], n = v->aux;
-        int coord = new_cluster(n, n > 2 ? 4 : n, c);  // the coordinates as a vector
+        int coord = new_cluster(n, n > 2 ? 4 : n, c);
         for (int i = 0; i < n; i++)
             mov_into(c[i], v->src[i]);
         int color = new_cluster(4, 4, q);
@@ -2109,16 +2048,10 @@ static void lower_effect(struct ir_val *v)
     }
 }
 
-// For each edge pred -> b and each phi of b, copy the phi's input from that edge into the phi's vreg. All the
-// reads go to temporaries first, so a phi feeding another phi on the same edge reads the old value.
-// A loop of one block carries a value round in a phi: v, made late in the block, is copied to the phi's register at
-// its end. When nothing reads the phi after v is made, v can be made in the phi's register and the copy never
-// happens. The readers of v after it, in the block and past the loop, read that register all the same: it holds v
-// from then on. The block's own mops have all been made by now, so that is checked on them; a read in another
-// block, by a phi, or by something that takes its operand later (a compare fused into a branch, a modifier, a
-// paired half) rules it out beforehand (phi_outside). AIRC_NOPHIDEF=1 turns it off.
-// g_phi_escapes: the phi's register is read after its block, so a copy into it may not run on the way out of the
-// loop. A modifier or a compare that reads it is read where its own readers are.
+// In a one-block loop, the value v carried round in a phi is made straight in the phi's register when nothing
+// reads the phi after v, saving the copy. Reads elsewhere or deferred (fused compares, modifiers, paired halves)
+// rule it out up front (phi_outside). AIRC_NOPHIDEF=1 turns it off.
+// g_phi_escapes marks phis read after the loop, whose copies can't run on the way out.
 static unsigned char *g_phi_outside, *g_phi_moved, *g_phi_escapes;
 
 static void phi_outside(struct ir_func *f)
@@ -2134,7 +2067,7 @@ static void phi_outside(struct ir_func *f)
     g_phi_outside = calloc(n, 1);
     g_phi_moved = calloc(n, 1);
     g_phi_escapes = calloc(n, 1);
-    unsigned char *late = calloc(n, 1);  // read in another block, by a phi or by a modifier
+    unsigned char *late = calloc(n, 1);
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *u = b->first; u; u = u->next)
             for (unsigned i = 0; i < u->nsrc; i++) {
@@ -2175,8 +2108,7 @@ static void phi_outside(struct ir_func *f)
     }
 }
 
-// v, which only phi p of its own loop reads, made at the end of the way round straight into p's register: p's
-// last reads (the loop's compare among them) then come before it, so no copy is needed
+// made last in the loop, after p's final reads, so it can write p's register without a copy
 static void lower_late_def(struct ir_val *p, struct ir_val *v)
 {
     for (unsigned i = 0; i < v->nsrc; i++)
@@ -2206,7 +2138,7 @@ static void phi_into_def(struct ir_block *b, struct ir_val *p, struct ir_val *v)
             def = k;
     if (def < 0)
         return;
-    for (int k = def + 1; k < g_nmops; k++) {  // the old value must not be read once v is made
+    for (int k = def + 1; k < g_nmops; k++) {  // nothing may read the old value after v
         const struct mop *m = &g_mops[k];
         for (int j = 0; j < m->nsrc; j++)
             if (m->src[j] == p->vreg)
@@ -2239,7 +2171,7 @@ static void phi_copies(struct ir_block *pred, struct ir_block *b)
                     phi_into_def(b, p, p->src[k]);
     static int mark[MAX_VREGS], gen;
     enum { MAX_COPIES = 1024 };
-    int dst[MAX_COPIES], src[MAX_COPIES], tmp[MAX_COPIES], n = 0;  // src -1: a constant, its imm in imm[]
+    int dst[MAX_COPIES], src[MAX_COPIES], tmp[MAX_COPIES], n = 0;  // src -1 for a constant in imm[]
     int64_t imm[MAX_COPIES];
     for (struct ir_val *p = b->first; p && p->op == IR_PHI; p = p->next) {
         struct ir_val *in = NULL;
@@ -2255,7 +2187,6 @@ static void phi_copies(struct ir_block *pred, struct ir_block *b)
         int is_const = in->op == IR_CONST || in->op == IR_UNDEF;
         int64_t value = in->op == IR_CONST ? in->imm : 0;
         int s = is_const ? -1 : vreg_of(in);
-        // a 64-bit value is a pair: each half copied
         for (int d = p->vreg, k = 0; k < (p->type == IR_I64 ? 2 : 1); k++) {
             dst[n] = d;
             src[n] = s;
@@ -2266,8 +2197,7 @@ static void phi_copies(struct ir_block *pred, struct ir_block *b)
             d = g_vregs[d].next;
         }
     }
-    // Every copy reads the old values, so one whose source another copy overwrites takes it into a temporary first;
-    // the others go straight in (a temporary for each of a hundred phis would leave no register for the rest).
+    // only sources another copy overwrites go via a temporary; one per phi would run out with a hundred phis
     gen++;
     for (int i = 0; i < n; i++)
         mark[dst[i]] = gen;
@@ -2313,8 +2243,8 @@ static void set_convergence(struct ir_block *b)
     m->target = g_bssy_to[b->id];
 }
 
-static int g_ra;       // the vreg of the return address in the subroutine being lowered
-static int g_win_end;  // the register past the window's last slot
+static int g_ra;
+static int g_win_end;  // past the window's last slot
 
 static void window_slots(int end)
 {
@@ -2322,7 +2252,7 @@ static void window_slots(int end)
         g_win_end = WIN_ARGS + end;
 }
 
-// sources into the window's slots one after another, a 64-bit one taking two; extra more entries kept after them
+// room for extra entries after the sources
 static struct xfer *xfer_sources(struct ir_val *v, int extra)
 {
     struct xfer *xs = ir_alloc((v->nsrc + extra) * sizeof(*xs));
@@ -2360,7 +2290,7 @@ static void lower_entry(struct ir_block *b)
     m->nxd = n;
 }
 
-// results go into their IR_PROJs' registers straight from the window, IR_PROJ imm the slot
+// an IR_PROJ's imm is its result's window slot
 static void lower_call(struct ir_val *v)
 {
     struct xfer *xs = xfer_sources(v, 0);
@@ -2406,7 +2336,7 @@ static void lower_block(struct ir_block *b)
     for (int i = 0; i < g_nbsync[b->id]; i++)
         emit_mop(MK_BSYNC)->imm = g_bar_base[b->func] + g_bsync[b->id][i];
     for (struct ir_val *v = b->first; v; v = v->next) {
-        // constant operands made ahead: lowering may emit its instruction before asking for their registers
+        // constants first, as lowering may emit the instruction before asking for them
         if (v->op != IR_PHI)
             for (unsigned i = 0; i < v->nsrc; i++)
                 if (v->src[i] && (v->src[i]->op == IR_CONST || v->src[i]->op == IR_UNDEF))
@@ -2440,17 +2370,16 @@ static void lower_block(struct ir_block *b)
             break;
         case IR_CBR: {
             emit_cond(v->src[0]);
-            // A loop of one block whose phis nothing reads past it makes its copies before the branch, on both
-            // edges: the way round is then the branch alone, not a branch to a stub of copies and one back
+            // a one-block loop whose phis don't escape copies before the branch, so the back edge needs no stub
             int self = b->succ[0] == b->succ[1] ? -1 : b->succ[0] == b ? 0 : b->succ[1] == b ? 1 : -1;
             for (struct ir_val *p = b->first; self >= 0 && p && p->op == IR_PHI; p = p->next)
                 if (g_phi_escapes[p->id])
                     self = -1;
             if (self >= 0)
                 phi_copies(b, b);
-            // after the compare, which the scheduler can then start early: the branch waits 13 cycles for P0
+            // after the compare so it starts early, as the branch waits 13 cycles for P0
             set_convergence(b);
-            // the true edge's phi copies may only run when it is taken: they get a stub after the false path
+            // the true edge's copies go in a stub after the false path
             int stub = self != 0 && b->succ[0]->first && b->succ[0]->first->op == IR_PHI;
             int bt = g_nmops;
             struct mop *m = emit_mop(MK_BRA);
@@ -2467,7 +2396,7 @@ static void lower_block(struct ir_block *b)
             }
             break;
         }
-        case IR_EXIT: {  // a fragment's colours four at a time into the scratch registers; EXIT moves them to R0..
+        case IR_EXIT: {  // colours to scratch registers, then EXIT moves them to R0..
             for (unsigned i = 0; i < v->nsrc; i += 4) {
                 struct mop *o = emit_mop(MK_OUTPUT);
                 o->nsrc = v->nsrc - i < 4 ? (int)(v->nsrc - i) : 4;
@@ -2486,16 +2415,16 @@ static void lower_block(struct ir_block *b)
     }
 }
 
-// each function's mops, the shader's first: [start, end)
+// [start, end), the shader first
 static int g_region_start[IR_MAX_SUBS + 1], g_region_end[IR_MAX_SUBS + 1];
 
-// a cluster's members for its base (the vreg alone otherwise), as a mop naming it reads or writes them all
+// a mop naming a cluster base touches every member
 #define MEMBERS(w, v) for (int w = (v); w >= 0; w = g_vregs[v].size > 1 ? g_vregs[w].next : -1)
 
 static void touch(int v, int k)
 {
     struct vreg *r = &g_vregs[v];
-    if (r->hw >= 0)  // a caller's, allocated with it
+    if (r->hw >= 0)  // allocated with a caller
         return;
     if (r->start < 0 || k < r->start)
         r->start = k;
@@ -2503,9 +2432,8 @@ static void touch(int v, int k)
         r->end = k;
 }
 
-// The mops a value is live at, as runs in mop order: a value used in one arm of an if is not live in the other, so
-// the registers there are free for others, and the members of a cluster are each only live where they are read.
-// The range above, from first to last, is these with the gaps filled.
+// live runs, so a value used in one arm of an if leaves its register free in the other, and cluster members are
+// live only where read
 struct seg {
     int start, end, next;  // inclusive
 };
@@ -2514,7 +2442,7 @@ static int g_nsegs, g_cap_segs;
 
 static int add_seg(int v, int tail, int start, int end)
 {
-    if (tail >= 0 && start <= g_segs[tail].end + 1) {  // the block before's run goes on
+    if (tail >= 0 && start <= g_segs[tail].end + 1) {
         if (end > g_segs[tail].end)
             g_segs[tail].end = end;
         return tail;
@@ -2531,12 +2459,9 @@ static int add_seg(int v, int tail, int start, int end)
     return g_nsegs++;
 }
 
-// Live ranges from liveness dataflow over the blocks of one function, so a value read again around a loop's back
-// edge stays live to the end of the loop. A range is one interval [start, end] in mop order, covering every block
-// the value is live through. Values of the shader a subroutine reads keep the ranges they have in the shader.
-// A block ending in a conditional branch is three parts here: up to the branch, the false edge's phi copies, and
-// the true edge's stub. A value only one edge reads is live in that edge's part alone, so the copies of the other
-// can write its register.
+// Dataflow, so values read round a back edge live to the loop's end. A conditional branch's block splits into the
+// branch, the false edge's copies and the true edge's stub, so one edge's copies may reuse a value only the other
+// reads. Shader values a subroutine reads keep their shader ranges.
 static void compute_ranges(struct ir_func *f, int region)
 {
     int nb = 0;
@@ -2594,7 +2519,7 @@ static void compute_ranges(struct ir_func *f, int region)
             np++;
         }
     }
-    // the leading MOVIMM of the integer 1 sits before the first block: fold it into block 0
+    // the MOVIMM of the integer 1 sits before the first block
     if (np)
         bstart[0] = g_region_start[region];
 
@@ -2618,7 +2543,6 @@ static void compute_ranges(struct ir_func *f, int region)
                     SETBIT(def, i, w);
             }
         }
-    // iterate in reverse layout order until nothing changes
     for (int changed = 1; changed;) {
         changed = 0;
         for (int i = np - 1; i >= 0; i--) {
@@ -2643,7 +2567,6 @@ static void compute_ranges(struct ir_func *f, int region)
             g_vregs[v].start = -1;
             g_vregs[v].end = -1;
         }
-    // defs and uses
     for (int k = g_region_start[region]; k < g_region_end[region]; k++) {
         struct mop *m = &g_mops[k];
         if (m->def >= 0)
@@ -2656,7 +2579,6 @@ static void compute_ranges(struct ir_func *f, int region)
         for (int j = 0; j < m->nxd; j++)
             touch(m->xd[j].vreg, k);
     }
-    // stretch over every part a value is live into or out of
     for (int i = 0; i < np; i++)
         for (int v = 0; v < g_nvregs; v++) {
             int li = BIT(in, i, v), lo = BIT(out, i, v);
@@ -2669,8 +2591,6 @@ static void compute_ranges(struct ir_func *f, int region)
             if (e > r->end)
                 r->end = e;
         }
-    // the runs: in a part, from its start if the value is live in (else from where it is first named) to its
-    // end if live out (else to where it is last named)
     g_nsegs = 0;
     int *tail = malloc((unsigned)g_nvregs * sizeof(*tail)), *stamp = calloc((unsigned)g_nvregs, sizeof(*stamp));
     int *first = malloc((unsigned)g_nvregs * sizeof(*first)), *last = malloc((unsigned)g_nvregs * sizeof(*last));
@@ -2704,7 +2624,7 @@ static void compute_ranges(struct ir_func *f, int region)
             int s = BIT(in, i, w) ? bstart[i] : first[w], e = BIT(out, i, w) ? bend[i] - 1 : last[w];
             tail[w] = add_seg(w, tail[w], s, e);
         }
-        for (int w = 0; w < words; w++)  // live through without being named
+        for (int w = 0; w < words; w++)  // live through but unnamed
             for (uint64_t bits = in[(size_t)i * words + w] & out[(size_t)i * words + w]; bits; bits &= bits - 1) {
                 int v = w * 64 + __builtin_ctzll(bits);
                 if (stamp[v] != i + 1 && g_vregs[v].hw < 0)
@@ -2718,7 +2638,6 @@ static void compute_ranges(struct ir_func *f, int region)
     free(named);
 #undef BIT
 #undef SETBIT
-    // a cluster shares one range across its members
     for (int v = 0; v < g_nvregs; v++)
         if (g_vregs[v].size > 1 && g_vregs[v].hw < 0) {
             int s = g_vregs[v].start, e = g_vregs[v].end;
@@ -2745,9 +2664,8 @@ static void compute_ranges(struct ir_func *f, int region)
     free(in);
     free(out);
 }
-// A shader that runs out of registers is compiled again with some of the values that were live at the failure kept
-// in local memory: stored right after they're made and loaded again before each use, so that what stays in a
-// register is a short range. The values are the IR ones' ids, which a compile of the same shader makes the same.
+// Out of registers, the shader recompiles with values live at the failure spilled to local memory. They're named
+// by IR id, which is stable across compiles of one shader.
 
 #define SPILL_ROUND 64   // values added each time
 #define SPILL_MAX 2048
@@ -2755,7 +2673,7 @@ static int g_spill_ids[SPILL_MAX];
 static unsigned g_nspill_ids;
 static int g_cand[SPILL_ROUND];
 static unsigned g_ncand;
-static int g_spill_limit;  // ids from here on were made by spilling, and aren't spilled themselves
+static int g_spill_limit;  // ids from here on came from spilling
 
 void airc_spill_reset(void)
 {
@@ -2764,7 +2682,7 @@ void airc_spill_reset(void)
     g_spill_limit = 0;
 }
 
-// The live values at the failure that have an IR value of their own and the longest ranges, longest first.
+// longest ranges first
 static void note_spill_candidates(const int *active, int na)
 {
     g_ncand = 0;
@@ -2775,7 +2693,7 @@ static void note_spill_candidates(const int *active, int na)
         unsigned k = 0;
         while (k < g_nspill_ids && g_spill_ids[k] != v->ir)
             k++;
-        if (k < g_nspill_ids)  // already out in memory, and still short of registers
+        if (k < g_nspill_ids)
             continue;
         int len = v->end - v->start, at = (int)g_ncand;
         while (at > 0 && g_vregs[g_cand[at - 1]].end - g_vregs[g_cand[at - 1]].start < len)
@@ -2792,7 +2710,7 @@ static void note_spill_candidates(const int *active, int na)
         g_cand[i] = g_vregs[g_cand[i]].ir;
 }
 
-// the next round's spills: the failure's candidates; 0 when there are none new
+// 0 when there are no new candidates
 int airc_spill_more(void)
 {
     int added = 0;
@@ -2822,7 +2740,7 @@ static void link_before(struct ir_val *x, struct ir_val *at)
     at->prev = x;
 }
 
-// what a load reads: 1 global, 2 shared, 3 local; 0 for a value that touches no memory and has no effect
+// 1 global, 2 shared, 3 local, 0 none
 static int load_space(const struct ir_val *v)
 {
     switch (v->op) {
@@ -2861,10 +2779,8 @@ static int pure(const struct ir_val *v)
            (v->op >= IR_CMP && v->op <= IR_ADDI);
 }
 
-// An unrolled loop's copies come one after another, and allocated in that order a copy's registers are taken
-// again by the next one, which keeps the scheduler from starting the next copy's loads early. The loads go first
-// instead, the copies' in turn, with what their addresses take. A load stays behind anything that may change
-// what it reads.
+// Unrolled copies would reuse each other's registers and stop the scheduler starting the next copy's loads early,
+// so the loads and their address maths go first, never past a write that may alias.
 static void loads_first(struct ir_func *f)
 {
     int n = 0;
@@ -2917,9 +2833,8 @@ static void loads_first(struct ir_func *f)
     free(ok);
 }
 
-// Fetches left where they're read get the registers the one before was just read from, so each waits alone. Each
-// goes up instead, with what its address takes, to just after the one before, while at most airc_batch are waiting
-// and the block's peak of live registers holds; never past anything that may change what it reads.
+// Fetches left at their use reuse the previous one's registers and wait one at a time, so each moves up behind the
+// one before, up to airc_batch in flight, without raising the block's register peak or passing an aliasing write.
 int airc_batch = 4, airc_batched;
 
 static int batchable(const struct ir_val *v)
@@ -2932,15 +2847,14 @@ static int movable(const struct ir_val *v)
     return v->op != IR_PHI && (pure(v) || v->op == IR_IPA || (v->op == IR_ALD && !(v->aux & IR_ATTR_OUTPUT)));
 }
 
-// the load a value reads, through IR_PROJ
 static struct ir_val *load_read(struct ir_val *s)
 {
     s = s && s->op == IR_PROJ ? s->src[0] : s;
     return s && batchable(s) ? s : NULL;
 }
 
-// per value of b: how many fetches it reads first (reads), and how many fetches before it wait to be read there
-// (pend). One read only in other blocks holds its registers whatever the order, and isn't counted.
+// reads: fetches a value is first to read; pend: fetches in flight before it. Fetches read only in other blocks
+// hold registers regardless and aren't counted.
 static void count_pending(struct ir_block *b, int *reads, int *pend, char *seen)
 {
     for (struct ir_val *v = b->first; v; v = v->next)
@@ -2963,7 +2877,7 @@ static void count_pending(struct ir_block *b, int *reads, int *pend, char *seen)
     }
 }
 
-// the registers a value holds, roughly: a wide load's and a texture op's are its IR_PROJs'
+// roughly; wide loads and texture ops count through their IR_PROJs
 static int regs_of(const struct ir_val *v)
 {
     if (v->type == IR_VOID || v->op == IR_CONST || v->op == IR_UNDEF || (v->op == IR_CBUF && !v->nsrc))
@@ -2971,8 +2885,7 @@ static int regs_of(const struct ir_val *v)
     return v->type == IR_I64 ? 2 : 1;
 }
 
-// the registers live just before each value of b (pr, by id), from its values' last reads in it: one read in
-// another block (out) is live to the end. Returns the most.
+// pr gets the live registers before each value, out marks values live to the end; returns the peak
 static int block_pressure(struct ir_block *b, const char *out, int *pr, int *pos, int *last, int *stamp, int *diff,
                           struct ir_val **before, int mark)
 {
@@ -2987,7 +2900,7 @@ static int block_pressure(struct ir_block *b, const char *out, int *pr, int *pos
             struct ir_val *s = v->src[i];
             if (!s)
                 continue;
-            if (stamp[s->id] != mark) {  // made before the block
+            if (stamp[s->id] != mark) {
                 stamp[s->id] = mark;
                 before[nbefore++] = s;
             }
@@ -3120,7 +3033,6 @@ static void batch_loads(struct ir_func *f)
     free(out);
 }
 
-// v, moved to the start of the entry block, ahead of any use
 static void to_entry_start(struct ir_func *f, struct ir_val *v)
 {
     ir_remove(v);
@@ -3131,10 +3043,8 @@ static void to_entry_start(struct ir_func *f, struct ir_val *v)
     f->entry->first = v;
 }
 
-// A helper lane of a fragment quad (one its primitive covers no sample of) runs for its neighbours' derivatives,
-// and its coordinates are extrapolated: a sliver triangle's can make a buffer index of INT_MIN, whose read faults
-// the channel. Its device loads at addresses that follow from the interpolated inputs, whose values reach no
-// derivative, implicit-LOD sample, cross-lane operation or branch, are guarded by its coverage mask.
+// A helper lane's extrapolated inputs on a sliver triangle can index a buffer at INT_MIN and fault the channel, so
+// loads addressed from interpolants are guarded by coverage when their values reach nothing cross-lane.
 static void guard_helper_loads(struct ir_func *f)
 {
     if (g_info->stage != NVK_FRAGMENT || f->nsubs)
@@ -3156,9 +3066,9 @@ static void guard_helper_loads(struct ir_func *f)
             }
         }
     for (struct ir_block *b = f->entry; sinks && b; b = b->next)
-        if (b->last && b->last->op == IR_CBR)  // a helper lane on another path changes what its quad sees
+        if (b->last && b->last->op == IR_CBR)  // a helper on another path changes what its quad sees
             reach[b->last->id] = 1;
-    // what reaches them, back through local memory as a whole
+    // local memory counts as one value
     for (int changed = 1; changed;) {
         changed = 0;
         int local = 0;
@@ -3176,7 +3086,7 @@ static void guard_helper_loads(struct ir_func *f)
                         changed = reach[v->src[i]->id] = 1;
             }
     }
-    // what follows from the interpolated inputs (a uniform address is the same in every lane of the quad)
+    // a uniform address is the same in every lane, so only interpolants matter
     for (int changed = 1; changed;) {
         changed = 0;
         for (struct ir_block *b = f->entry; b; b = b->next)
@@ -3225,8 +3135,7 @@ static void spill_values(struct ir_func *f)
         g_spill_limit = maxid + 1;
     int *slot = calloc((size_t)maxid + 1, sizeof(*slot)), nslots = 0;
     unsigned base = (g_info->local_size + 3) & ~3u;
-    // a wide load's or a texture fetch's registers go in one aligned block, kept until its last lane is: so it's
-    // its lanes that are spilled, each stored as soon as it's read out
+    // a wide result's block lives until its last lane does, so spill the lanes
     struct ir_val **byid = calloc((size_t)maxid + 1, sizeof(*byid));
     char *wide = calloc((size_t)maxid + 1, 1);
     for (struct ir_block *b = f->entry; b; b = b->next)
@@ -3248,7 +3157,7 @@ static void spill_values(struct ir_func *f)
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first, *next; v; v = next) {
             next = v->next;
-            if (v->op == IR_PHI && slot[v->id])  // goes to memory whole, below
+            if (v->op == IR_PHI && slot[v->id])  // below
                 continue;
             for (unsigned i = 0; i < v->nsrc; i++) {
                 struct ir_val *s = v->src[i];
@@ -3257,15 +3166,13 @@ static void spill_values(struct ir_func *f)
                 struct ir_val *ld = ir_add(v->op == IR_PHI ? v->phi_blocks[i] : b, IR_LDL, s->type, 0);
                 ld->imm = base + 4u * (unsigned)(slot[s->id] - 1);
                 ld->aux = 4;
-                if (v->op != IR_PHI && v != b->last)  // a phi's goes at its predecessor's end, the rest before the use
+                if (v->op != IR_PHI && v != b->last)  // a phi's at its predecessor's end
                     link_before(ld, v);
                 v->src[i] = ld;
             }
         }
-    // A phi that's spilled lives in its slot: each edge stores what it brings, in the predecessor, and the phi goes.
-    // Kept as a register it would still hold one all through a loop it carries a value round, as the copy in at the
-    // loop's end and the use at its start make its range the whole loop. The values the edges bring are read before
-    // any is written, as a phi reads the old values of the others.
+    // A spilled phi lives only in its slot, as a register would span its whole loop; each edge stores into it, after
+    // loading every edge value first since phis read each other's old values.
     for (int pass = 0; pass < 2; pass++)
         for (struct ir_block *b = f->entry; b; b = b->next)
             for (struct ir_val *v = b->first; v && v->op == IR_PHI; v = v->next) {
@@ -3274,7 +3181,7 @@ static void spill_values(struct ir_func *f)
                 for (unsigned i = 0; i < v->nsrc; i++) {
                     struct ir_val *s = v->src[i];
                     int in_memory = s && s->id <= maxid && slot[s->id];
-                    if (pass == 0 && in_memory && s->op == IR_PHI) {  // only another phi's slot is about to change
+                    if (pass == 0 && in_memory && s->op == IR_PHI) {  // only phi slots are about to change
                         struct ir_val *ld = ir_add(v->phi_blocks[i], IR_LDL, s->type, 0);
                         ld->imm = base + 4u * (unsigned)(slot[s->id] - 1);
                         ld->aux = 4;
@@ -3306,7 +3213,7 @@ static void spill_values(struct ir_func *f)
             st->src[1] = v;
             st->imm = base + 4u * (unsigned)(slot[v->id] - 1);
             st->aux = 4;
-            struct ir_val *after = v;  // right after the value; a phi's after the block's last phi
+            struct ir_val *after = v;  // a phi's after the last phi
             while (after->op == IR_PHI && after->next && after->next->op == IR_PHI)
                 after = after->next;
             ir_remove(st);
@@ -3326,11 +3233,9 @@ static void spill_values(struct ir_func *f)
 #define NREGS 240
 static int g_regcount;
 
-static char g_reserved[IR_MAX_SUBS + 1][NREGS];  // registers a function keeps out of: R1, the stack pointer, and
-                                                  // a subroutine's callers' live across calls to it
+static char g_reserved[IR_MAX_SUBS + 1][NREGS];  // R1 (stack pointer) and callers' registers live across calls
 
-// A subroutine reads the shader's values where it uses them (its arguments, the integer 1 and the like): each call
-// to it, and to whatever calls it, reads them too, so they stay live across it.
+// shader values a subroutine reads (the integer 1 and the like) stay live across every call reaching it
 static void add_externals(void)
 {
     int words = (g_nvregs + 63) / 64;
@@ -3354,7 +3259,6 @@ static void add_externals(void)
                         ext[(size_t)r * words + w / 64] |= 1ull << (w % 64);
             }
         }
-    // through calls: a subroutine's callers read what it does
     for (int changed = 1; changed;) {
         changed = 0;
         for (int r = 1; r < g_nregions; r++)
@@ -3397,7 +3301,6 @@ static int is_transfer(const struct mop *m)
     return m->k == MK_CALL || m->k == MK_ENTRY || m->k == MK_RET;
 }
 
-// are all the mops of a run list free in a register's row, and take them
 static int seg_free(const uint64_t *row, int seg, int base)
 {
     for (; seg >= 0; seg = g_segs[seg].next)
@@ -3421,11 +3324,8 @@ static void seg_take(uint64_t *row, int seg, int base)
         }
 }
 
-// Phi copies coalesced before allocation: a copy's two values take one register unless one is written while the
-// other is live past the write and the write isn't a copy of the other (Chaitin's test, on the runs above). Each
-// group's live members hold the same value wherever they meet, so the test holds for groups as for values. An
-// instruction of a fixed latency reads its sources before it writes, so its result may take the register of a
-// source that dies there; anything else keeps clear of what it reads. Clusters keep registers of their own.
+// Phi copies coalesce by Chaitin's test on the live runs, applied to whole groups. Fixed-latency ops read before
+// writing, so their result may reuse a dying source's register; nothing else may. Clusters are never coalesced.
 static int g_group[MAX_VREGS], g_gnext[MAX_VREGS];
 
 static int group_of(int v)
@@ -3475,8 +3375,7 @@ static int group_live(int g, int k)
     return 0;
 }
 
-// is group g live past mop k: in a run at the next mop, unless the run starts there with a write. A write never
-// ends a part, so the next mop is the one after k on every path.
+// a write never ends a part, so k + 1 follows k on every path
 static int live_past(int g, int k, const char *part_start)
 {
     const struct mop *m = &g_mops[k + 1];
@@ -3493,7 +3392,7 @@ static int live_past(int g, int k, const char *part_start)
     return 0;
 }
 
-// would a write to group a's register clobber group b; the mops defining each vreg are dmop[dstart[v]..]
+// the mops defining v are dmop[dstart[v]..]
 static int clobbers(int a, int b, const int *dstart, const int *dmop, const char *part_start)
 {
     for (int v = a; v >= 0; v = g_gnext[v])
@@ -3507,7 +3406,7 @@ static int clobbers(int a, int b, const int *dstart, const int *dmop, const char
     return 0;
 }
 
-// the operands coalescing renamed, to put back and again
+// kept so the renames can be undone and redone
 static struct {
     int *at, from, to;
 } *g_renames;
@@ -3584,7 +3483,7 @@ static int coalesce_phis(int region)
         g_group[b] = a;
         merged = 1;
     }
-    // a subroutine may read the shader's values too: every mop is renamed
+    // every mop, as subroutines read shader values too
     g_nrenames = 0;
     for (int k = 0; merged && k < g_nmops; k++) {
         struct mop *m = &g_mops[k];
@@ -3607,10 +3506,9 @@ static int coalesce_phis(int region)
 }
 
 static int g_clusters_first;
-static int g_second_pass;  // of airc_back's two allocations
+static int g_second_pass;
 
-// Warps an SM keeps resident at a thread's register count, taken in 8-register units. GA10x: four partitions of
-// 16K registers, 48 warps.
+// GA10x has four partitions of 16K registers, allocated in units of 8, and at most 48 warps
 static int warps_at(int regs)
 {
     regs = (regs + 7) & ~7;
@@ -3618,7 +3516,6 @@ static int warps_at(int regs)
     return w < 48 ? w : 48;
 }
 
-// the last mop before k a register's row is taken at, -1 for none
 static int last_taken(const uint64_t *row, const int *row_end, int c, int k)
 {
     if (row_end[c] < k)
@@ -3648,16 +3545,13 @@ static int place_before(int a, int b)
     return g_vregs[a].start < g_vregs[b].start;
 }
 
-// the registers of one function's values on their ranges; how many registers there are then, or -1 if they don't
-// fit (the spill candidates noted)
+// returns the register count, or -1 with spill candidates noted
 static int place(int region)
 {
-    // the mops moving values through the subroutine window, in order
     int *xfer = malloc((g_region_end[region] - g_region_start[region] + 1) * sizeof(*xfer)), nxfer = 0;
     for (int k = g_region_start[region]; k < g_region_end[region]; k++)
         if (is_transfer(&g_mops[k]))
             xfer[nxfer++] = k;
-    // heads of clusters (size >= 1, not a non-head member)
     int *order = malloc(g_nvregs * sizeof(*order));
     int n = 0;
     char ishead[1] = { 0 };
@@ -3673,18 +3567,11 @@ static int place(int region)
     uint64_t *occ = malloc((size_t)NREGS * words * 8);
     char *placed = malloc(g_nvregs);
     int *active = malloc(g_nvregs * sizeof(*active));
-    // Placed twice, in start order and with the clusters first (they need aligned runs, which singles would leave no
-    // room for), and the one that takes fewer registers kept: neither always does, and one may not fit at all.
-    // Then once more in the winner's order, spread: each value in the register left alone longest of those below
-    // the most the same occupancy allows. Taking the lowest free register puts a value where one just died, and the
-    // scheduler can't move a write above the reads of the register's last value, nor a load above an earlier
-    // load's use when both land in one register. Spread singles can leave a cluster no aligned room below that
-    // budget: then spread in the other order, rather than fall back to the packed placement. In the second pass,
-    // failing that too (an unrolled loop's wide loads, with the budget tight), the clusters go first and lowest and
-    // only the singles spread. Not in the first: its schedule orders the second pass, whose packing then missed a
-    // smaller register granule it reached before (six kernels of the corpus lost occupancy). A shader with local
-    // memory spreads down to 40 warps from 48: the path tracer's BVH walk, packed to run 48, was 5% slower than
-    // spread at 40 (a shader without one, the particle simulation, was 10% slower at 40).
+    // Packed in start order and clusters-first, keeping the smaller, then spread within the same occupancy into the
+    // longest-idle register, since reusing a just-freed one blocks the scheduler. If spreading leaves a cluster no
+    // room, the other order is tried, and in the second pass only singles spread (doing that in the first pass lost
+    // six corpus kernels a register granule). Local memory shaders spread down to 40 warps: a BVH walk was 5% faster
+    // there than packed at 48, while a shader without local memory was 10% slower.
     int *best = malloc(g_nvregs * sizeof(*best)), best_count = 0, fitted = 0, best_first = 0, budget = NREGS;
     int *row_end = malloc(NREGS * sizeof(*row_end));
     int spread_fitted = 0;
@@ -3693,7 +3580,7 @@ static int place(int region)
         if (attempt == 2) {
             if (!fitted)
                 break;
-            // + 1 for the exit's temporary and + 2 for the program counter (airc_back)
+            // + 1 for the exit's temporary and + 2 for the program counter
             budget = best_count;
             int target = warps_at(best_count + 3);
             if (g_info->local_size && target > 40)
@@ -3722,12 +3609,11 @@ static int place(int region)
             while (x < nxfer && xfer[x] < start)
                 x++;
             int from = x < nxfer && xfer[x] <= g_vregs[h].end ? g_win_end : 2;  // live at a transfer: past the window
-            // a copy whose source dies at it takes the source's register, and the copy goes away
+            // a copy whose source dies there takes its register and vanishes
             const struct mop *dm = &g_mops[start];
             int src = dm->k == MK_MOV && dm->def == h ? dm->src[0] : -1;
             if (src >= 0 && src != VREG_RZ && g_vregs[h].size == 1 && g_vregs[src].size == 1 && !member[src] &&
                 placed[src] && g_vregs[src].end == start && g_vregs[src].hw >= from) {
-                // the source holds its register at this mop, which the copy is welcome to
                 uint64_t *row = occ + (size_t)g_vregs[src].hw * words;
                 row[(start - base) / 64] &= ~(1ull << ((start - base) % 64));
                 if (seg_free(row, g_vregs[h].seg, base)) {
@@ -3778,7 +3664,7 @@ static int place(int region)
                 for (int j = order[i]; j >= 0; j = g_vregs[j].next)
                     best[j] = g_vregs[j].hw;
         }
-        if (failed >= 0 && attempt && !fitted) {  // what holds registers: the placed values whose range spans this one's start
+        if (failed >= 0 && attempt && !fitted) {
             int na = 0, start = g_vregs[order[failed]].start;
             for (int a = 0; a < failed; a++)
                 if (g_vregs[order[a]].start <= start && g_vregs[order[a]].end >= start)
@@ -3807,8 +3693,7 @@ static int place(int region)
 
 static int regalloc(struct ir_func *f, int region)
 {
-    // Coalescing can leave the clusters no aligned room: the values are placed with the phi copies coalesced and
-    // without, and the coalesced ones kept unless they take more granules of 8 registers (or don't fit).
+    // coalescing can leave clusters no aligned room, so it is kept only if it costs no extra 8-register granule
     int *hw0 = malloc(g_nvregs * sizeof(*hw0)), *hw1 = malloc(g_nvregs * sizeof(*hw1)), regcount = g_regcount;
     for (int v = 0; v < g_nvregs; v++)
         hw0[v] = g_vregs[v].hw;
@@ -3844,7 +3729,6 @@ static int regalloc(struct ir_func *f, int region)
     free(hw1);
     if (plain < 0)
         return -1;
-    // what each callee keeps out of: what this one does, and its values live across the call or read in the callee
     for (int k = g_region_start[region]; k < g_region_end[region]; k++) {
         const struct mop *m = &g_mops[k];
         if (m->k != MK_CALL)
@@ -3870,20 +3754,17 @@ static int hw(int vreg)
     return g_vregs[vreg].hw;
 }
 
-// What an instruction leaves behind in its destination, for sched_push: nothing yet (a variable-latency result
-// is waited for on a scoreboard), a fixed-latency result, a predicate, or the uniform register.
+// sched_push's destination kinds; 0 is a variable-latency result, waited for on a scoreboard
 #define FIXED_LAT 1
 #define PRED_LAT 2
 #define UNIFORM_LAT 3
 #define BAR_LAT 2
-#define UNIFORM_CYCLES 7  // the uniform datapath is slower: a load reading UR4 right after its ULDC reads garbage
-#define UR_PSEUDO 254     // the uniform registers, all loaded in the prologue
+#define UNIFORM_CYCLES 7  // a load reading UR4 right after its ULDC reads garbage
+#define UR_PSEUDO 254     // all loaded in the prologue
 #define P0_PSEUDO 250
 #define P6_PSEUDO 249
 
-// The pipe a fixed-latency result comes from, and the one that reads it, for the cycles from the writer's issue to
-// the reader's (NVIDIA's sm_80 table, as Mesa's NAK has it). IMAD.WIDE writes its low and high words at different
-// times and reads its operands at different stages.
+// Pipe classes for NVIDIA's sm_80 latency table as NAK has it; IMAD.WIDE's halves and operands differ in timing.
 enum { WC_NONE, WC_ALU, WC_FMA, WC_WIDE_LO, WC_WIDE_HI, WC_FP16, WC_PRED, WC_UNIFORM, WC_I2FP };
 enum { RC_ALU, RC_FMA, RC_WIDE_AB, RC_WIDE_CH, RC_FP16, RC_DECOUPLED, RC_AGU, RC_VOTE };
 
@@ -3930,7 +3811,7 @@ static int reader_class(const struct sass_insn *in, int i)
 
 static unsigned raw_latency(int writer, int reader)
 {
-    // [reader][ALU, FMA, WIDE_LO, WIDE_HI, FP16 writer]
+    // [reader][writer ALU, FMA, WIDE_LO, WIDE_HI, FP16]
     static const uint8_t reg[][5] = {
         [RC_ALU] = { 4, 5, 3, 5, 5 },       [RC_FMA] = { 5, 4, 2, 4, 5 },       [RC_WIDE_AB] = { 5, 4, 4, 6, 5 },
         [RC_WIDE_CH] = { 3, 2, 2, 2, 3 },   [RC_FP16] = { 5, 5, 3, 5, 5 },      [RC_DECOUPLED] = { 4, 4, 4, 4, 4 },
@@ -3938,17 +3819,15 @@ static unsigned raw_latency(int writer, int reader)
     };
     if (writer == WC_UNIFORM)
         return UNIFORM_CYCLES;
-    if (writer == WC_I2FP)  // not in the table: nvcc's distances for sm_86
+    if (writer == WC_I2FP)  // not in the table; nvcc's sm_86 distances
         return reader == RC_ALU ? 4 : reader == RC_FMA ? 5 : 6;
-    if (writer == WC_PRED)  // only an ALU or FMA instruction takes a predicate quickly
+    if (writer == WC_PRED)  // only ALU and FMA take a predicate quickly
         return reader == RC_ALU ? 4 : reader == RC_FMA ? 5 : 13;
-    // a cycle more for readers outside the ALU and FMA pipes: at the table's figures the compute thread ID,
-    // threadgroup memory and SIMD probes read stale operands on the 3060
+    // at the table's figures, thread ID, threadgroup memory and SIMD probes read stale operands on GA106
     unsigned slack = reader != RC_ALU && reader != RC_FMA;
     return reg[reader == RC_VOTE ? RC_ALU : reader][writer - WC_ALU] + slack;
 }
 
-// the longest any reader waits on a result
 static unsigned worst_latency(int writer)
 {
     unsigned worst = 0;
@@ -3960,8 +3839,8 @@ static unsigned worst_latency(int writer)
 
 static struct sass_insn *g_prog;
 static unsigned g_np, g_prog_cap;
-static unsigned g_wcycle[256];  // when a fixed-latency write to each register issued
-static uint8_t g_wclass[256];    // and from which pipe, WC_NONE when nothing is pending
+static unsigned g_wcycle[256];  // issue cycle of each register's fixed-latency write
+static uint8_t g_wclass[256];
 static unsigned g_bar_set[6];
 static unsigned g_cycle;
 
@@ -3985,7 +3864,6 @@ static void set_stall(struct sass_insn *in, unsigned s)
     in->hi = (in->hi & ~(0xfull << 41 | 1ull << 45)) | ((uint64_t)s << 41) | (uint64_t)(s <= 2) << 45;
 }
 
-// lengthen the stalls before the next instruction until it issues at cycle need
 static void stall_until(unsigned need)
 {
     while (need > g_cycle && g_np > 0) {
@@ -4000,14 +3878,13 @@ static void stall_until(unsigned need)
     }
 }
 
-// What a mop reads and writes, found by running its emitter with g_probe set: sched and sched_push then record
-// their operands instead of emitting. The list scheduler orders mops by it.
+// filled by running a mop's emitter with g_probe set, for the list scheduler
 struct fx {
     uint8_t rd[16], rclass[16], wr[8], wclass[8];
     int nrd, nwr;
-    int async;     // the result comes back on a scoreboard
-    int late;      // the sources are read after issue
-    int overflow;  // more operands than fit here: leave the mop where it is
+    int async;     // result on a scoreboard
+    int late;      // sources read after issue
+    int overflow;  // too many operands, so the mop stays put
 };
 static int g_probe;
 static struct fx g_fx;
@@ -4030,8 +3907,7 @@ static void probe_write(int reg)
         g_fx.wr[g_fx.nwr++] = (uint8_t)reg;
 }
 
-// barriers a drain left for the next instruction: waiting on one nothing is pending on costs nothing, so it may
-// be reached from elsewhere too
+// a drain's waits for the next instruction, harmless if it's also reached from elsewhere
 static unsigned g_carried_waits;
 
 static void sched_push(struct sass_insn in, const uint8_t *srcs, int nsrc, int dst, int wide, unsigned lat)
@@ -4080,23 +3956,20 @@ static void sched_push(struct sass_insn in, const uint8_t *srcs, int nsrc, int d
     g_cycle += get_stall(&in);
 }
 
-// The scoreboards still pending for each register, a bit each: a result to land in it (g_wbar_of), and late reads
-// of it (g_rbar_of: memory, texture and the like read their sources after issue). Where paths meet a register may
-// be pending on several, and a register read late by several instructions has to wait for them all before it is
-// written.
+// Pending scoreboards per register, for results landing (g_wbar_of) and late source reads (g_rbar_of). Several can
+// be pending where paths meet, and a write must wait for all of them.
 static unsigned g_wbar_of[256], g_rbar_of[256];
 
-// The scoreboards held by atomics and loads of shared memory, which a threadgroup barrier has to wait for: one
-// still in flight when the barrier releases the other warps lets them read or update the word before it lands.
+// Scoreboards of atomics and shared loads; a threadgroup barrier must wait for them, or other warps see the word
+// before it lands.
 static unsigned g_mem_bars;
 static int g_mem_op;
 
-// By mop: its late reads' registers aren't written again in its run, so its result's barrier can stand for them, and
-// one fewer is taken (schedule_segment); g_rd_free for the mop being emitted.
+// The mop's late-read registers aren't rewritten in its run, so its write barrier covers them and saves one
+// (schedule_segment).
 static unsigned char *g_rd_free_of;
 static int g_rd_free;
 
-// an instruction waits on these: everything they were set for is done, whichever registers it was for
 static void settle(unsigned waits)
 {
     if (!waits)
@@ -4108,7 +3981,6 @@ static void settle(unsigned waits)
     g_mem_bars &= ~waits;
 }
 
-// the scoreboards something is still pending on, a bit each
 static unsigned taken(void)
 {
     unsigned used = 0;
@@ -4117,14 +3989,12 @@ static unsigned taken(void)
     return used;
 }
 
-// A scoreboard nothing waits on any more, the one set longest ago first. With none free, one older than its ops
-// take, waited for first (*wait), which costs nothing by then. Else the oldest of those set for the same kind of op:
-// its results' readers wait for the new one too, and a short op's readers can't afford a memory or texture wait.
-// Never one in avoid: the instruction's own write barrier, which waiting on would lose.
+// Prefers a free scoreboard, then a stale one (waited for at no cost), then the oldest set for the same kind of op,
+// as a short op's readers can't afford a memory wait. Never the instruction's own write barrier in avoid.
 #define STALE_BAR 150
 #define STALE_SHORT 30
-static unsigned g_bar_long;  // scoreboards set for a memory or texture op
-static int g_long_op;        // the mop being emitted is one
+static unsigned g_bar_long;  // set for memory or texture ops
+static int g_long_op;
 static int take_bar(unsigned *wait, unsigned avoid, int lng)
 {
     unsigned used = taken();
@@ -4151,10 +4021,8 @@ static int take_bar(unsigned *wait, unsigned avoid, int lng)
     return best;
 }
 
-// Build a control word. Waits: on async results the sources need (RAW), on async results still to land in the
-// destination (WAW), and on pending late readers of the destination (WAR). Allocates a read barrier on the
-// sources when the instruction reads them late (memory, texture, attribute, MUFU), and a write barrier on dst
-// when its result is async. dstw: registers dst writes.
+// The control word waits for RAW, WAW and WAR hazards on scoreboards, and sets a read barrier for late sources
+// and a write barrier for an async result. dstw is how many registers dst writes.
 static uint32_t sched(const uint8_t *srcs, int nsrc, int var_dst, int dst, int dstw, int late)
 {
     if (g_probe) {
@@ -4179,8 +4047,7 @@ static uint32_t sched(const uint8_t *srcs, int nsrc, int var_dst, int dst, int d
         for (int k = 0; k < dstw; k++)
             g_wbar_of[dst + k] = 1u << c.wr;
     }
-    // A result lands after its sources are read, so its barrier covers the reads too: with every scoreboard taken,
-    // that is where they go when nothing writes them again before the result would be waited for anyway.
+    // a result lands after its sources are read, so with all scoreboards taken its barrier covers the reads too
     if (late) {
         if (!var_dst || !g_rd_free || taken() != 0x3f)
             c.rd = take_bar(&wait, var_dst ? 1u << c.wr : 0, 0);
@@ -4195,8 +4062,8 @@ static uint32_t sched(const uint8_t *srcs, int nsrc, int var_dst, int dst, int d
     return sass_ctrl_word(c);
 }
 
-// Before a branch: let every fixed-latency result land, as the code it goes to doesn't know their timing, and keep
-// a scoreboard set just before from being waited for straight after the jump.
+// The branch target doesn't know fixed-latency timing, and a scoreboard set just before mustn't be waited on
+// straight after the jump.
 static void settle_fixed(void)
 {
     unsigned need = g_cycle;
@@ -4214,8 +4081,7 @@ static void settle_fixed(void)
     stall_until(need);
 }
 
-// Before a branch back, a call or a return: wait until every outstanding result and late read is done, so the code
-// reached starts from nothing pending. The barriers are waited for by the next instruction (g_carried_waits).
+// before a back branch, call or return, so the target starts with nothing pending
 static void drain(void)
 {
     settle_fixed();
@@ -4224,14 +4090,13 @@ static void drain(void)
     g_carried_waits |= wait;
 }
 
-// What the forward branches to a mop leave pending, by its index (NULL for none): the scoreboards of a block
-// reached from more than one place are those of every way in, and a branch back drains, so a loop's head only sees
-// the ways in from before it.
+// What forward branches leave pending at a mop, merged over every way in; back branches drain, so a loop head only
+// sees the ways in from before it.
 struct pending {
     unsigned wbar[256], rbar[256], mem;
 };
 static struct pending **g_into;
-static int g_reached;  // the code being emitted is reached from the instruction before it
+static int g_reached;  // falls through from the previous instruction
 
 static void branch_to(int mop)
 {
@@ -4245,7 +4110,6 @@ static void branch_to(int mop)
     p->mem |= g_mem_bars;
 }
 
-// at a mop branches may go to: what is pending there
 static void arrive(int mop)
 {
     struct pending *p = g_into[mop];
@@ -4266,8 +4130,7 @@ static void arrive(int mop)
     g_into[mop] = NULL;
 }
 
-// A demoted thread's memory writes don't happen: they go under @!P6, which joins their sources so they wait for
-// its last write.
+// a demoted thread's writes go under @!P6, so P6 joins their sources
 static int demote_src(uint8_t *srcs, int n)
 {
     if (g_demote)
@@ -4280,12 +4143,12 @@ static struct sass_insn demote_guard(struct sass_insn in)
     return g_demote ? sass_pred(in, 6, 1) : in;
 }
 
-static unsigned *g_mop_np;    // SASS index where each mop's instructions begin
-static int *g_block_np;       // SASS index of each block's first instruction
+static unsigned *g_mop_np;
+static int *g_block_np;
 static struct {
-    unsigned at;   // the BRA's SASS index
-    int block;     // target block id, or -1
-    int mop;       // target mop index (a stub), or -1
+    unsigned at;
+    int block;     // or -1
+    int mop;       // a stub, or -1
 } g_fix[8192];
 static int g_nfix;
 
@@ -4294,7 +4157,6 @@ static uint8_t mem_size(int bytes)
     return bytes == 1 ? SASS_U8 : bytes == 2 ? SASS_U16 : bytes == 8 ? SASS_B64 : bytes == 16 ? SASS_B128 : SASS_B32;
 }
 
-// map an IR integer condition (cond | IR_SIGNED) to an ISETP op + sign
 static void isetp_op(int aux, uint8_t *op, int *sgn)
 {
     static const uint8_t m[] = { ISETP_EQ, ISETP_NE, ISETP_LT, ISETP_LE, ISETP_GT, ISETP_GE };
@@ -4311,7 +4173,7 @@ static uint8_t fsetp_op(int pred)
     return m[pred & 15];
 }
 
-// the source modifiers of a mop's mods on the instruction's operands: slot[i] the operand of source i, -1 for none
+// s0..s2 are the operand slots of sources 0..2, -1 for none
 static struct sass_insn with_mods(struct sass_insn in, int mods, int s0, int s1, int s2)
 {
     const int slot[3] = { s0, s1, s2 };
@@ -4321,9 +4183,7 @@ static struct sass_insn with_mods(struct sass_insn in, int mods, int s0, int s1,
     return in;
 }
 
-// float arithmetic and compares flush denormals as Apple's GPUs do (denormal * inf is NaN there, step(denormal, 0)
-// is 1), but for OpenCL's kernels, where keeping them costs nothing (MUFU flushes either way); fmin/fmax and
-// moves keep them
+// Apple's GPUs flush denormals (denormal * inf is NaN, step(denormal, 0) is 1); OpenCL keeps them, as that's free
 static struct sass_insn ftz(struct sass_insn in)
 {
     return g_info->denorms ? in : sass_ftz(in);
@@ -4338,14 +4198,13 @@ static void emit_mov(int d, int s)
     sched_push(sass_mov_rr(d, s, c), src, 1, d, 0, FIXED_LAT);
 }
 
-// a branch's, BSSY's, CALL's or RET's offset, as BRA has it
+// BRA, BSSY, CALL and RET share the offset field
 static void set_rel(struct sass_insn *in, int32_t rel)
 {
     in->lo = (in->lo & 0xffffffffull) | ((uint64_t)(uint32_t)rel << 32);
     in->hi = (in->hi & ~0x3ffffull) | (rel < 0 ? 0x3ffff : 0);
 }
 
-// each value of xs (into the window) or xd (out of it) moved, the return address too
 static void window_moves(const struct xfer *x, int n, int into)
 {
     for (int j = 0; j < n; j++) {
@@ -4368,7 +4227,7 @@ static void emit_call(const struct mop *m)
     sched_push(sass_imadmov_imm(WIN_RA, 0, c), NULL, 0, WIN_RA, 0, FIXED_LAT);
     unsigned ra = g_np - 1, bssy = 0;
     drain();
-    if (m->aux >= 0) {  // where the call's threads meet again: Volta's subroutines may return each on its own
+    if (m->aux >= 0) {  // Volta+ threads may return from a subroutine separately
         sched_push(sass_bssy((uint8_t)m->aux, 0, sched(NULL, 0, 0, -1, 0, 0)), NULL, 0, -1, 0, 0);
         bssy = g_np - 1;
     }
@@ -4377,7 +4236,7 @@ static void emit_call(const struct mop *m)
     g_fix[g_nfix].at = at;
     g_fix[g_nfix].block = m->target;
     g_fix[g_nfix++].mop = -1;
-    // RET.REL goes to the address counted from the program's first instruction
+    // RET.REL's target is relative to the program start
     g_prog[ra].lo = (g_prog[ra].lo & 0xffffffffull) | (uint64_t)((at + 1) * 16) << 32;
     if (m->aux >= 0) {
         set_rel(&g_prog[bssy], (int32_t)(at - bssy) * 16);
@@ -4397,10 +4256,8 @@ static void emit_ret(const struct mop *m)
     g_reached = 0;
 }
 
-// A fragment's colours into R0.. at its exit, from the registers MK_OUTPUT found them in. Some of those may be in
-// R0.. already, so a move waits until nothing still to be made reads its target; a cycle of them (R0 and R1
-// swapped) is broken through the scratch register. AIRC_STAGEEXIT=1 stages every colour through the scratch
-// registers as before.
+// Exit colours move to R0.. as a parallel copy, breaking cycles through the scratch register. AIRC_STAGEEXIT=1
+// stages every colour through scratch instead.
 static uint8_t g_out_reg[64];
 static int g_stage_exit;
 
@@ -4421,7 +4278,6 @@ static void exit_moves(int n)
                     pick = -1;
         }
         if (pick < 0) {
-            // every target is still wanted: park the source of the first in the scratch register
             uint8_t park = from[pending[0]];
             uint8_t src[1] = { park };
             sched_push(sass_mov_rr(tmp, park, sched(src, 1, 0, tmp, 1, 0)), src, 1, tmp, 0, FIXED_LAT);
@@ -4437,15 +4293,14 @@ static void exit_moves(int n)
     }
 }
 
-// An edge whose phi copies all coalesced is a branch alone, so a loop branches once a trip. A true edge's stub is
-// left out (its branch without a target) and the conditional branch goes there itself; a false edge's branch is
-// the conditional one, negated, when the true edge's block follows.
+// An edge whose copies all coalesced needs no stub, so a loop branches once a trip; the conditional branch targets
+// the block directly, or is negated when the true block follows.
 static int coalesced(const struct mop *m)
 {
     return m->k == MK_MOV && hw(m->def) == hw(m->src[0]);
 }
 
-// does the code after mop i go on into block b: past nothing, or only a stub or a branch left out
+// past nothing but coalesced copies and dropped branches
 static int falls_into(int i, int b)
 {
     int k = i + 1;
@@ -4500,13 +4355,12 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
         switch (m->k) {
         case MK_MOVIMM:
             if (g_vregs[m->def].end == i && g_vregs[m->def].start == i)
-                break;  // a constant made for an operand that took it as an immediate after all
+                break;  // its reader took it as an immediate after all
             c = sched(NULL, 0, 0, d, 1, 0);
             sched_push(sass_imadmov_imm(d, (uint32_t)m->imm, c), NULL, 0, d, 0, FIXED_LAT);
             break;
         case MK_MOV:
-            // coalesced; the scheduler still sees it read and write the register, so it keeps its place among the
-            // two values' other reads and writes for the second allocation, which may not coalesce it
+            // the probe still sees a coalesced copy, as the second allocation may not coalesce it
             if (d == s[0] && !g_probe)
                 break;
             c = sched(s, 1, 0, d, 1, 0);
@@ -4525,7 +4379,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             sched_push(m->imm & 0x100 ? sass_pixld(d, m->imm & 0xff, c) : sass_s2r(d, (uint8_t)m->imm, c), NULL, 0,
                        d, 0, 0);
             break;
-        case MK_ALD:  // a vertex handle is read late, as a load's address is
+        case MK_ALD:  // the vertex handle is read late
             c = sched(s, m->nsrc, 1, d, 1, m->nsrc);
             sched_push(sass_ald(d, m->nsrc ? s[0] : SASS_RZ, (uint16_t)m->imm, 1, (m->aux & IR_ATTR_PATCH) != 0,
                                 (m->aux & IR_ATTR_OUTPUT) != 0, c),
@@ -4571,7 +4425,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             c = sched(s, m->nsrc, 0, d, 1, 0);
             struct sass_insn in = m->immb ? sass_imm(sass_lop3(d, s[0], 0, (uint8_t)m->aux, c), (uint32_t)m->imm)
                                           : sass_lop3(d, s[0], s[1], (uint8_t)m->aux, c);
-            int rc = m->immb ? (m->nsrc > 1 ? 1 : 0) : (m->nsrc > 2 ? 2 : 0);  // a third source after a and b
+            int rc = m->immb ? (m->nsrc > 1 ? 1 : 0) : (m->nsrc > 2 ? 2 : 0);  // source c
             if (rc > 0)
                 in.hi = (in.hi & ~0xffull) | s[rc];
             sched_push(in, s, m->nsrc, d, 0, FIXED_LAT);
@@ -4742,7 +4596,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
                        ss, m->immb ? 2 : 3, d, 0, FIXED_LAT);
             break;
         }
-        case MK_ATOM: {  // variable latency, like a load; with no result, a read barrier on its sources alone
+        case MK_ATOM: {  // with no result, only a read barrier on its sources
             int shared = IR_ATOMA_SHARED(m->aux), ret = m->def >= 0;
             uint8_t ss[6] = { s[0], s[1], s[2], (uint8_t)(s[0] + 1) };
             int n = demote_src(ss, shared ? 3 : 4);
@@ -4755,7 +4609,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
                                (uint32_t)m->imm, s[1], s[2], c);
             } else {
                 in = sass_red(IR_ATOMA_OP(m->aux), IR_ATOMA_TYPE(m->aux), s[0], (uint32_t)m->imm, s[1], c);
-                ss[n++] = UR_PSEUDO;  // the descriptor, as LDG.E reads it
+                ss[n++] = UR_PSEUDO;  // .E reads the descriptor
             }
             sched_push(demote_guard(in), ss, n, d, 0, 0);
             break;
@@ -4807,7 +4661,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             sched_push(sass_lds(d, a, (uint32_t)m->imm, mem_size(m->aux), c), ss, m->nsrc, d, 0, 0);
             break;
         }
-        case MK_STS: {  // every register of a wide store's data is read late
+        case MK_STS: {  // all of a wide store's data is read late
             int words = m->aux > 4 ? m->aux / 4 : 1;
             uint8_t ss[5] = { s[0] };
             for (int k = 0; k < words; k++)
@@ -4816,7 +4670,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             sched_push(sass_sts(s[0], (uint32_t)m->imm, s[1], mem_size(m->aux), c), ss, 1 + words, -1, 0, 0);
             break;
         }
-        case MK_LDL: {  // as LDG: every register of a wide load waits on it
+        case MK_LDL: {
             uint8_t a = m->nsrc ? s[0] : SASS_RZ;
             uint8_t ss[1] = { a };
             c = sched(ss, m->nsrc, 1, d, m->aux > 4 ? m->aux / 4 : 1, 1);
@@ -4836,7 +4690,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             break;
         }
         case MK_BAR:
-            if (m->aux) {  // a memory fence, with nvcc's control words
+            if (m->aux) {  // a fence, with nvcc's control words
                 sched_push(sass_membar_gpu(0x000fec00), NULL, 0, -1, 0, 0);
                 sched_push(sass_errbar(0x000fc000), NULL, 0, -1, 0, 0);
                 sched_push(sass_cctl_ivall(0x000fca00), NULL, 0, -1, 0, 0);
@@ -4847,8 +4701,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             for (int r = 0; r < 256; r++)
                 held |= (g_wbar_of[r] | g_rbar_of[r]) & g_mem_bars;
             settle(held);
-            // six cycles before the next instruction, as nvcc and NAK give it: a shared load issued one to three
-            // cycles after the barrier missed the other warps' stores from before it
+            // six cycles as nvcc and NAK use; a shared load 1-3 cycles after BAR missed other warps' stores
             c = (c & ~(0xfu << 9)) | 6u << 9;
             sched_push(sass_bar_sync(c | held << 20), NULL, 0, -1, 0, 0);
             break;
@@ -4931,7 +4784,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             if (m->target < 0 && m->label < 0)
                 break;
             if (!cond && falls_into(i, m->target))
-                break;  // the block it goes to follows
+                break;
             settle_fixed();
             int to = m->target >= 0 ? g_block_mop[m->target] : m->label;
             if (to <= i)
@@ -4947,8 +4800,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             break;
         }
         case MK_OUTPUT:
-            // Where the colours live is all the exit needs. Probing still stages them, which is what the scheduler
-            // sees: the sources are read here, and nothing is allowed to write them before this.
+            // the exit only needs where the colours live; probing stages them so nothing overwrites them first
             for (int k = 0; k < m->nsrc; k++) {
                 if (!g_probe && !g_stage_exit) {
                     g_out_reg[m->imm + k] = s[k];
@@ -4995,9 +4847,8 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
     }
 }
 
-// The registers are allocated by now, so the order of a block's mops may change as long as every register and
-// every memory space sees its reads and writes in the same relative order. A mop that starts or ends a block or
-// moves control, a threadgroup barrier or a demote stays where it is, and nothing crosses it.
+// After allocation, mops reorder within a block so long as each register and memory space keeps its access order;
+// nothing crosses a fence.
 
 static int is_fence(const struct mop *m)
 {
@@ -5011,8 +4862,7 @@ static int is_fence(const struct mop *m)
     case MK_CALL:
     case MK_ENTRY:
     case MK_RET:
-    // the exit reads the colours from where the outputs found them, so they stay next to it: moved up, the second
-    // allocation would end the colours' ranges there and give their registers to later values
+    // moved up, the second allocation would end the colours' ranges early and reuse their registers
     case MK_OUTPUT:
         return 1;
     default:
@@ -5022,8 +4872,7 @@ static int is_fence(const struct mop *m)
 
 enum { SP_NONE, SP_GLOBAL, SP_SHARED, SP_LOCAL, SP_ATTR, SP_COUNT };
 
-// the memory space a mop touches and whether it writes there: stores and atomics keep their order against every
-// other access of the space, loads move past each other. A load of memory nothing writes moves past stores too.
+// loads pass each other, and read-only loads pass stores too
 static int mem_space(const struct mop *m, int *store)
 {
     *store = 0;
@@ -5059,7 +4908,7 @@ static int mem_space(const struct mop *m, int *store)
     }
 }
 
-// roughly the cycles to a variable-latency result, for deciding what to start early
+// rough guesses, only for deciding what to start early
 static unsigned result_latency(enum mkind k)
 {
     switch (k) {
@@ -5093,15 +4942,15 @@ struct edge {
 struct snode {
     int mop;
     struct fx fx;
-    unsigned lat;      // to the result, when it is async
+    unsigned lat;      // when async
     struct edge *out;
     int nout, capout;
-    int *producers;    // the async nodes whose results it reads
+    int *producers;    // async nodes it reads
     int nprod, capprod;
-    int npred;         // edges still to be satisfied
-    unsigned avail;    // the cycle its operands are ready
-    unsigned height;   // the longest chain of latencies from it to the end of the block
-    int consumed;      // an async node: something has read its result
+    int npred;
+    unsigned avail;
+    unsigned height;   // longest latency chain to the block's end
+    int consumed;      // async result already read
 };
 
 struct vec {
@@ -5139,8 +4988,7 @@ static unsigned raw_edge(const struct snode *w, int reg, int rclass)
     return 1;
 }
 
-// A segment's order, in order[lo..hi): the mops are all movable. sink is a register the fence after the segment
-// reads (the predicate of a branch), whose last write should start early.
+// sink is a register the following fence reads, such as a branch predicate, whose last write should start early
 static void schedule_segment(int *order, int lo, int hi, int sink, enum nvk_stage stage)
 {
     int n = hi - lo;
@@ -5215,7 +5063,7 @@ static void schedule_segment(int *order, int lo, int hi, int sink, enum nvk_stag
     }
 
     if (ok) {
-        // each scoreboard held by a result nobody has read yet makes the next load share one
+        // past MAX_LIVE unread async results another load would have to share a scoreboard
         enum { MAX_LIVE = 5 };
         int *ready = malloc(n * sizeof(*ready));
         int nready = 0, placed = 0, live = 0;
@@ -5226,7 +5074,7 @@ static void schedule_segment(int *order, int lo, int hi, int sink, enum nvk_stag
         while (placed < n) {
             int pick = -1;
             unsigned soonest = ~0u;
-            int quiet = 0;  // a candidate that holds no scoreboard
+            int quiet = 0;  // a ready candidate needing no scoreboard
             for (int r = 0; r < nready; r++) {
                 struct snode *c = &nodes[ready[r]];
                 if (c->avail < soonest)
@@ -5266,7 +5114,7 @@ static void schedule_segment(int *order, int lo, int hi, int sink, enum nvk_stag
             now++;
         }
         free(ready);
-        uint64_t later[4] = { 0 };  // registers written after, in the order chosen
+        uint64_t later[4] = { 0 };  // written later in the chosen order
         for (int p = n - 1; p >= 0; p--) {
             struct snode *nd = &nodes[order[lo + p] - lo];
             int free_rd = nd->fx.late && nd->fx.async;
@@ -5292,7 +5140,7 @@ static void schedule_segment(int *order, int lo, int hi, int sink, enum nvk_stag
     free(nodes);
 }
 
-// the mops into SASS, each straight run in the order schedule_segment gives it, which is left in order
+// leaves each straight run's chosen order in order[]
 static void emit_mops(enum nvk_stage stage, int *order)
 {
     char *start = calloc(g_nmops + 1, 1);
@@ -5304,7 +5152,7 @@ static void emit_mops(enum nvk_stage stage, int *order)
     for (struct ir_block *b = g_fn->entry; b; b = b->next)
         if (!b->dead)
             start[g_block_mop[b->id]] = 1;
-    // AIRC_NOSCHED=1: keep the program order, for telling a reordering bug from other wrong output
+    // AIRC_NOSCHED=1 keeps program order, to tell a reordering bug from other wrong output
     int plain = getenv("AIRC_NOSCHED") != NULL;
     for (int lo = 0; lo < g_nmops;) {
         int hi = lo + 1;
@@ -5325,8 +5173,7 @@ static void emit_mops(enum nvk_stage stage, int *order)
     free(start);
 }
 
-// Registers for the mops, then their SASS into g_prog, the order emit_mops gave each straight run left in order.
-// 0, or -1 when the values don't fit.
+// -1 when the values don't fit
 static int allocate_and_emit(struct ir_func *f, const struct airc_info *info, int *order)
 {
     memset(g_reserved, 0, sizeof(g_reserved));
@@ -5345,7 +5192,7 @@ static int allocate_and_emit(struct ir_func *f, const struct airc_info *info, in
         g_regcount += g_exit_regs > 4 ? g_exit_regs : 4;
         g_exit_tmp = g_regcount - 1;
     } else {
-        // the colours land in R0.. and the one temporary a cycle of moves needs is past them
+        // the cycle-breaking temporary sits past the colours in R0..
         g_exit_tmp = g_scratch > g_exit_regs ? g_scratch : g_exit_regs;
         g_regcount = g_exit_tmp + 1;
     }
@@ -5368,7 +5215,7 @@ static int allocate_and_emit(struct ir_func *f, const struct airc_info *info, in
     g_into = calloc(g_nmops + 1, sizeof(*g_into));
     g_block_np = calloc(f->nblocks, sizeof(*g_block_np));
 
-    // prologue: R1 = stack pointer, UR4 = the global memory base (LDG reads it implicitly), the buffers' bases
+    // R1 is the stack pointer and UR4 the memory descriptor LDG reads implicitly
     sched_push(sass_mov_cbuf(1, 0, 0x28, sched(NULL, 0, 0, 1, 1, 0)), NULL, 0, 1, 0, FIXED_LAT);
     sched_push(sass_uldc64_cbuf(4, 0, 0x118, sched(NULL, 0, 0, -1, 0, 0)), NULL, 0, UR_PSEUDO, 0, UNIFORM_LAT);
     for (int k = 0; k < g_nubase; k++)
@@ -5395,13 +5242,13 @@ static int allocate_and_emit(struct ir_func *f, const struct airc_info *info, in
     free(g_mop_np);
     free(g_rd_free_of);
     free(g_block_np);
-    for (int i = 0; i <= g_nmops; i++)  // a stub's, left out
+    for (int i = 0; i <= g_nmops; i++)  // a dropped stub's may remain
         free(g_into[i]);
     free(g_into);
     return 0;
 }
 
-// does a schedule keep every mop within the run it was lowered in: between fences, block starts and stubs
+// whether every mop stayed within its straight run
 static int in_runs(const int *order)
 {
     char *start = calloc(g_nmops + 1, 1);
@@ -5436,12 +5283,12 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
     g_exit_regs = 0;
     g_demote = 0;
 
-    memset(g_consts, 0xff, sizeof(g_consts));  // block -1: all free
+    memset(g_consts, 0xff, sizeof(g_consts));  // block -1, all free
     g_one = new_vreg(1, 1);
     struct mop *one = emit_mop(MK_MOVIMM);
     one->def = g_one;
     one->imm = 1;
-    // every phi has its vreg before any block is lowered: a predecessor's copies may come first
+    // a predecessor's copies may be lowered before the phi's block
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v && v->op == IR_PHI; v = v->next) {
             int m[2];
@@ -5487,9 +5334,8 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
                      (v->op == IR_LDG || v->op == IR_LDS || v->op == IR_LDL || v->op == IR_TEX))
                 g_vregs[v->vreg].ir = v->id;
 
-    // Allocated and scheduled twice: the second time with each straight run's mops in the order the first
-    // schedule left them, so the registers follow the loads it started early, and the scheduler is no longer held
-    // back by the first allocation's reuse of a register. Kept unless it costs occupancy or doesn't fit.
+    // A second allocation in the first schedule's order lets registers follow the early loads instead of blocking
+    // them; kept unless it costs occupancy or doesn't fit.
     struct mop *mops = malloc(g_nmops * sizeof(*mops));
     memcpy(mops, g_mops, g_nmops * sizeof(*mops));
     struct vreg *vregs = malloc(g_nvregs * sizeof(*vregs));
@@ -5559,14 +5405,13 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
         sph_tess_eval((uint32_t *)out, info->vertex_inputs, info->ngeneric, info->sysvals);
     if (hdr)  // SHADER_LOCAL_MEMORY_LOW_SIZE
         ((uint32_t *)out)[1] |= ((info->local_size + 15) & ~15u) & 0xffffff;
-    // AIRC_SERIAL=1: every instruction waits on all six scoreboards and stalls 15 cycles, for telling a scheduling
-    // hazard (a result read before it lands) from other wrong output
+    // AIRC_SERIAL=1 waits on every scoreboard and stalls 15 cycles, to tell a scheduling hazard from other bugs
     if (getenv("AIRC_SERIAL"))
         for (unsigned i = 0; i < g_np; i++)
             g_prog[i].hi |= 0x3full << 52 | 0xfull << 41;
     sass_emit(g_prog, g_np, out + hdr);
 
-    unsigned r = (g_regcount + 2 + 7) & ~7u;  // + 2 for the program counter, rounded to the 8-register granule
+    unsigned r = (g_regcount + 2 + 7) & ~7u;  // + 2 for the program counter, in 8-register granules
     *regs = r < 8 ? 8 : r;
 
     free(g_prog);
