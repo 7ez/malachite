@@ -87,7 +87,7 @@ sh updater/build.sh
 `sudo make install-kext` and `sudo make install-mtl SIGN=1` install what you built. WindowServer refuses a Metal driver
 that isn't signed. For the firmware, unpack `gsp`, `bootloader`, `booter_load` and
 `booter_unload` `-570.144.bin.zst` from linux-firmware's `nvidia/ga102/gsp` into `fw/570/`, without the version in their
-names.
+names, and `bootloader`, `booter_load` and `booter_unload` from `nvidia/ad102/gsp` into `fw/570/ad10x/` for RTX 40.
 
 ## Not finished
 

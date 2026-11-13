@@ -176,9 +176,13 @@ private func copyPayload(_ pkg: String, efi: String?, legacy: Bool, saved: [Stri
     let fm = FileManager.default
     say("Installing")
     try steps.mkdir("\(supportDir)/570")
-    let firmware = (try? fm.contentsOfDirectory(atPath: "\(pkg)/firmware/570").sorted().filter { $0.hasSuffix(".bin") }) ?? []
+    // gsp.bin and GA10x's set, then a folder for each other family's (570/ad10x)
+    let firmware = (try? fm.contentsOfDirectory(atPath: "\(pkg)/firmware/570").sorted()) ?? []
     for f in firmware {
-        try steps.put("\(pkg)/firmware/570/\(f)", "\(supportDir)/570/\(f)")
+        var dir: ObjCBool = false
+        if f.hasSuffix(".bin") || fm.fileExists(atPath: "\(pkg)/firmware/570/\(f)", isDirectory: &dir) && dir.boolValue {
+            try steps.put("\(pkg)/firmware/570/\(f)", "\(supportDir)/570/\(f)")
+        }
     }
     say("  GSP firmware")
 
