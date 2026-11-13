@@ -23,17 +23,17 @@ planned.
 
 ## Benchmarks
 
-Geekbench and Unigine (windowed) on an RTX 3060 in a macOS 26.7.1 VM (GPU passed through), both drivers in the same VM on
-the same day, November 2026.
+Geekbench and Unigine (windowed) on an RTX 3060 in a macOS 26.7.1 VM (GPU passed through). Malachite ran on 13 November
+and NullMoth on 12 November, in the same VM with the same displays. Two Malachite runs each, after a restart.
 
-| | Malachite 2026.11.12-2 | NullMoth 2.9 |
+| | Malachite 2026.11.13 | NullMoth 2.9 |
 |---|---|---|
-| Geekbench 7 Metal | [77140](https://browser.geekbench.com/v7/gpu/392279) | [80819](https://browser.geekbench.com/v7/gpu/390474) |
-| Geekbench 7 OpenCL | [52534](https://browser.geekbench.com/v7/gpu/392287) | [43784](https://browser.geekbench.com/v7/gpu/390480), Path Tracer scores about 3k |
-| Geekbench 6 Metal | [68802](https://browser.geekbench.com/v6/compute/6971619) | [22235](https://browser.geekbench.com/v6/compute/6970997), Face Detection fails validation |
-| Geekbench 6 OpenCL | [56734](https://browser.geekbench.com/v6/compute/6971620) | [74223](https://browser.geekbench.com/v6/compute/6970984) |
-| Unigine Heaven 4.0, 1920x1080 | 31.3 fps | doesn't finish, OpenGL falls back to software |
-| Unigine Valley 1.0, 1920x1080 | 35.0 fps | doesn't finish, OpenGL falls back to software |
+| Geekbench 7 Metal | [77128](https://browser.geekbench.com/v7/gpu/395795), [74945](https://browser.geekbench.com/v7/gpu/395848) | [80819](https://browser.geekbench.com/v7/gpu/390474) |
+| Geekbench 7 OpenCL | [54363](https://browser.geekbench.com/v7/gpu/395804), [54244](https://browser.geekbench.com/v7/gpu/395860) | [43784](https://browser.geekbench.com/v7/gpu/390480), Path Tracer scores about 3k |
+| Geekbench 6 Metal | [70081](https://browser.geekbench.com/v6/compute/6972646), [73584](https://browser.geekbench.com/v6/compute/6972663) | [22235](https://browser.geekbench.com/v6/compute/6970997), Face Detection fails validation |
+| Geekbench 6 OpenCL | [61398](https://browser.geekbench.com/v6/compute/6972649), [61008](https://browser.geekbench.com/v6/compute/6972664) | [74223](https://browser.geekbench.com/v6/compute/6970984) |
+| Unigine Heaven 4.0, 1920x1080 | 31.4 and 31.8 fps | doesn't finish, OpenGL falls back to software |
+| Unigine Valley 1.0, 1920x1080 | 34.9 and 35.2 fps | doesn't finish, OpenGL falls back to software |
 
 NullMoth's compiler still beats ours in Geekbench 7 Metal overall, most of all in Feature Matching and Super
 Resolution, and in every Geekbench 6 OpenCL workload. That's being worked on.
