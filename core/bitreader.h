@@ -1,5 +1,4 @@
-// RBSP bits of NAL units, the syntax elements of H.264 and H.265 headers, the bits of AV1 OBUs and VP9 headers, and
-// the boolean decoder of VP8 and VP9
+// Bit reader for H.264/H.265 RBSP and AV1/VP9 headers, plus the VP8/VP9 boolean decoder
 #pragma once
 #include "plat.h"
 
@@ -26,8 +25,8 @@ uint64_t bits_pos(const struct bits *b);
 
 // the next NAL unit from *pos: its payload and length, start code skipped; 0 at the end
 int bits_next_nal(const uint8_t *s, size_t len, size_t *pos, size_t *start, size_t *size);
-// the next frame of a VP8 or VP9 stream from *pos: an IVF file's next frame (its 32-byte file header skipped at 0),
-// or all of what is left of a stream that isn't IVF, one container sample; 0 at the end, -1 for a cut frame
+// the next VP8/VP9 frame from *pos: the next IVF frame (32-byte file header skipped at 0), or the whole input if it
+// isn't IVF (one container sample); 0 at the end, -1 for a cut frame
 int bits_next_ivf(const uint8_t *s, size_t len, size_t *pos, size_t *start, size_t *size);
 
 // VP8's boolean entropy decoder (RFC 6386 7.3), which VP9 keeps (9.2); reads past the end give zeros

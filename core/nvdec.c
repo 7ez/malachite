@@ -3,9 +3,9 @@
 #include "av1grain.h"
 
 #define ALIGN(x, a) (((x) + (a) - 1) / (a) * (a))
-#define MAX_FRAME_DISTANCE 31  // order hints a reference can be away for its motion vectors to be projected
+#define MAX_FRAME_DISTANCE 31  // max order hint distance for projecting a reference's MVs
 
-// an end of sequence NAL unit twice, which NVDEC puts after the slices
+// two end of sequence NAL units, NVDEC's marker after the slices
 static const uint8_t eos[16] = { 0, 0, 1, 0x0b, 0, 0, 0, 0, 0, 0, 1, 0x0b };
 
 void nvdec_surface_init(uint32_t width_mbs, uint32_t height_mbs, uint32_t bps, struct nvdec_surface *surf)
@@ -27,16 +27,15 @@ void nvdec_h264_sizes(uint32_t width_mbs, uint32_t height_mbs, struct nvdec_h264
     sizes->history = ALIGN(width_mbs * 0x300, 0x200);
 }
 
-// The filter buffer is what NVDEC's deblocking and sample adaptive offset keep across CTB rows and tile columns in.
-// nvdec_drv.h gives the sizes of its above and left parts for 16x16 CTBs (HEVC_DBLK_TOP_BUF_SIZE and the like) and
-// per row of pixels what tile borders take (GIP_ASIC_*_RAM_SIZE) for up to 20 tile columns, but not where in the
-// buffer each part goes: the five offsets in the picture setup name the regions, each sized for what might be in it.
+// Filter buffer: deblocking and SAO state kept across CTB rows and tile columns. nvdec_drv.h gives part sizes
+// (HEVC_DBLK_TOP_BUF_SIZE etc. for 16x16 CTBs, GIP_ASIC_*_RAM_SIZE per row per tile border, up to 20 columns) but not
+// their placement, so each of the five regions the setup's offsets name is sized for its worst case.
 void nvdec_hevc_sizes(const struct nvdec_surface *surf, struct nvdec_hevc_sizes *sizes)
 {
     uint32_t w = surf->width_mbs, h = surf->height_mbs, rows = h * 16, borders = H265_MAX_TILE_COLS - 1;
     uint32_t dblk_top = (w + 2) * ALIGN(632, 128), dblk_left = (h + 2) * ALIGN(506, 128);
     uint32_t sao_left = (h + 2) * ALIGN(713, 128), sao_top = (w + 2) * ALIGN(713, 128);
-    // Hantro G2's SAO border is 48 bytes a row, nvdec_drv.h says 16 (hantro_hevc.c)
+    // SAO tile borders take 48 bytes a row as on Hantro G2, not nvdec_drv.h's 16
     uint32_t tile_filter = 16 * rows * borders * surf->bps, tile_sao = 48 * rows * borders * surf->bps;
     uint32_t tile_bsd = 4 * rows * borders;
 
@@ -124,8 +123,7 @@ void nvdec_h264_setup(const struct h264_dec *d, const struct h264_picture *pic, 
     }
 }
 
-// The lists as Hantro's G2 (the engine's ancestor) takes them: the sequence the initial list is made of, repeated to
-// fill it (hantro_g2_hevc_dec.c set_ref_pic_list)
+// initial ref list as Hantro G2 (NVDEC's ancestor) takes it: the candidate sequence repeated to fill 16 entries
 static void init_ref_list(const struct h265_dec *d, uint8_t *list, const uint8_t *first, uint32_t nfirst,
                           const uint8_t *second, uint32_t nsecond, const uint8_t *lt, uint32_t nlt)
 {
@@ -141,8 +139,7 @@ static void init_ref_list(const struct h265_dec *d, uint8_t *list, const uint8_t
         list[i] = seq[i % n];
 }
 
-// the scaling lists as Hantro's G2 takes them: the DC values of the 16x16 and 32x32 lists, then each list column by
-// column (hantro_g2_hevc_dec.c prepare_scaling_list_buffer)
+// scaling lists as Hantro G2 takes them: 16x16 and 32x32 DC values, then each list column by column
 static void scaling_lists(const struct h265_scaling *sl, uint8_t *out)
 {
     for (int i = 0; i < 6; i++)
@@ -161,7 +158,7 @@ static void scaling_lists(const struct h265_scaling *sl, uint8_t *out)
                     *out++ = sl->list[size][size == 3 ? i * 3 : i][8 * k + j];
 }
 
-// the width and height of each tile in CTBs, a row of tiles at a time (hantro_g2_hevc_dec.c prepare_tile_info_buffer)
+// each tile's width and height in CTBs, row by row, as Hantro G2 takes them
 static void tile_sizes(const struct h265_sps *s, const struct h265_pps *p, uint16_t *out)
 {
     uint32_t cols[H265_MAX_TILE_COLS], rows[H265_MAX_TILE_ROWS];
@@ -288,9 +285,8 @@ void nvdec_hevc_setup(const struct h265_dec *d, const struct h265_picture *pic, 
     tile_sizes(s, p, (uint16_t *)(page + NVDEC_SETUP_TILES));
 }
 
-// NVDEC's AV1 buffers are named and sized in nvdec_drv.h (AV1_TEMPORAL_MV_BUF_SIZE and the like); the filter buffer
-// holds its six regions one after the other, in the order mesa-nova's NVK decoder found NVIDIA's driver giving them
-// (rust/video/decode/av1.rs), superres's before loop restoration's.
+// sizes from nvdec_drv.h (AV1_TEMPORAL_MV_BUF_SIZE etc.); the six filter regions go back to back in NVIDIA's driver's
+// order, superres before loop restoration
 void nvdec_av1_sizes(const struct nvdec_surface *surf, struct nvdec_av1_sizes *sizes)
 {
     uint32_t w = surf->width_mbs * 16, h = surf->height_mbs * 16;
@@ -332,8 +328,7 @@ static int div_lut(int i)
     return (int)(((1 << 22) + (256 + i) / 2) / (256 + i));
 }
 
-// the shear a warp model is applied as (setupShear, 7.11.3.6), reduced to what the hardware keeps: 0 if the model
-// can't warp
+// setupShear (7.11.3.6) reduced to what the hardware keeps; 0 if the model can't warp
 static int shear_params(const int32_t *m, int16_t *out)
 {
     if (m[2] <= 0)
@@ -357,9 +352,8 @@ static int shear_params(const int32_t *m, int16_t *out)
     return 1;
 }
 
-// The global motion buffer: for each of the seven references its six model parameters, then the four shear
-// parameters as 16-bit values, all 0x8000 for a model that can't warp or a reference of another size (mesa-nova
-// av1.rs). An intra picture has the identity models and no shear.
+// per reference: six model params, then four 16-bit shear params, all 0x8000 if the model can't warp or the
+// reference is scaled; intra pictures get identity models and no shear
 static void global_motion(const struct av1_frame *f, int intra, const struct nvdec_av1_pic *pic, uint8_t *out)
 {
     static const int32_t identity[6] = { 0, 0, 1 << 16, 0, 0, 1 << 16 };
@@ -374,9 +368,8 @@ static void global_motion(const struct av1_frame *f, int intra, const struct nvd
     }
 }
 
-// Each tile in raster order, in AV1TileInfo_OLD's 16 bytes: its width and height in superblocks, then the offsets in
-// the bitstream of its first byte and of the one after its last (mesa-nova av1.rs; AV1_SET_TILE_STREAM_INFO_BUF_OFFSET
-// is left unused)
+// AV1TileInfo_OLD per tile in raster order: width and height in superblocks, then bitstream offsets of its first
+// byte and one past its last (AV1_SET_TILE_STREAM_INFO_BUF_OFFSET unused)
 static void av1_tiles_info(const struct av1_picture *pic, uint8_t *out)
 {
     const struct av1_frame *f = &pic->hdr;
@@ -400,9 +393,8 @@ static uint32_t cdef_pack(const uint32_t *v, uint32_t n, int bits)
     return out;
 }
 
-// The references the motion vectors of this picture are projected from, at most three (libaom's
-// av1_setup_motion_field, as mesa-nova chooses them): LAST_FRAME unless it's an overlay, then the later ones,
-// BWDREF_FRAME, ALTREF2_FRAME and ALTREF_FRAME, then LAST2_FRAME. The ones too far away are named but not used.
+// up to three references to project MVs from (libaom av1_setup_motion_field): LAST_FRAME unless an overlay, then
+// BWDREF, ALTREF2, ALTREF if later, then LAST2. Ones too far away are named but not used.
 static void motion_fields(const struct av1_dec *d, const struct av1_frame *f, uint32_t slot,
                           struct nvdec_av1_pic *out, struct nvdec_av1_frame *fr)
 {
@@ -458,8 +450,7 @@ static void motion_fields(const struct av1_dec *d, const struct av1_frame *f, ui
     out->mf3_type = (uint32_t)type[2];
 }
 
-// NVIDIA's driver gives 10000 cycles a macroblock, of at least 8100 macroblocks (mesa-nova av1.rs; cagedbird043/nvrm
-// vp9.rs has the same for VP9)
+// NVIDIA's driver allows 10000 cycles per macroblock, counting at least 8100 macroblocks
 static uint32_t gptimer_timeout(uint32_t width, uint32_t height)
 {
     uint64_t mbs = (uint64_t)((width + 15) / 16) * ((height + 15) / 16);
@@ -504,8 +495,7 @@ void nvdec_av1_setup(const struct av1_dec *d, const struct av1_picture *pic, con
         .enable_order_hint = (uint32_t)s->order_hint,
         .enable_jnt_comp = (uint32_t)s->jnt_comp,
         .enable_cdef = (uint32_t)cdef,
-        // the decoder adds film grain only to a display picture of its own (SET_DISPLAY_BUF_LUMA_OFFSET), the
-        // reference staying without; no picture gets one yet
+        // grain goes only to a separate display picture (SET_DISPLAY_BUF_LUMA_OFFSET), which isn't set up yet
         .enable_fgs = 0,
         .frame_type = f->type,
         // hidden frames too (mesa-nova)
@@ -586,8 +576,7 @@ void nvdec_av1_setup(const struct av1_dec *d, const struct av1_picture *pic, con
     for (int i = 0; i < AV1_REFS_PER_FRAME; i++)
         fr->refs[i] = intra ? pic->slot : d->refs[f->ref_idx[i]].slot;
 
-    // the features from the reference frame up are flags, or in that one's case the reference plus one but on key
-    // frames
+    // features from the reference frame (5) up are flags; the reference frame itself is ref + 1, 0 on key frames
     for (int i = 0; i < 8 && f->seg_enabled; i++) {
         for (int j = 0; j < 8; j++) {
             if (!(f->seg_feature_enabled[i] >> j & 1))
@@ -675,13 +664,11 @@ void nvdec_av1_setup(const struct av1_dec *d, const struct av1_picture *pic, con
     av1_tiles_info(pic, page + NVDEC_SETUP_TILES);
 }
 
-// The motion vectors take 1024 bytes a superblock and the segmentation map 32 (GIP_ASIC_VP9_CTB_SEG_SIZE), as
-// mickys/nvenc measured them. nvdec_drv.h sizes the deblocking filter's above and left lines (VP9_DBLK_*_BUF_SIZE)
-// and gives tile borders 16 bytes of filter and 4 of BSD control a row (GIP_ASIC_*_RAM_SIZE), not where in the buffer
-// each part goes; as with H.265 each region is sized for what might be in it. The first holds the deblocking lines
-// and 48 bytes a row for each tile border, one at least, as NVIDIA's driver gives it (cagedbird043/nvrm vp9.rs);
-// the above region nvenc's 16 bytes a row for 64 tile columns, or the 5776 bytes a superblock column NVIDIA's driver
-// leaves (mesa-nova nvk_video_session.c), if more; the BSD control nvenc's 4 bytes a row for 64 tile columns.
+// Per superblock, MVs take 1024 bytes (measured) and the segmap 32 (GIP_ASIC_VP9_CTB_SEG_SIZE). nvdec_drv.h sizes the
+// deblocking lines (VP9_DBLK_*_BUF_SIZE) and per-row tile border costs (GIP_ASIC_*_RAM_SIZE) but not their placement,
+// so as with H.265 each region gets its worst case: deblocking lines plus 48 bytes a row per tile border (at least
+// one), as NVIDIA's driver does; above: 16 bytes a row for 64 tile columns or NVIDIA's 5776 bytes per superblock
+// column, whichever is more; BSD control: 4 bytes a row for 64 tile columns.
 void nvdec_vp9_sizes(const struct nvdec_surface *surf, struct nvdec_vp9_sizes *sizes)
 {
     uint32_t w = surf->width_mbs * 16, h = surf->height_mbs * 16, sb_cols = w / 64, sb_rows = h / 64;
@@ -697,21 +684,20 @@ void nvdec_vp9_sizes(const struct nvdec_surface *surf, struct nvdec_vp9_sizes *s
     sizes->flt_above = ALIGN(dblk_top + dblk_left + tile_filter, 256);
     sizes->bsd = sizes->flt_above + ALIGN(above * surf->bps, 256);
     sizes->filter = sizes->bsd + 4 * 64 * h;
-    // nvenc measured about 4 bytes a pixel of width; NVIDIA's driver gives it 64 KiB (mesa-nova)
+    // measured ~4 bytes per pixel of width; NVIDIA's driver gives 64 KiB
     sizes->intra_top = ALIGN(w * 8 * surf->bps, 0x10000);
     sizes->prob = ALIGN(VP9_PROBS_SIZE, 256);
     sizes->counts = sizeof(struct vp9_counts);
 }
 
-// 512 bytes of history for each macroblock column, and NVDEC's state after the probabilities (mickys/nvenc vp8dec.c,
-// cagedbird043/nvrm vp8.rs)
+// history: 512 bytes per macroblock column; prob also holds NVDEC's state after the probabilities
 void nvdec_vp8_sizes(const struct nvdec_surface *surf, struct nvdec_vp8_sizes *sizes)
 {
     sizes->history = ALIGN(surf->width_mbs * 0x200 + 0x1000, 256);
     sizes->prob = 0x5000;
 }
 
-// The width and height of each tile in superblocks, a row of tiles at a time, as H.265's (mickys/nvenc vp9dec.c)
+// each tile's width and height in superblocks, row by row, as for H.265
 static void vp9_tile_sizes(const struct vp9_frame *f, uint16_t *out)
 {
     uint32_t cols[VP9_MAX_TILE_COLS + 1], rows[VP9_MAX_TILE_ROWS + 1];
@@ -734,7 +720,7 @@ void nvdec_vp9_setup(const struct vp9_dec *d, const struct vp9_picture *pic, con
     nvdec_vp9_sizes(surf, &sizes);
     struct nvdec_vp9_pic *out = (struct nvdec_vp9_pic *)page;
     struct nvdec_vp9_frame *fr = (struct nvdec_vp9_frame *)(page + NVDEC_SETUP_VP9);
-    // in samples: in bytes, 10-bit rows land twice as far apart (nvenc)
+    // in samples: a byte stride puts 10-bit rows twice as far apart
     uint16_t stride = (uint16_t)(surf->pitch / surf->bps);
     int resize = !d->have_last || f->width != d->last_width || f->height != d->last_height;
 
@@ -760,8 +746,7 @@ void nvdec_vp9_setup(const struct vp9_dec *d, const struct vp9_picture *pic, con
         .lossless = (int8_t)f->lossless,
         .tx_mode = (int8_t)f->tx_mode,
         .allow_hp = (int8_t)f->allow_hp,
-        // the filters as coded, not libvpx's numbers for them, or regular frames come out smooth (nvenc; Hantro's G2
-        // takes them the same way)
+        // as coded, not libvpx's remapped values, or regular frames come out smooth
         .interp_filter = (int8_t)f->interp_filter,
         .reference_mode = (int8_t)f->reference_mode,
         .comp_fixed_ref = (int8_t)f->comp_fixed_ref,
@@ -813,9 +798,8 @@ void nvdec_vp9_setup(const struct vp9_dec *d, const struct vp9_picture *pic, con
     memcpy(page + NVDEC_SETUP_VP9_HEADER, stream + pic->header_pos, pic->header_len);
 }
 
-// The frame from its first partition on, its size rounded up to whole macroblocks or the last row mispredicts, the
-// segmentation byte set twice as NVIDIA's Tegra driver does (AROS nvgfx_decode_vp8.c, nvenc and averne's FFmpeg
-// nvtegra_vp8.c)
+// frame from its first partition on; size rounded up to whole macroblocks or the last row mispredicts; segmentation
+// byte set twice as NVIDIA's Tegra driver does
 void nvdec_vp8_setup(const struct vp8_dec *d, const struct vp8_picture *pic, const struct nvdec_surface *surf,
                      uint8_t *page)
 {
@@ -895,8 +879,7 @@ static void extend(uint8_t *p, uint32_t pitch, uint32_t w, uint32_t h, uint32_t 
             memcpy(p + bl_offset(pitch, x, y), p + bl_offset(pitch, x, h - 1), 16);
 }
 
-// NVDEC predicts VP9 from the references' whole superblocks without clamping to the picture's edge, as the
-// specification does (8.5.2.3); the edge's samples repeated past it make up for that (mickys/nvenc vp9dec.c)
+// NVDEC predicts VP9 from whole superblocks without the spec's edge clamp (8.5.2.3); repeated edges make up for it
 void nvdec_extend(uint8_t *surface, const struct nvdec_surface *surf, uint32_t width, uint32_t height)
 {
     uint32_t aw = ALIGN(width, 64), ah = ALIGN(height, 64), b = surf->bps;
@@ -985,8 +968,7 @@ static void h265_info(const struct h265_sps *sps, struct nvdec_pic *info)
                                           sps->height - sps->crop_top - sps->crop_bottom } };
 }
 
-// Surfaces take the superblocks AV1 decodes in whole, which are 128 samples at the most; the sequence's largest size
-// holds every frame
+// surfaces hold whole superblocks (up to 128 samples); the sequence's max size holds every frame
 static void av1_info(const struct av1_seq *seq, const struct av1_frame *f, struct nvdec_pic *info)
 {
     *info = (struct nvdec_pic){ .slots = AV1_SLOTS,

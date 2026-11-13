@@ -354,8 +354,7 @@ static const struct vp9_probs defaults = {
     },
 };
 
-// vp9_kf_y_mode_prob, vp9_kf_uv_mode_prob and vp9_kf_partition_probs: what key frames and intra-only frames decode
-// their modes and partitions with, by the above and left blocks' modes or partitions
+// vp9_kf_y_mode_prob, vp9_kf_uv_mode_prob, vp9_kf_partition_probs: intra frames' probs by above/left context
 static const uint8_t kf_y_mode[10][10][9] = {
     {
         { 137, 30, 42, 148, 151, 207, 70, 52, 91 },
@@ -536,8 +535,7 @@ static const int8_t tx16_tree[4] = { 0, 2, -1, -2 };
 static const int8_t binary_tree[2] = { 0, -1 };
 static const int8_t mv_class_tree[20] = { 0, 2, -1, 4, 6, 8, -2, -3, 10, 12, -4, -5, -6, 14, 16, 18, -7, -8, -9, -10 };
 
-// NVDEC's table, nvdec_vp9EntropyProbs_t: nine-probability tables as eight and a ninth, rows of three padded to four,
-// the key frame partitions next to the frame context's
+// nvdec_vp9EntropyProbs_t: 9-prob rows split 8 + tail, 3-prob rows padded to 4, key frame partitions beside context's
 struct nvdec_probs {
     uint8_t kf_y_mode[10][10][8], kf_y_mode_tail[10][10];
     uint8_t ref_pred[3], seg_tree[7], seg_pred[3], ref_scores[4], comp_pred[2], pad0[9];

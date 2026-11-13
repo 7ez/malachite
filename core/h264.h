@@ -1,7 +1,5 @@
-// H.264 Annex-B streams down to what NVDEC needs from the driver: the parameter sets, each picture's slices,
-// its picture order count and the reference pictures it may use. NVDEC parses slice data and builds the
-// reference lists itself. Progressive (frame_mbs_only) 4:2:0 8-bit streams without slice groups or scaling
-// matrices: Baseline, Main and High encoded that way.
+// H.264 Annex-B parsing for what NVDEC needs from the driver: parameter sets, slices, POC, usable references (NVDEC
+// parses slice data and builds the ref lists). Progressive 4:2:0 8-bit only, no slice groups or scaling matrices.
 #pragma once
 #include "plat.h"
 
@@ -77,7 +75,7 @@ struct h264_picture {
     int32_t poc[2];
     uint32_t slot;
     uint32_t index;  // in decoding order
-    uint32_t idr_count;  // IDR pictures before it and itself: a new count of picture order
+    uint32_t idr_count;  // IDRs up to and including it; POC restarts at each
 };
 
 struct h264_dec {
@@ -94,11 +92,9 @@ struct h264_dec {
 };
 
 void h264_init(struct h264_dec *d);
-// the next picture from stream position *pos, which moves past it: 1 for a picture, 0 at the end, -1 for a stream
-// it can't decode. pic->slot is a surface no reference frame is in.
+// next picture from *pos (advanced past it): 1 picture, 0 end, -1 undecodable; pic->slot is free of references
 int h264_next(struct h264_dec *d, const uint8_t *s, size_t len, size_t *pos, struct h264_picture *pic);
 // pic is decoded: mark the references it leaves
 void h264_done(struct h264_dec *d, const struct h264_picture *pic);
-// the slices of pic as NVDEC reads them, three-byte start codes and all, and where each starts: pic->bytes into out,
-// pic->nslices + 1 offsets (the last one the end)
+// pic's slices with three-byte start codes: pic->bytes into out, pic->nslices + 1 offsets (the last is the end)
 void h264_slices(const struct h264_picture *pic, const uint8_t *s, uint8_t *out, uint32_t *offsets);

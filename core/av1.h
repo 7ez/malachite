@@ -1,12 +1,11 @@
-// AV1 low-overhead OBU streams (a temporal unit after another, every OBU with its size) down to what NVDEC needs from
-// the driver: the sequence header, each frame's header, where its tile data lies and which reference slots it uses.
-// NVDEC decodes the tile data itself. Main profile (4:2:0, 8 and 10 bit), operating point 0, no scalability.
+// AV1 low-overhead OBU streams parsed for NVDEC: sequence and frame headers, tile data spans, reference slots.
+// Main profile (4:2:0, 8 and 10 bit), operating point 0, no scalability.
 #pragma once
 #include "plat.h"
 
 #define AV1_REFS 8            // reference slots
 #define AV1_REFS_PER_FRAME 7  // LAST_FRAME to ALTREF_FRAME
-#define AV1_SLOTS (AV1_REFS + 1)  // surfaces: the frames in the reference slots and the one being decoded
+#define AV1_SLOTS (AV1_REFS + 1)  // surfaces: reference slots plus the frame being decoded
 #define AV1_MAX_TILES 256  // what NVDEC's tile buffers hold (AV1_MAX_TILES in nvdec_drv.h)
 #define AV1_MAX_TILE_COLS 64
 #define AV1_MAX_TILE_ROWS 64
@@ -98,13 +97,12 @@ struct av1_frame {
     struct av1_grain grain;
 };
 
-// a frame in a reference slot
 struct av1_ref {
     int valid;
     uint32_t slot;  // the surface it was decoded into
     uint32_t width, height, upscaled_width, mi_cols, mi_rows, render_width, render_height;
     uint32_t type, order_hint;
-    uint32_t order_hints[AV1_REFS_PER_FRAME + 1];  // those of its own references, by reference frame
+    uint32_t order_hints[AV1_REFS_PER_FRAME + 1];  // of its own references, by reference frame
     int showable;
     int32_t gm_params[AV1_REFS_PER_FRAME + 1][6];
     int32_t lf_ref_deltas[8], lf_mode_deltas[2];
@@ -116,12 +114,12 @@ struct av1_ref {
 struct av1_picture {
     const struct av1_seq *seq;
     struct av1_frame hdr;
-    int output;    // shown: show_frame, or show_existing_frame
-    int existing;  // shows a frame already decoded, in slot
+    int output;    // show_frame or show_existing_frame
+    int existing;  // shows the already decoded frame in slot
     uint32_t slot;
     uint32_t index;  // in decoding order
     uint32_t ntiles, ngroups;
-    // the tile data of each tile group in the stream, and each tile's span in those put together
+    // group_*: each tile group's data in the stream; tile_*: each tile's span in the groups concatenated
     uint32_t group_pos[AV1_MAX_TILE_GROUPS], group_len[AV1_MAX_TILE_GROUPS];
     uint32_t tile_start[AV1_MAX_TILES], tile_end[AV1_MAX_TILES];
     uint32_t bytes;  // of the tile data
@@ -134,12 +132,11 @@ struct av1_dec {
 };
 
 void av1_init(struct av1_dec *d);
-// the next frame from stream position *pos, which moves past it: 1 for a frame, 0 at the end, -1 for a stream it
-// can't decode. pic->slot is a surface no reference slot holds.
+// next frame at *pos, advancing it: 1 frame, 0 end, -1 undecodable; pic->slot is a surface no reference holds
 int av1_next(struct av1_dec *d, const uint8_t *s, size_t len, size_t *pos, struct av1_picture *pic);
-// pic is decoded: it goes in the reference slots it refreshes
+// stores decoded pic in the reference slots it refreshes
 void av1_done(struct av1_dec *d, const struct av1_picture *pic);
-// the tile data of pic as NVDEC reads it: pic->bytes into out
+// copies pic's tile data as NVDEC reads it, pic->bytes long, to out
 void av1_tiles(const struct av1_picture *pic, const uint8_t *s, uint8_t *out);
-// get_relative_dist() of the specification
+// get_relative_dist() of the spec
 int av1_dist(const struct av1_seq *s, int a, int b);

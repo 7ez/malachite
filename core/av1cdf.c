@@ -34,9 +34,7 @@
 #include "av1cdf.h"
 #include "plat.h"
 
-// Each CDF is given as its values but the last (32768), without the
-// counter libaom keeps after them. Tables of libaom mixing CDF sizes are
-// split in tables of one size.
+// CDFs omit the final 32768 and libaom's counter; libaom tables mixing CDF sizes are split by size.
 
 // default_kf_y_mode_cdf.
 static const uint16_t default_kf_y_mode_cdf[5][5][12] = {
@@ -5346,13 +5344,13 @@ static const uint16_t default_mv_bits_cdf[2][10][1] = {
     },
 };
 
-// the coefficient CDFs of base_q_idx (get_q_ctx() in libaom)
+// coefficient CDF set for base_q_idx, libaom's get_q_ctx()
 static uint32_t q_ctx(uint32_t q)
 {
     return q <= 20 ? 0 : q <= 60 ? 1 : q <= 120 ? 2 : 3;
 }
 
-// the CDFs of n values each that `values` hold, from byte at of the table on, stride values apart
+// writes the n-value CDFs inverted from byte offset at, one per stride uint16s
 static void put(uint16_t *t, uint32_t at, uint32_t stride, const uint16_t *cdfs, size_t values, size_t n)
 {
     for (size_t k = 0; k < values / n; k++)
@@ -5433,7 +5431,7 @@ void av1_default_probs(uint32_t base_qindex, uint8_t *table)
     PUT(0x0faa, 1, default_comp_group_idx_cdfs, 1);
     PUT(0x0fb8, 1, default_compound_idx_cdfs, 1);
 
-    // the colour index CDFs of palettes of n and 10 - n colours share 8 values, those of 5 colours take 4
+    // colour index CDFs of n and 10 - n colours share an 8-value row; 5 colours get 4
     PUT(0x0fe0, 8, default_palette_y_color_index_2_cdf, 1);
     PUT(0x0fe2, 8, default_palette_y_color_index_8_cdf, 7);
     PUT(0x1030, 8, default_palette_y_color_index_3_cdf, 2);

@@ -91,7 +91,7 @@ int bits_next_nal(const uint8_t *s, size_t len, size_t *pos, size_t *start, size
     return 1;
 }
 
-// A sample is consumed whole, so a position past 0 and short of the end is in an IVF file
+// a non-IVF sample is consumed whole, so *pos between 0 and the end means IVF
 int bits_next_ivf(const uint8_t *s, size_t len, size_t *pos, size_t *start, size_t *size)
 {
     if (*pos >= len)

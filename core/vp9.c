@@ -58,7 +58,7 @@ static void render_size(struct bits *b)
     }
 }
 
-// setup_past_independence(), but for the probabilities, which are the kernel's
+// setup_past_independence() minus the probabilities, which the kernel keeps
 static void past_independence(struct vp9_frame *f)
 {
     static const int32_t ref_deltas[4] = { 1, 0, -1, -1 };
@@ -139,7 +139,7 @@ static void tile_info(struct bits *b, struct vp9_frame *f)
         f->tile_rows_log2 += bits_u(b, 1);
 }
 
-// 6.2: the uncompressed header, from what the frame before left
+// 6.2, starting from the state the previous frame left
 static int uncompressed_header(struct vp9_dec *d, struct bits *b, struct vp9_frame *f)
 {
     *f = (struct vp9_frame){
@@ -229,7 +229,7 @@ static int uncompressed_header(struct vp9_dec *d, struct bits *b, struct vp9_fra
     return b->over ? -1 : 0;
 }
 
-// vp9_setup_compound_reference_mode(): the reference whose sign bias the other two don't share is the fixed one
+// vp9_setup_compound_reference_mode(): the fixed reference is the one whose sign bias differs
 static void compound_refs(struct vp9_frame *f)
 {
     const int *s = f->sign_bias;
@@ -248,7 +248,7 @@ static void compound_refs(struct vp9_frame *f)
     }
 }
 
-// Annex B: the frames of a sample, by the superframe index at its end; without one the sample is a frame
+// Annex B superframe index at the sample's end; without one the sample is a single frame
 static int superframe(struct vp9_dec *d, const uint8_t *s, size_t start, size_t size)
 {
     uint8_t marker = size ? s[start + size - 1] : 0;
@@ -275,7 +275,6 @@ static int superframe(struct vp9_dec *d, const uint8_t *s, size_t start, size_t 
     return 0;
 }
 
-// the slot no reference holds
 static uint32_t free_slot(const struct vp9_dec *d)
 {
     uint32_t used = 0;
@@ -304,7 +303,7 @@ static int parse_frame(struct vp9_dec *d, const uint8_t *s, uint32_t start, uint
         f->height = r->height;
         return 1;
     }
-    // a stream starts with an intra frame; the surfaces are as big as the last key frame
+    // surfaces are sized by the last key frame
     if (f->type == VP9_KEY_FRAME) {
         d->width = f->width;
         d->height = f->height;
@@ -349,7 +348,7 @@ static int parse_frame(struct vp9_dec *d, const uint8_t *s, uint32_t start, uint
 
 int vp9_next(struct vp9_dec *d, const uint8_t *s, size_t len, size_t *pos, struct vp9_picture *pic)
 {
-    if (!*pos)  // a new stream or sample: what is left of a superframe that broke off is in another buffer
+    if (!*pos)  // new stream or sample: a broken-off superframe's leftovers point into the old buffer
         d->frames = d->next_frame = 0;
     while (d->next_frame == d->frames) {
         size_t start, size;

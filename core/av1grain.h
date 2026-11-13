@@ -1,6 +1,5 @@
-// The film grain tables NVDEC adds to a picture it outputs: the grain AV1's pseudo-random generator and auto-regressive
-// filter make (7.18.3.3), cut to the part a frame uses, and the scaling functions as lookup tables. The layout is
-// AV1FilmGrainMemory of nvdec_drv.h.
+// NVDEC's film grain tables (AV1FilmGrainMemory in nvdec_drv.h): 7.18.3.3 grain cropped to what a frame uses, and
+// the scaling functions as LUTs.
 #pragma once
 #include "av1.h"
 

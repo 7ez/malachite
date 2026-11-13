@@ -38,7 +38,7 @@ static int parse_sps(struct h264_dec *d, struct bits *b)
     uint32_t id = bits_ue(b);
     if (id >= H264_MAX_SPS)
         return -1;
-    // the profiles whose SPS says how chroma and bit depth go
+    // profiles whose SPS carries chroma format and bit depth
     static const uint8_t high[] = { 100, 110, 122, 244, 44, 83, 86, 118, 128, 138, 139, 134, 135 };
     int is_high = 0;
     for (unsigned i = 0; i < sizeof(high); i++)

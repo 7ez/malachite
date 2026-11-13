@@ -1,7 +1,5 @@
-// H.265 Annex-B streams down to what NVDEC needs from the driver: the parameter sets, each picture's slices, its
-// picture order count, the reference picture set and the bits of the slice header NVDEC skips. NVDEC parses the rest
-// of the slice headers and the slice data itself. Main and Main10 (4:2:0, 8 and 10 bit, no extensions) with one layer;
-// the VPS holds nothing the decoder needs and is skipped.
+// H.265 Annex-B parsing for what NVDEC needs from the driver: parameter sets, slices, POC, RPS and the slice header
+// bits NVDEC skips (it parses the rest itself). Main and Main10, one layer; the VPS is skipped.
 #pragma once
 #include "plat.h"
 
@@ -14,8 +12,7 @@
 #define H265_MAX_TILE_COLS 20  // what NVDEC's tile size buffer holds (nvdec_drv.h GIP_ASIC_TILE_SIZE)
 #define H265_MAX_TILE_ROWS 22
 
-// the lists of a scaling_list_data(), in raster order: 4x4, 8x8, 16x16 and 32x32 (matrices 0 and 3) for each of
-// intra Y, Cb, Cr, inter Y, Cb, Cr
+// scaling_list_data() lists in raster order: [4x4..32x32 (32x32 only matrices 0, 3)][intra Y Cb Cr, inter Y Cb Cr]
 struct h265_scaling {
     uint8_t list[4][6][64];
     uint8_t dc[2][6];  // 16x16 and 32x32
@@ -114,8 +111,8 @@ struct h265_picture {
     int output;
     uint32_t slot;
     uint32_t index;      // in decoding order
-    uint32_t idr_count;  // pictures that restarted the order count before it and itself
-    // the pictures its reference lists are made of, as indices in the DPB
+    uint32_t idr_count;  // POC restarts up to and including it
+    // DPB indices its reference lists are built from
     uint32_t nbefore, nafter, nlt;
     uint8_t before[H265_DPB], after[H265_DPB], lt[H265_DPB];
 };
@@ -128,16 +125,15 @@ struct h265_dec {
     uint32_t pictures, idrs;
     int started;   // seen an IRAP picture to start from
     int eos;       // after an end of sequence NAL unit, the next picture restarts
-    int skip_rasl;  // the last IRAP picture started a sequence, so the pictures that lead it can't be decoded
+    int skip_rasl;  // the last IRAP started a sequence, so its RASL pictures can't be decoded
 };
 
-// the widths of the tile columns and the heights of the tile rows in CTBs; -1 if the PPS' don't fit the picture
+// tile column widths and row heights in CTBs; -1 if the PPS's tiles don't fit the picture
 int h265_tiles(const struct h265_sps *s, const struct h265_pps *p, uint32_t *cols, uint32_t *rows);
 void h265_init(struct h265_dec *d);
-// the next picture from stream position *pos, which moves past it: 1 for a picture, 0 at the end, -1 for a stream
-// it can't decode. pic->slot is a surface no reference picture is in.
+// next picture from *pos (advanced past it): 1 picture, 0 end, -1 undecodable; pic->slot is free of references
 int h265_next(struct h265_dec *d, const uint8_t *s, size_t len, size_t *pos, struct h265_picture *pic);
 // pic is decoded: it's a reference now
 void h265_done(struct h265_dec *d, const struct h265_picture *pic);
-// the slices of pic as NVDEC reads them, three-byte start codes and all: pic->bytes into out
+// pic's slices with three-byte start codes: pic->bytes into out
 void h265_slices(const struct h265_picture *pic, const uint8_t *s, uint8_t *out);

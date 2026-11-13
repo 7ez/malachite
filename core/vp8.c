@@ -13,7 +13,7 @@ static void skip_delta(struct boolreader *r, int bits)
         bool_literal(r, bits + 1);
 }
 
-// 19.2: the frame header up to the references it refreshes
+// 19.2, up to the reference refresh flags
 static void frame_header(struct boolreader *r, struct vp8_frame *f)
 {
     if (f->key)

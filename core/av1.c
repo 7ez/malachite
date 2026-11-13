@@ -250,7 +250,7 @@ static void frame_size_with_refs(struct header *h)
     render_size(h);
 }
 
-// the unused slot on one side of the current frame (backward: not before it) with the latest or earliest hint
+// unused slot on one side of cur (backward: hint >= cur) with the latest or earliest hint
 static int find_ref(const int *hint, const int *used, int cur, int backward, int latest)
 {
     int found = -1, best = 0;
@@ -265,7 +265,7 @@ static int find_ref(const int *hint, const int *used, int cur, int backward, int
     return found;
 }
 
-// 7.8: the reference slots a frame names by the order hints of just two
+// 7.8: derive all reference slots from LAST and GOLDEN
 static void set_frame_refs(struct header *h, uint32_t last, uint32_t gold)
 {
     struct av1_frame *f = h->f;
@@ -723,7 +723,7 @@ static void film_grain_params(struct header *h)
     g->clip_to_restricted_range = (int)bits_u(b, 1);
 }
 
-// 5.9.2. The frame header, from the first bit of the OBU payload.
+// 5.9.2, b at the start of the OBU payload
 static int uncompressed_header(const struct av1_dec *d, struct bits *b, uint32_t temporal_id, uint32_t spatial_id,
                                struct av1_frame *f)
 {
@@ -748,7 +748,7 @@ static int uncompressed_header(const struct av1_dec *d, struct bits *b, uint32_t
                 bits_u(b, (int)id_len);
             const struct av1_ref *r = &d->refs[f->existing_idx];
             f->type = r->type;
-            // a shown key frame refreshes every slot, which is state the kernel's tables don't follow
+            // a shown key frame refreshes every slot, which the kernel's tables don't track
             return !r->valid || r->type == AV1_KEY_FRAME || b->over ? -1 : 0;
         }
         f->type = bits_u(b, 2);
@@ -786,7 +786,7 @@ static int uncompressed_header(const struct av1_dec *d, struct bits *b, uint32_t
     f->refresh = f->type == AV1_SWITCH_FRAME || (f->type == AV1_KEY_FRAME && f->show) ? all_frames : bits_u(b, 8);
     if ((!h.intra || f->refresh != all_frames) && f->error_resilient && s->order_hint) {
         for (int i = 0; i < AV1_REFS; i++) {
-            // a slot that doesn't hold what the stream says was lost
+            // a slot not matching ref_order_hint was lost
             h.err |= bits_u(b, (int)s->order_hint_bits) != d->refs[i].order_hint || !d->refs[i].valid;
         }
     }
@@ -824,7 +824,7 @@ static int uncompressed_header(const struct av1_dec *d, struct bits *b, uint32_t
     }
     f->disable_frame_end_update_cdf = s->reduced_still_picture || f->disable_cdf_update ? 1 : (int)bits_u(b, 1);
 
-    // load_previous(): what a frame starts from without being told
+    // load_previous()
     reset_gm(h.prev_gm);
     for (int i = 0; i < 8; i++)
         f->lf_ref_deltas[i] = default_ref_deltas[i];
@@ -908,8 +908,7 @@ static int parse_obu(const uint8_t *s, size_t len, size_t pos, struct obu *o)
     return 0;
 }
 
-// 5.11.1: where the tiles of a tile group lie. The group's tile data, size fields and all, is appended to the
-// picture's; *next is the first tile the group should hold.
+// 5.11.1: appends the group's tile data, size fields included, to pic; *next is the first tile it must start at
 static int tile_group(struct av1_picture *pic, const uint8_t *s, size_t at, size_t size, uint32_t *next)
 {
     const struct av1_frame *f = &pic->hdr;
@@ -951,7 +950,6 @@ static int tile_group(struct av1_picture *pic, const uint8_t *s, size_t at, size
     return 0;
 }
 
-// the slot no reference holds
 static uint32_t free_slot(const struct av1_dec *d)
 {
     uint32_t used = 0;

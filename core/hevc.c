@@ -100,8 +100,7 @@ static int scaling_list_data(struct bits *b, struct h265_scaling *sl)
     return b->over ? -1 : 0;
 }
 
-// 7.3.7 and 7.4.8: set idx of num sets, predicted from an earlier one of sets; ref_num_deltas is how many pictures
-// that one has, 0 when this one isn't predicted
+// 7.3.7, 7.4.8: set idx of num, maybe predicted from an earlier one; *ref_num_deltas is that one's size, else 0
 static int st_ref_pic_set(struct bits *b, const struct h265_rps *sets, uint32_t idx, uint32_t num,
                           struct h265_rps *out, uint32_t *ref_num_deltas)
 {
@@ -127,7 +126,7 @@ static int st_ref_pic_set(struct bits *b, const struct h265_rps *sets, uint32_t 
         if (ref_num_deltas)
             *ref_num_deltas = n;
 
-        // 7-61: the negative pictures, the reference set's positive ones first, nearest the current picture first
+        // 7-61: negative deltas, nearest first
         int i = 0;
         for (int j = ref->pos - 1; j >= 0; j--) {
             int32_t d = ref->delta[1][j] + delta_rps;
@@ -293,7 +292,7 @@ static int parse_sps(struct h265_dec *d, struct bits *b)
     }
     s->temporal_mvp = bits_u(b, 1);
     s->strong_intra_smoothing = bits_u(b, 1);
-    // what follows (the VUI and the extensions) is nothing Main and Main10 streams need
+    // the VUI and extensions that follow aren't needed for Main/Main10
 
     if (b->over || s->width > 8192 || s->height > 8192 || s->width < 16 || s->height < 16 ||
         s->crop_left + s->crop_right >= s->width || s->crop_top + s->crop_bottom >= s->height ||
@@ -386,8 +385,7 @@ static int parse_pps(struct h265_dec *d, struct bits *b)
     return 0;
 }
 
-// the slice header up to slice_temporal_mvp_enabled_flag, which is all the driver needs of the first slice segment
-// of a picture
+// slice header up to slice_temporal_mvp_enabled_flag: all the driver needs of a picture's first slice segment
 static int parse_slice(const struct h265_dec *d, struct bits *b, uint32_t nal_type, uint32_t temporal_id,
                        struct h265_slice *h)
 {
@@ -447,7 +445,7 @@ static int parse_slice(const struct h265_dec *d, struct bits *b, uint32_t nal_ty
     return b->over ? -1 : 0;
 }
 
-// 6.5.1: n tiles over total CTBs, the explicit sizes of all but the last or even ones
+// 6.5.1: n tiles over total CTBs, uniform or explicit sizes for all but the last
 static int split(uint32_t total, uint32_t n, int uniform, const uint32_t *sizes, uint32_t *out)
 {
     uint32_t sum = 0;
@@ -515,8 +513,7 @@ static int find_ref(const struct h265_dec *d, int long_term, int32_t poc, int32_
     return -1;
 }
 
-// 8.3.2: the reference picture set of the picture; every other picture stops being a reference. A reference
-// picture that isn't there is only a stream error for a picture that predicts from it.
+// 8.3.2: pictures outside the RPS stop being references; a missing one is an error only if the picture uses it
 static int reference_picture_set(struct h265_dec *d, struct h265_picture *pic)
 {
     const struct h265_slice *h = &pic->hdr;

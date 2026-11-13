@@ -15,7 +15,7 @@
 #define PAGE 0x1000ull
 #define SUBCH 4
 #define CLASS_NVDEC_AV1 0xc7b0  // the first video decoder class with AV1 methods (clc7b0.h)
-// VP9 needs SET_INTRA_TOP_BUF_OFFSET, or the engine faults at address 0 (mickys/nvenc), which clc7b0.h has first
+// VP9 needs SET_INTRA_TOP_BUF_OFFSET (first in clc7b0.h) or the engine faults at address 0
 #define CLASS_NVDEC_VP9 0xc7b0
 #define CLASS_NVDEC_VP8 0xc5b0  // the oldest of NVIDIA's video decoder class headers in Mesa, which has VP8 methods
 
@@ -201,18 +201,16 @@ static void vbuf_free(struct video *v, struct vbuf *b)
     *b = (struct vbuf){ 0 };
 }
 
-// The probabilities each reference slot's frame ended in. The specification saves them with the frame (7.20) and a
-// later frame starts from the ones its primary reference has; NVDEC writes a frame's into a table of its own, which
-// the CPU copies to the slots the frame refreshes, or the table it started from when it doesn't adapt them.
+// AV1 probabilities saved per reference slot (7.20); a frame starts from its primary reference's. NVDEC writes the
+// frame's to prob_out, which the CPU copies to the refreshed slots (prob_in if the frame doesn't adapt).
 struct av1_tables {
     uint8_t slot[AV1_REFS][AV1_PROBS_SIZE];
     uint32_t refresh;
     int adapt;
 };
 
-// The four probability contexts of a VP9 stream (load_probs() and save_probs(), 7.20), which NVDEC leaves to the
-// driver, and the frame being decoded: the probabilities it got, the context they came from, which the counts NVDEC
-// writes adapt and refresh_frame_context saves them back to, and its picture, which predicts the next frames
+// VP9's four probability contexts (load_probs/save_probs, 7.20), left to the driver by NVDEC, plus the current
+// frame's probabilities, source context (adapted by NVDEC's counts, saved back on refresh) and picture
 struct vp9_tables {
     struct vp9_probs ctx[VP9_CONTEXTS], cur;
     struct vp9_prob_frame frame;
@@ -343,8 +341,8 @@ static void av1_store(struct video_dec *h)
             memcpy(t->slot[i], table, AV1_PROBS_SIZE);
 }
 
-// The probabilities the frame decodes with: its context, reset first if it says so, with the compressed header's
-// updates, which the kernel parses again rather than take the client's word for them
+// frame probabilities: its context, reset first if asked, plus the compressed header's updates, which the kernel
+// re-parses rather than trust the client
 static int vp9_load(struct video_dec *h, uint32_t slot, const struct nvdec_vp9_pic *pic,
                     const struct nvdec_vp9_frame *fr)
 {
@@ -376,8 +374,7 @@ static int vp9_load(struct video_dec *h, uint32_t slot, const struct nvdec_vp9_p
     return 0;
 }
 
-// the frame is decoded: its context saved back, adapted by what NVDEC counted, and its picture extended for the
-// frames that predict from it
+// frame decoded: save its context back, adapted by NVDEC's counts, and extend its edges for later frames
 static void vp9_store(struct video_dec *h)
 {
     struct vp9_tables *t = h->vp9;
@@ -420,10 +417,9 @@ int video_dec_queue(struct video *v, struct video_dec *h, uint32_t slot, uint32_
     uint32_t current = is_h264 ? h264->curr_pic_idx : h->codec == NVDEC_H265 ? hevc->curr_pic_idx : slot;
     if (slot >= h->slots || current != slot)
         return -1;
-    // the surface each picture offset names: H.264's and H.265's by index, AV1's references LAST_FRAME to
-    // ALTREF_FRAME in 0 to 6 and the picture in 8, whatever the setup's frame_buffer_idx say (mesa-nova av1.rs),
-    // VP9's LAST_FRAME to ALTREF_FRAME and VP8's golden, altref and last in 0 to 2 and the picture in 3
-    // (VP9_FRAME_SFC_ID and VP8_FRAME_SFC_ID of nvdec_drv.h)
+    // surface per picture offset: H.264/H.265 by index; AV1 LAST..ALTREF in 0-6 and the picture in 8, whatever
+    // frame_buffer_idx says; VP9 LAST..ALTREF or VP8 golden, altref, last in 0-2 and the picture in 3
+    // (nvdec_drv.h VP9_FRAME_SFC_ID, VP8_FRAME_SFC_ID)
     int pics[NVDEC_SLOTS];
     for (int i = 0; i < NVDEC_SLOTS; i++)
         pics[i] = is_h264 || h->codec == NVDEC_H265 ? i : -1;
@@ -579,8 +575,7 @@ int video_decode(struct video *v, enum nvdec_codec codec, const uint8_t *stream,
     while (r >= 0 && n < max && (r = nvdec_stream_next(&s, stream, len, &pos, &pic)) > 0) {
         uint32_t w = pic.crop.width, ht = pic.crop.height, pitch = w * pic.bps;
         if (!h->width_mbs) {
-            // the slices with their start codes take no more than the stream did; an H.264 stream may keep more
-            // references than it says
+            // slices with start codes fit in the stream's size; H.264 streams may keep more references than declared
             uint32_t slots = codec == NVDEC_H264 ? NVDEC_SLOTS : pic.slots;
             // AV1 and VP9 frames can be smaller than the surfaces
             if (video_dec_open(v, h, codec, pic.width_mbs, pic.height_mbs, pic.bps, slots, len + 64) ||

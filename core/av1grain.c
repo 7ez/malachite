@@ -146,7 +146,7 @@ static int round2(int x, int n) { return n ? (x + (1 << (n - 1))) >> n : x; }
 
 static int clip(int x, int lo, int hi) { return x < lo ? lo : x > hi ? hi : x; }
 
-// the piecewise linear scaling function through the points, for each of the 256 values of a sample (7.18.3.5)
+// 7.18.3.5 piecewise linear scaling function as a 256-entry LUT
 static void scaling_lut(uint32_t n, const uint8_t *value, const uint8_t *scaling, uint8_t *lut) {
     memset(lut, 0, 256);
     if (!n)
@@ -163,7 +163,7 @@ static void scaling_lut(uint32_t n, const uint8_t *value, const uint8_t *scaling
         lut[i] = scaling[n - 1];
 }
 
-// a chroma plane's grain: 38 rows of 44, seeded apart from the other plane's, filtered with the luma grain's help
+// 38x44 chroma grain; seed_xor separates the planes, the AR filter also takes the luma grain
 static void chroma_grain(const struct av1_grain *g, int (*grain)[82], int (*plane)[44], const int *coeffs,
                          uint32_t seed_xor, int on, int shift, int lo, int hi, int bit_depth) {
     struct rng r = {g->seed ^ seed_xor};
@@ -226,7 +226,7 @@ void av1_grain_tables(const struct av1_grain *g, uint32_t bit_depth, struct av1_
     chroma_grain(g, luma, cr, g->ar_cr, 0x49d8, g->num_cr || g->chroma_scaling_from_luma, shift, lo, hi,
                  (int)bit_depth);
 
-    // the 64x64 and 32x32 a picture's blocks are taken from, past the borders the filter needs
+    // crop to the 64x64 and 32x32 that blocks sample from, past the filter borders
     for (int y = 0; y < 64; y++)
         for (int x = 0; x < 64; x++)
             out->luma[y * 64 + x] = (int16_t)luma[y + 9][x + 9];
