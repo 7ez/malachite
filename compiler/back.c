@@ -1575,7 +1575,9 @@ static void lower_value(struct ir_val *v)
             fb = strip_mods(fb, &mb);
             m->mods = ma | mb << 2;
         }
-        m->src[0] = vreg_of(fa);
+        // an integer 0 the operation reads is RZ, not a register set to it (0 - x, a negation)
+        int rz = v->type == IR_I32 && (m->k == MK_IADD3 || m->k == MK_ISUB || m->k == MK_LOP3 || m->k == MK_IMNMX);
+        m->src[0] = rz && fa->op == IR_CONST && !fa->imm ? VREG_RZ : vreg_of(fa);
         m->nsrc = 1;
         if (immb) {
             m->immb = 1;
@@ -1587,7 +1589,7 @@ static void lower_value(struct ir_val *v)
         } else if (imm) {
             m->imm = v->op == IR_FSUB && !neg_a ? (uint32_t)fb->imm ^ 0x80000000u : (uint32_t)fb->imm;
         } else {
-            m->src[m->nsrc++] = vreg_of(fb);
+            m->src[m->nsrc++] = rz && fb->op == IR_CONST && !fb->imm ? VREG_RZ : vreg_of(fb);
         }
         if (m->k == MK_LOP3)
             m->aux = v->op == IR_AND ? LOP3_AND : v->op == IR_OR ? LOP3_OR : LOP3_XOR;
