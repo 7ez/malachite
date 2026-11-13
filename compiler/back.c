@@ -4009,6 +4009,14 @@ static struct sass_insn with_mods(struct sass_insn in, int mods, int s0, int s1,
     return in;
 }
 
+// float arithmetic and compares flush denormals as Apple's GPUs do (denormal * inf is NaN there, step(denormal, 0)
+// is 1), but for OpenCL's kernels, where keeping them costs nothing (MUFU flushes either way); fmin/fmax and
+// moves keep them
+static struct sass_insn ftz(struct sass_insn in)
+{
+    return g_info->denorms ? in : sass_ftz(in);
+}
+
 static void emit_mov(int d, int s)
 {
     if (d == s)
@@ -4282,15 +4290,13 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
                                : sass_imnmx(d, s[0], s[1], m->aux & 1, (m->aux & 2) != 0, c),
                        s, m->nsrc, d, 0, FIXED_LAT);
             break;
-        // float arithmetic and compares flush denormals as Apple's GPUs do (denormal * inf is NaN there,
-        // step(denormal, 0) is 1); fmin/fmax and moves keep them
         case MK_FADD: {
             c = sched(s, m->nsrc, 0, d, 1, 0);
             struct sass_insn add =
                 m->aux & 2    ? sass_hadd2(d, s[0], s[1], m->aux & 1, c)
-                : m->aux & 16 ? with_mods(sass_ftz(sass_fadd_imm(d, s[0], (uint32_t)m->imm, c)), m->mods, SASS_MOD_A,
+                : m->aux & 16 ? with_mods(ftz(sass_fadd_imm(d, s[0], (uint32_t)m->imm, c)), m->mods, SASS_MOD_A,
                                           -1, -1)
-                              : with_mods(sass_ftz(sass_fadd(d, s[0], s[1], m->aux & 1, c)), m->mods, SASS_MOD_A,
+                              : with_mods(ftz(sass_fadd(d, s[0], s[1], m->aux & 1, c)), m->mods, SASS_MOD_A,
                                           SASS_MOD_B, -1);
             if (m->aux & 64)
                 add = sass_sat(add);
@@ -4302,9 +4308,9 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
         case MK_FMUL: {
             c = sched(s, m->nsrc, 0, d, 1, 0);
             struct sass_insn mul = m->aux & 2    ? sass_hmul2(d, s[0], s[1], c)
-                                   : m->aux & 16 ? with_mods(sass_ftz(sass_fmul_imm(d, s[0], (uint32_t)m->imm, c)),
+                                   : m->aux & 16 ? with_mods(ftz(sass_fmul_imm(d, s[0], (uint32_t)m->imm, c)),
                                                              m->mods, SASS_MOD_A, -1, -1)
-                                                 : with_mods(sass_ftz(sass_fmul(d, s[0], s[1], c)), m->mods,
+                                                 : with_mods(ftz(sass_fmul(d, s[0], s[1], c)), m->mods,
                                                              SASS_MOD_A, SASS_MOD_B, -1);
             sched_push(m->aux & 64 ? sass_sat(mul) : mul, s, m->nsrc, d, 0, FIXED_LAT);
             break;
@@ -4314,11 +4320,11 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             c = sched(s, m->nsrc, 0, d, 1, 0);
             struct sass_insn fma =
                 m->aux & 2    ? sass_hfma2(d, s[0], s[1], s[2], c)
-                : m->aux & 16 ? with_mods(sass_ftz(sass_ffma_imm_b(d, s[0], (uint32_t)m->imm, s[1], mode, c)), m->mods,
+                : m->aux & 16 ? with_mods(ftz(sass_ffma_imm_b(d, s[0], (uint32_t)m->imm, s[1], mode, c)), m->mods,
                                           SASS_MOD_A, SASS_MOD_C, -1)
-                : m->aux & 32 ? with_mods(sass_ftz(sass_ffma_imm_c(d, s[0], s[1], (uint32_t)m->imm, mode, c)),
+                : m->aux & 32 ? with_mods(ftz(sass_ffma_imm_c(d, s[0], s[1], (uint32_t)m->imm, mode, c)),
                                           m->mods, SASS_MOD_A, SASS_MOD_C, -1)
-                              : with_mods(sass_ftz(sass_ffma(d, s[0], s[1], s[2], mode, c)), m->mods, SASS_MOD_A,
+                              : with_mods(ftz(sass_ffma(d, s[0], s[1], s[2], mode, c)), m->mods, SASS_MOD_A,
                                           SASS_MOD_B, SASS_MOD_C);
             sched_push(m->aux & 64 ? sass_sat(fma) : fma, s, m->nsrc, d, 0, FIXED_LAT);
             break;
@@ -4377,7 +4383,7 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             break;
         case MK_FRND:  // variable latency, like F2I
             c = sched(s, 1, 1, d, 1, 1);
-            sched_push(sass_frnd(d, s[0], m->aux, c), s, 1, d, 0, 0);
+            sched_push(ftz(sass_frnd(d, s[0], m->aux, c)), s, 1, d, 0, 0);  // flushed, floor(-denormal) is -0
             break;
         case MK_H2F:
             c = sched(s, 1, 0, d, 1, 0);
@@ -4397,10 +4403,10 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
                 in = m->immb ? sass_imm(sass_isetp(0, s[0], 0, op, sgn, c), (uint32_t)m->imm)
                              : sass_isetp(0, s[0], s[1], op, sgn, c);
             } else {
-                in = m->immb ? with_mods(sass_ftz(sass_imm(sass_fsetp(0, s[0], 0, fsetp_op(m->aux & 15), c),
+                in = m->immb ? with_mods(ftz(sass_imm(sass_fsetp(0, s[0], 0, fsetp_op(m->aux & 15), c),
                                                            (uint32_t)m->imm)),
                                          m->mods, SASS_MOD_A, -1, -1)
-                             : with_mods(sass_ftz(sass_fsetp(0, s[0], s[1], fsetp_op(m->aux & 15), c)), m->mods,
+                             : with_mods(ftz(sass_fsetp(0, s[0], s[1], fsetp_op(m->aux & 15), c)), m->mods,
                                          SASS_MOD_A, SASS_MOD_B, -1);
             }
             if (m->aux & (SETP_AND | SETP_OR))

@@ -78,7 +78,7 @@ struct sass_insn sass_i2f(uint8_t rd, uint8_t rs, int is_signed, uint32_t ctrl);
 struct sass_insn sass_f2i(uint8_t rd, uint8_t rs, int is_signed, uint32_t ctrl);  // F2I[.U32].TRUNC.NTZ
 // F2IP.U8.F32.TRUNC.NTZ: a float to a byte, saturated (a NaN as 0) and zero-extended; fixed latency, unlike F2I
 struct sass_insn sass_f2ip_u8(uint8_t rd, uint8_t rs, uint32_t ctrl);
-struct sass_insn sass_frnd(uint8_t rd, uint8_t rs, int mode, uint32_t ctrl);       // FRND.FTZ (mode SASS_RND_*)
+struct sass_insn sass_frnd(uint8_t rd, uint8_t rs, int mode, uint32_t ctrl);       // FRND (mode SASS_RND_*)
 struct sass_insn sass_kill(uint8_t pred, uint32_t ctrl);  // @Pp KILL (discard), p 7 = PT
 enum { SASS_SHFL_IDX, SASS_SHFL_UP, SASS_SHFL_DOWN, SASS_SHFL_BFLY };
 struct sass_insn sass_shfl_bfly(uint8_t rd, uint8_t rs, uint8_t lane, uint16_t c, uint32_t ctrl);

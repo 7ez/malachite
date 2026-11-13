@@ -254,11 +254,10 @@ struct sass_insn sass_kill(uint8_t pred, uint32_t ctrl)
     return mk(0x000000000000795bull, (uint32_t)pred << 23, ctrl);
 }
 
-// FRND.FTZ[.FLOOR|.CEIL|.TRUNC] Rd, Rs -- round to an integral float; mode SASS_RND_*. Metal flushes float
-// denormals, so floor(-denormal) is -0, not -1.
+// FRND[.FLOOR|.CEIL|.TRUNC] Rd, Rs -- round to an integral float; mode SASS_RND_*
 struct sass_insn sass_frnd(uint8_t rd, uint8_t rs, int mode, uint32_t ctrl)
 {
-    return mk(0x00007307ull | ((uint64_t)rd << 16) | ((uint64_t)rs << 32), 0x00211000 | ((uint32_t)mode << 14), ctrl);
+    return mk(0x00007307ull | ((uint64_t)rd << 16) | ((uint64_t)rs << 32), 0x00201000 | ((uint32_t)mode << 14), ctrl);
 }
 
 struct sass_insn sass_f2i(uint8_t rd, uint8_t rs, int is_signed, uint32_t ctrl)

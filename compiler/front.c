@@ -4722,8 +4722,8 @@ static void call(LLVMValueRef in)
                 i2f->aux = sk == 's';
                 r = to_bfloat ? float_to_bfloat(i2f) : narrow(i2f, dt);
             } else if (sk == 'f' && dt == IR_PRED) {
-                // true unless 0 or a denormal (flushed), NaN included: the exponent isn't 0
-                r = op2(IR_AND, IR_I32, widen(s), konst(IR_I32, 0x7f800000));
+                // true unless 0 or a flushed denormal, NaN included
+                r = op2(IR_AND, IR_I32, widen(s), konst(IR_I32, g_info->denorms ? 0x7fffffff : 0x7f800000));
             } else if (sk == 'f') {
                 r = op1(IR_F2I, IR_I32, widen(s));
                 r->aux = dk == 's';
@@ -7316,6 +7316,8 @@ static LLVMValueRef stage_function(LLVMValueRef *arglist)
         if (!LLVMIsAFunction(fn))
             airc_fail("%s does not name a function", stages[s].md);
         g_info->stage = stages[s].stage;
+        // OpenCL's kernels come as __entry_<name>; its device says it has denormals whatever we answer
+        g_info->denorms = g_info->stage == NVK_COMPUTE && !strncmp(LLVMGetValueName(fn), "__entry_", 8);
         if (g_info->stage == NVK_VERTEX && patch && md_has(patch, "air.patch"))
             patch_of(patch);
         if (g_info->stage == NVK_VERTEX || g_info->stage == NVK_TESS_EVAL)

@@ -18,6 +18,7 @@ struct airc_info {
     uint32_t centroid;      // and those interpolated at the centroid, and at each sample, a bit each
     uint32_t at_sample;
     unsigned flags;         // NVK_FLAG_*
+    int denorms;            // float arithmetic keeps denormals (OpenCL's kernels), where Metal's flushes them
     unsigned nvary;
     unsigned sysvals;  // SPH_* system values a vertex function reads
     unsigned ps_sysvals;  // SPH_PS_* system values a fragment function reads
