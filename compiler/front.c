@@ -167,7 +167,7 @@ static unsigned g_nallocas;  // private memory: allocas seen (each a slot)
 // a post-tessellation vertex function's control points: the function it gets one from, the location of each member
 // of what that returns, and where the patch's vertices start in the input map
 static LLVMValueRef g_point_fn;
-static uint8_t g_point_loc[16];
+static uint8_t g_point_loc[32];
 static unsigned g_npoint_loc;
 static struct ir_val *g_point_map;
 // a kernel's stage input: how its attributes are laid out, the params its region's address and each buffer it
@@ -7384,9 +7384,9 @@ static void control_points(LLVMValueRef node)
         if (s && len == 32 && !memcmp(s, "air.patch_control_point_function", 32) && LLVMIsAFunction(f[1])) {
             g_point_fn = f[1];
         } else if (s && len == 18 && !memcmp(s, "air.location_index", 18) && LLVMIsAConstantInt(f[1])) {
-            if (g_npoint_loc == sizeof g_point_loc)
-                airc_fail("a control point of more than 16 members");
             unsigned loc = (unsigned)LLVMConstIntGetZExtValue(f[1]);
+            if (loc >= 32 || g_npoint_loc == sizeof g_point_loc)
+                airc_fail("a control point member at location %u", loc);
             g_point_loc[g_npoint_loc++] = (uint8_t)loc;
             g_info->vertex_inputs |= 1u << loc;
         }
