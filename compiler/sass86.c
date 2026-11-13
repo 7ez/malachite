@@ -196,6 +196,11 @@ struct sass_insn sass_popc(uint8_t rd, uint8_t rs, uint32_t ctrl)
     return mk(0x00007309ull | ((uint64_t)rd << 16) | ((uint64_t)rs << 32), 0, ctrl);
 }
 
+struct sass_insn sass_iabs(uint8_t rd, uint8_t rs, uint32_t ctrl)
+{
+    return mk(0x00007213ull | ((uint64_t)rd << 16) | ((uint64_t)rs << 32), 0, ctrl);
+}
+
 struct sass_insn sass_brev(uint8_t rd, uint8_t rs, uint32_t ctrl)
 {
     return mk(0x00007301ull | ((uint64_t)rd << 16) | ((uint64_t)rs << 32), 0, ctrl);

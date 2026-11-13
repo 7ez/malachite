@@ -72,6 +72,7 @@ struct sass_insn sass_imnmx(uint8_t rd, uint8_t ra, uint8_t rb, int is_max, int 
 struct sass_insn sass_mufu(uint8_t rd, uint8_t ra, uint8_t op, uint32_t ctrl);  // MUFU Rd, Ra (op = MUFU_*)
 struct sass_insn sass_popc(uint8_t rd, uint8_t rs, uint32_t ctrl);  // POPC Rd, Rs
 struct sass_insn sass_brev(uint8_t rd, uint8_t rs, uint32_t ctrl);  // BREV Rd, Rs
+struct sass_insn sass_iabs(uint8_t rd, uint8_t rs, uint32_t ctrl);  // IABS Rd, Rs
 struct sass_insn sass_flo(uint8_t rd, uint8_t rs, uint32_t ctrl);   // FLO.U32 Rd, Rs (the top set bit, ~0 for none)
 struct sass_insn sass_vote_any(uint8_t rd, uint8_t pred, uint32_t ctrl);  // VOTE.ANY Rd, PT, Pp
 struct sass_insn sass_i2f(uint8_t rd, uint8_t rs, int is_signed, uint32_t ctrl);  // I2FP.F32.{S32,U32}

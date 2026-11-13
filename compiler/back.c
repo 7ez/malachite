@@ -42,6 +42,7 @@ enum mkind {
     MK_POPC,
     MK_BREV,
     MK_FLO,
+    MK_IABS,
     MK_VOTE,     // def = the lanes where P0 is set (aux: all active lanes)
     MK_SHFL,     // def = src0 of another lane, aux = SASS_SHFL_* mode | c << 4; lane imm, or src1 if there is one
     MK_FSWZADD,  // def = quad swizzle add of src0 (neighbour) and src1 (pixel), aux = pattern
@@ -867,6 +868,19 @@ static struct ir_val *sat_source(const struct ir_val *v)
     return (x->op == IR_FMUL || x->op == IR_FFMA) && x->type == IR_F32 ? x : NULL;
 }
 
+// the 0 - x that the signed max(x, 0 - x) v takes, as abs comes from the front end; NULL if v isn't one
+static struct ir_val *abs_negation(const struct ir_val *v)
+{
+    if (v->op != IR_MAX || !v->aux || v->type != IR_I32)
+        return NULL;
+    for (int i = 0; i < 2; i++) {
+        struct ir_val *n = v->src[i];
+        if (n->op == IR_SUB && n->src[0]->op == IR_CONST && !n->src[0]->imm && n->src[1] == v->src[!i])
+            return n;
+    }
+    return NULL;
+}
+
 static void find_folds(struct ir_func *f)
 {
     int n = 0;
@@ -891,6 +905,8 @@ static void find_folds(struct ir_func *f)
                 }
             } else if ((in = sat_source(v))) {
                 g_sat[in->id] = g_use_count[in->id] == 1 && in->block == b;
+            } else if ((in = abs_negation(v))) {
+                g_folded[in->id] = g_use_count[in->id] == 1 && in->block == b;
             }
         }
 }
@@ -1514,6 +1530,15 @@ static void lower_value(struct ir_val *v)
             break;  // made by the instruction that reads it, or at the end of its loop
         if (v->op == IR_ADD && lower_mul_add(v))
             break;
+        struct ir_val *neg = abs_negation(v);
+        if (neg) {
+            v->vreg = new_vreg(1, 1);
+            struct mop *m = emit_mop(MK_IABS);
+            m->def = v->vreg;
+            m->src[0] = vreg_of(neg->src[1]);
+            m->nsrc = 1;
+            break;
+        }
         if (is_logic(v) && lower_lop3(v))
             break;
         if (v->op == IR_OR && v->src[1]->op == IR_CONST && !v->src[1]->imm && v->src[0]->op != IR_CONST &&
@@ -3148,6 +3173,7 @@ static int in_place(enum mkind k)
     case MK_SHL:
     case MK_SHR:
     case MK_IMNMX:
+    case MK_IABS:
     case MK_FADD:
     case MK_FMUL:
     case MK_FFMA:
@@ -4286,6 +4312,10 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
                        d, 0, FIXED_LAT);
             break;
         }
+        case MK_IABS:
+            c = sched(s, 1, 0, d, 1, 0);
+            sched_push(sass_iabs(d, s[0], c), s, 1, d, 0, FIXED_LAT);
+            break;
         case MK_IMNMX:
             c = sched(s, m->nsrc, 0, d, 1, 0);
             sched_push(m->immb ? sass_imm(sass_imnmx(d, s[0], 0, m->aux & 1, (m->aux & 2) != 0, c), (uint32_t)m->imm)
