@@ -733,7 +733,7 @@ static int is_imm(const struct ir_val *v)
 
 // A multiply that only an add in its own block reads is made by the add, as one IMAD (y * width + x, in nearly
 // every kernel's addressing); its operands are read there. A constant addend stays IADD3's immediate.
-static unsigned char *g_mul_fused;
+static unsigned char *g_mul_fused, *g_add_fused;
 static unsigned char *g_late_def;  // made with the phi copies instead (lower_late_def)
 
 static void find_fused_muls(struct ir_func *f)
@@ -758,6 +758,43 @@ static void find_fused_muls(struct ir_func *f)
                 }
             }
         }
+    // a sum of registers that only another such sum in its block reads goes into that one's IADD3 as its third
+    // source; a sum made of three takes no fourth
+    free(g_add_fused);
+    g_add_fused = calloc(n, 1);
+    unsigned char *three = calloc(n, 1);
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next) {
+            if (v->op != IR_ADD || v->type != IR_I32 || is_imm(v->src[0]) || is_imm(v->src[1]) ||
+                g_mul_fused[v->src[0]->id] || g_mul_fused[v->src[1]->id])
+                continue;
+            for (int i = 0; i < 2; i++) {
+                struct ir_val *u = v->src[i];
+                if (u->op == IR_ADD && u->type == IR_I32 && u->block == b && g_use_count[u->id] == 1 && !three[u->id] &&
+                    !is_imm(u->src[0]) && !is_imm(u->src[1]) && !g_mul_fused[u->src[0]->id] &&
+                    !g_mul_fused[u->src[1]->id]) {
+                    g_add_fused[u->id] = three[v->id] = 1;
+                    break;
+                }
+            }
+        }
+    free(three);
+}
+
+static int lower_add3(struct ir_val *v)
+{
+    int i = v->src[0]->op == IR_ADD && g_add_fused[v->src[0]->id] ? 0 : 1;
+    struct ir_val *u = v->src[i];
+    if (u->op != IR_ADD || !g_add_fused[u->id] || u->vreg >= 0)
+        return 0;
+    v->vreg = new_vreg(1, 1);
+    struct mop *m = emit_mop(MK_IADD3);
+    m->def = v->vreg;
+    m->src[0] = vreg_of(u->src[0]);
+    m->src[1] = vreg_of(u->src[1]);
+    m->src[2] = vreg_of(v->src[!i]);
+    m->nsrc = 3;
+    return 1;
 }
 
 static int lower_mul_add(struct ir_val *v)
@@ -1526,9 +1563,10 @@ static void lower_value(struct ir_val *v)
     case IR_FMUL:
     case IR_FMIN:
     case IR_FMAX: {
-        if ((v->op == IR_MUL && g_mul_fused[v->id]) || g_late_def[v->id] || g_folded[v->id])
+        if ((v->op == IR_MUL && g_mul_fused[v->id]) || (v->op == IR_ADD && g_add_fused[v->id]) ||
+            g_late_def[v->id] || g_folded[v->id])
             break;  // made by the instruction that reads it, or at the end of its loop
-        if (v->op == IR_ADD && lower_mul_add(v))
+        if (v->op == IR_ADD && (lower_mul_add(v) || lower_add3(v)))
             break;
         struct ir_val *neg = abs_negation(v);
         if (neg) {
@@ -4256,8 +4294,9 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
             break;
         case MK_IADD3:
             c = sched(s, m->nsrc, 0, d, 1, 0);
-            sched_push(m->immb ? sass_imm(sass_iadd3_rr(d, s[0], 0, c), (uint32_t)m->imm)
-                               : sass_iadd3_rr(d, s[0], s[1], c),
+            sched_push(m->immb      ? sass_imm(sass_iadd3_rr(d, s[0], 0, c), (uint32_t)m->imm)
+                       : m->nsrc > 2 ? sass_iadd3_rrr(d, s[0], s[1], s[2], c)
+                                     : sass_iadd3_rr(d, s[0], s[1], c),
                        s, m->nsrc, d, 0, FIXED_LAT);
             break;
         case MK_ISUB:

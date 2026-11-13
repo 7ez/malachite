@@ -51,6 +51,7 @@ struct sass_insn sass_imadwide_cbuf(uint8_t rd, uint8_t ra, uint8_t rb, uint8_t 
                                     uint32_t ctrl);  // IMAD.WIDE.U32 Rd,Ra,Rb,c[bank][off]
 struct sass_insn sass_iadd3_cbuf(uint8_t rd, uint8_t ra, uint8_t bank, uint16_t off, uint32_t ctrl);
 struct sass_insn sass_iadd3_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint32_t ctrl);   // IADD3 Rd,Ra,Rb,RZ
+struct sass_insn sass_iadd3_rrr(uint8_t rd, uint8_t ra, uint8_t rb, uint8_t rc, uint32_t ctrl);  // IADD3 Rd,Ra,Rb,Rc
 struct sass_insn sass_isub_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint32_t ctrl);    // IADD3 Rd,Ra,-Rb,RZ
 struct sass_insn sass_imad_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint8_t rc, uint32_t ctrl);  // IMAD Rd,Ra,Rb,Rc
 struct sass_insn sass_imadhi_rr(uint8_t rd, uint8_t ra, uint8_t rb, int is_signed,

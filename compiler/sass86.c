@@ -59,6 +59,12 @@ struct sass_insn sass_iadd3_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint32_t ctrl
               0x07ffe0ff, ctrl);
 }
 
+struct sass_insn sass_iadd3_rrr(uint8_t rd, uint8_t ra, uint8_t rb, uint8_t rc, uint32_t ctrl)
+{
+    return mk(0x00007210ull | ((uint64_t)rd << 16) | ((uint64_t)ra << 24) | ((uint64_t)rb << 32),
+              0x07ffe000 | rc, ctrl);
+}
+
 struct sass_insn sass_isub_rr(uint8_t rd, uint8_t ra, uint8_t rb, uint32_t ctrl)
 {
     // IADD3 Rd, Ra, -Rb, RZ  -- negate-Rb flag at bit 63
