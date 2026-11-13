@@ -599,8 +599,7 @@ static bool malachite_opencl_memory(void *ptr)
     return malachite_swizzled(t, descriptor.swizzle);  // CoreAnimation reads its one-channel surfaces through one
 }
 
-// WindowServer's tiled backings ask for a GPU-tiled layout of the buffer; ours are all linear, which is still one
-// consistent layout for everything that reads and writes the texture
+// WindowServer's tiled backings; linear is still one layout every reader and writer agrees on
 - (id)newTiledTextureWithDescriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset
                         bytesPerRow:(NSUInteger)bytesPerRow
 {
@@ -608,9 +607,8 @@ static bool malachite_opencl_memory(void *ptr)
 }
 @end
 
-// Apple's GL renderer takes what a GPU can do from a table it picks by the device's name, and NVIDIA's says it has no
-// last-vertex provoking, GL's default, which NVIDIA's hardware does have. So every draw has a compute pass rewrite its
-// indices first, ten times the cost of the draw. Bit 3 of the table's first byte says otherwise, in this process only.
+// Apple's GL renderer's NVIDIA table denies last-vertex provoking, which the hardware has, so every draw got a compute
+// pass rewriting its indices at ten times the draw's cost. Bit 3 of the table's first byte fixes that, per process.
 static void malachite_gl_provoking(const struct mach_header_64 *mh, intptr_t slide)
 {
     const struct symtab_command *tab = NULL;
@@ -632,7 +630,7 @@ static void malachite_gl_provoking(const struct mach_header_64 *mh, intptr_t sli
             continue;
         uint8_t *caps = (uint8_t *)(syms[i].n_value + slide);
         vm_address_t page = (vm_address_t)caps & ~(vm_address_t)vm_page_mask;
-        // read-only and maybe not ours to change in this app: it then draws as it did
+        // may be refused in some apps, which then draw as before
         if (vm_protect(mach_task_self(), page, vm_page_size, FALSE, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) ==
             KERN_SUCCESS) {
             *caps |= 8;
@@ -643,10 +641,9 @@ static void malachite_gl_provoking(const struct mach_header_64 *mh, intptr_t sli
     os_log(OS_LOG_DEFAULT, "Malachite: no capability table in Apple's GL renderer");
 }
 
-// WindowServer starts its updates with no timestamp, so the vblank times Core Animation gives an image queue are 60 Hz
-// ones on every screen, and AppKit sleeps to the next of them at each swap the compositor is behind on: 90 swaps a
-// second at 240 Hz. So the swap waits for what it's after, WindowServer taking the last frame, and not at all when the
-// app turned vsync off, which AppKit doesn't look at. The time limit is for a window nothing composites.
+// With no WindowServer timestamps, AppKit sleeps to 60 Hz vblanks on every screen, 90 swaps a second at 240 Hz.
+// So a swap waits only for the last frame to be taken, and not at all with vsync off, which AppKit ignores.
+// The time limit is for a window nothing composites.
 static long (*gl_unconsumed)(void *, void *, void *);
 static void *(*gl_context)(void);
 static int (*gl_get)(void *, int, int *);
@@ -709,7 +706,7 @@ static void malachite_run_flush(MalachiteCommandBuffer *cb);
 static void malachite_record(id commandBuffer, uint32_t opcode, const void *payload, uint32_t size)
 {
     MalachiteCommandBuffer *cb = (MalachiteCommandBuffer *)commandBuffer;
-    if (cb->_run_draws && opcode != MALACHITE_CMD_PUSH)  // in the order they were encoded
+    if (cb->_run_draws && opcode != MALACHITE_CMD_PUSH)  // keeps encoding order
         malachite_run_flush(cb);
     if (opcode != MALACHITE_CMD_PUSH)
         cb->_records++;
@@ -744,9 +741,7 @@ static void malachite_run_flush(MalachiteCommandBuffer *cb)
     malachite_record(cb, MALACHITE_CMD_PUSH, &p, sizeof(p));
 }
 
-// Keep a resource the command buffer's commands use alive as long as the command buffer: the commands carry raw
-// GPU addresses, and freeing a resource unmaps it, so one released after encoding (an MPS temporary image, say)
-// would leave the GPU reading unmapped memory.
+// Commands carry raw GPU addresses, and a resource freed after encoding (an MPS temporary) is unmapped under the GPU.
 static void malachite_keep(__unsafe_unretained id commandBuffer, __unsafe_unretained id resource)
 {
     if (!resource)
@@ -762,7 +757,7 @@ static void malachite_keep(__unsafe_unretained id commandBuffer, __unsafe_unreta
     [cb->_kept addObject:resource];
 }
 
-// a buffer the GPU writes in the command buffer: one OpenCL reads back without a synchronize is copied back at commit
+// OpenCL reads some back without a synchronize, so those are copied back at commit
 static void malachite_written(__unsafe_unretained id commandBuffer, __unsafe_unretained id buffer)
 {
     MalachiteCommandBuffer *cb = commandBuffer;
@@ -781,12 +776,10 @@ static void malachite_texture_written(__unsafe_unretained id commandBuffer, __un
         ((MalachiteCommandBuffer *)commandBuffer)->_writes_capture = true;
 }
 
-// one side of a copy-engine copy: a buffer's rows or a texture's surface, and where the copy starts in it (x in
-// bytes, y in rows)
 struct malachite_side {
     uint64_t va;
-    uint32_t pitch, rows;  // rows 0: pitch-linear
-    uint32_t x, y;
+    uint32_t pitch, rows;  // rows 0 for pitch-linear
+    uint32_t x, y;  // x in bytes
 };
 
 static struct malachite_side malachite_side_of(MalachiteTexture *t, const struct malachite_sub *s, NSUInteger x, NSUInteger y)
@@ -795,8 +788,7 @@ static struct malachite_side malachite_side_of(MalachiteTexture *t, const struct
                                 (uint32_t)(x / s->block * s->bpp), (uint32_t)(y / s->block) };
 }
 
-// the copy engine's SET_REMAP_COMPONENTS: each destination component (x, y, z, w) from a source component, a
-// constant or not written; components of size bytes, nsrc of them to a source element and ndst to a destination one
+// the copy engine's SET_REMAP_COMPONENTS
 enum { REMAP_X = 0, REMAP_Y = 1, REMAP_ZERO = 4, REMAP_NONE = 6 };  // SRC_X, SRC_Y, CONST_A (0), NO_WRITE
 
 static uint32_t malachite_remap(uint32_t x, uint32_t y, uint32_t z, uint32_t w, uint32_t size, uint32_t nsrc,
@@ -805,8 +797,7 @@ static uint32_t malachite_remap(uint32_t x, uint32_t y, uint32_t z, uint32_t w, 
     return x | y << 4 | z << 8 | w << 12 | (size - 1) << 16 | (nsrc - 1) << 20 | (ndst - 1) << 24;
 }
 
-// which part of a packed depth/stencil texture's texels a copy to or from a buffer moves: the depth or the stencil
-// as the options say, the stencil of a stencil-only format (whose texels are packed ones), or the whole texel
+// stencil-only formats have packed texels too
 enum { MALACHITE_ASPECT_ALL, MALACHITE_ASPECT_DEPTH, MALACHITE_ASPECT_STENCIL };
 
 static int malachite_aspect(id<MTLTexture> t, MTLBlitOption options)
@@ -835,8 +826,7 @@ static void malachite_dispatch(id cb, MalachiteComputePipelineState *pipeline, c
                            const uint32_t *threadgroup = NULL, const uint32_t *part = NULL, uint64_t region = 0);
 static id<MTLComputePipelineState> malachite_mip_pipeline(id<MTLDevice> device, bool volume);
 
-// An app with Chromium inside (Electron's: Bitwarden, Slack, Discord, Code) carries its ANGLE in its framework's
-// Libraries, in the .app the process's executable is in, helpers included.
+// Electron apps carry ANGLE in a framework's Libraries, helpers included.
 static bool malachite_has_chromium(void)
 {
     char exe[PATH_MAX];
@@ -864,12 +854,8 @@ static bool malachite_has_chromium(void)
     return found;
 }
 
-// Chromium's graphics layer (ANGLE) turns Metal off on NVIDIA, and on macOS it has no other GPU backend worth the
-// name: its OpenGL one draws through Apple's GL renderer, which faults the GPU on the GL shaders it makes (Bitwarden
-// stays blank), and Chrome, Brave and Edge would draw everything on the CPU. The rule is overridden in their
-// processes as the plugin loads, so the helpers they start inherit it, and in any process ANGLE is loaded into
-// (Steam's and games' embedded copies), keeping any overrides already set; MALACHITE_ANGLE_METAL=0 leaves it, =1 sets it
-// in any process.
+// ANGLE turns Metal off on NVIDIA, and its GL backend faults the GPU through Apple's renderer. Set at load so helpers
+// inherit it, and wherever ANGLE loads; MALACHITE_ANGLE_METAL=0 leaves it, =1 forces it.
 static void malachite_angle_override(void)
 {
     const char *want = getenv("MALACHITE_ANGLE_METAL"), *key = "ANGLE_FEATURE_OVERRIDES_DISABLED", *cur = getenv(key);
@@ -891,10 +877,7 @@ __attribute__((constructor)) static void malachite_angle_metal(void)
         malachite_angle_override();
 }
 
-// VideoToolbox looks in /Library/Video/Plug-Ins with a FigRegistry option its own folders don't get, and never
-// offers NVVideo.bundle from there; registered through its call, the decoder is VideoToolbox's first choice for
-// H.264, H.265 and AV1. So it is, in each process this plugin loads into once VideoToolbox is there too. WindowServer
-// never decodes.
+// VideoToolbox never offers NVVideo.bundle from /Library/Video/Plug-Ins; registered by hand it is the first choice.
 static void malachite_register_video(void)
 {
     static dispatch_once_t once;
@@ -911,14 +894,14 @@ static void malachite_register_video(void)
             { 'hvc1', "NVDecHEVC_CreateInstance", @"pl.aochi.videodecoder.hevc.nvdec", @"NVIDIA H.265 (NVDEC)", @"H.265" },
             { 'av01', "NVDecAV1_CreateInstance", @"pl.aochi.videodecoder.av1.nvdec", @"NVIDIA AV1 (NVDEC)", @"AV1" },
             { 'vp09', "NVDecVP9_CreateInstance", @"pl.aochi.videodecoder.vp9.nvdec", @"NVIDIA VP9 (NVDEC)", @"VP9" },
-            // no CoreMedia codec type, but VideoToolbox takes any: what VP8 in an ISO media file is
+            // VP8's ISO media type; CoreMedia has none, VideoToolbox takes any
             { 'vp08', "NVDecVP8_CreateInstance", @"pl.aochi.videodecoder.vp8.nvdec", @"NVIDIA VP8 (NVDEC)", @"VP8" },
         };
         for (const auto &decoder : decoders) {
             void *factory = lib ? dlsym(lib, decoder.factory) : NULL;
             if (!factory || !reg)
                 continue;
-            // the id VideoToolbox names it by gets "." and the codec type on the end
+            // VideoToolbox appends "." and the codec type to the id
             NSDictionary *info = @{
                 @"CMClassImplementationID" : decoder.impl,
                 @"CMClassImplementationName" : decoder.name,
@@ -932,7 +915,6 @@ static void malachite_register_video(void)
     });
 }
 
-// the install name a dylib gives itself, or NULL for an executable or bundle
 static const char *malachite_dylib_name(const struct mach_header *mh)
 {
     const struct load_command *lc = (const struct load_command *)((const struct mach_header_64 *)mh + 1);
@@ -950,8 +932,7 @@ static bool malachite_ends_with(const char *s, const char *tail)
     return n >= m && !strcmp(s + n - m, tail);
 }
 
-// from inside dyld (for the images already there, and each one loaded after), so the registration, which loads
-// NVVideo.bundle, goes on after it
+// runs inside dyld, so registering, which loads NVVideo.bundle, waits until after
 static void malachite_image_added(const struct mach_header *mh, intptr_t slide)
 {
     const char *name = malachite_dylib_name(mh);
@@ -961,7 +942,7 @@ static void malachite_image_added(const struct mach_header *mh, intptr_t slide)
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
             malachite_register_video();
         });
-    // libANGLE-shared is the system web engine's copy, in its GPU process
+    // libANGLE-shared is the system web engine's, in its GPU process
     if (malachite_ends_with(name, "/libGLESv2.dylib") || malachite_ends_with(name, "/libEGL.dylib") ||
         malachite_ends_with(name, "/libANGLE-shared.dylib"))
         malachite_angle_override();
@@ -974,10 +955,9 @@ __attribute__((constructor)) static void malachite_video_decoder(void)
         _dyld_register_func_for_add_image(malachite_image_added);
 }
 
-// CoreAnimation uploads only level 0 of the small mipmapped textures it draws badges and symbols into, then samples
-// them minified: the levels below it hold whatever was in the memory, black boxes on screen. They're made from level
-// 0 on the CPU, a 2x2 box at a time, until anything writes a level of its own (a blit, a render pass, mipmaps).
-static char malachite_mips_key;  // on a texture's memory once a level past 0 has been written
+// CoreAnimation fills only level 0 of small mipmapped badges and samples them minified, showing black boxes, so the
+// levels are made on the CPU until anything writes one of its own.
+static char malachite_mips_key;
 
 static void malachite_mips_written(id texture, NSUInteger level)
 {
@@ -1023,17 +1003,15 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
         w = dw;
         h = dh;
     }
-    // the levels went in by blits, which mark them as an app's own
+    // the copies marked them as an app's own
     objc_setAssociatedObject(t->_backing, &malachite_mips_key, nil, OBJC_ASSOCIATION_RETAIN);
     free(cur);
     free(next);
 }
 
-// Our blit encoder. The base encode methods all throw, so each one is ours: a kernel command with raw GPU
-// addresses, which the kernel runs on the copy engine (0xC7B5). A texture region is a rectangle of rows, or of
-// GOBs for an image's surfaces, which the copy engine lays out itself.
+// The kernel runs these on the copy engine (0xC7B5), which lays out block-linear surfaces itself.
 @interface MalachiteBlitCommandEncoder : MTLIOAccelBlitCommandEncoder <MTLBlitCommandEncoder> {
-    __unsafe_unretained id _cb;  // the owning command buffer (outlives the encoder); not retained to avoid a cycle
+    __unsafe_unretained id _cb;  // outlives the encoder; retaining it would be a cycle
 }
 - (instancetype)initWithCommandBuffer:(id)cb;
 @end
@@ -1046,7 +1024,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     return self;
 }
 
-// commands run to completion in the order they were encoded: a fence or barrier has nothing to order
+// commands run to completion in encoding order, so there is nothing to fence
 - (void)updateFence:(id)fence
 {
 }
@@ -1084,9 +1062,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     malachite_record(_cb, MALACHITE_CMD_FILL_BUFFER, &p, sizeof(p));
 }
 
-// lines rows of bytes from one side to the other. A pitch-linear side takes its start in its address; a
-// block-linear one the whole GOBs of it there too (shrinking its height to match), the rest in the copy's origin,
-// whose fields are only 16 bits. remap, when not 0, moves components of each element instead (malachite_remap).
+// whole GOBs go into a block-linear side's address, as the origin fields are only 16 bits
 - (void)copy:(struct malachite_side)a
           to:(struct malachite_side)b
        bytes:(NSUInteger)bytes
@@ -1112,9 +1088,8 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     malachite_record(_cb, MALACHITE_CMD_COPY_2D, &c, sizeof(c));
 }
 
-// A buffer's rows to or from one aspect of a packed depth/stencil surface, whose 8-byte texels are the float depth
-// word, then the word whose low byte is the stencil. The stencil byte goes through a word a texel in between, as a
-// copy-engine component is at most 4 bytes.
+// Texels are the depth word, then a word with the stencil in its low byte; the stencil goes through a temporary word
+// per texel, as a copy-engine component is at most 4 bytes.
 - (void)copy:(struct malachite_side)a
             to:(struct malachite_side)b
        texels:(NSUInteger)w
@@ -1201,7 +1176,6 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
         destinationBytesPerImage:dstImage options:MTLBlitOptionNone];
 }
 
-// whole levels, each the source's size
 - (void)copyFromTexture:(id)src
             sourceSlice:(NSUInteger)srcSlice
             sourceLevel:(NSUInteger)srcLevel
@@ -1222,7 +1196,6 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     }
 }
 
-// every level and slice the two have in common
 - (void)copyFromTexture:(id)src toTexture:(id)dst
 {
     id<MTLTexture> a = src, b = dst;
@@ -1233,7 +1206,6 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
                sliceCount:slices levelCount:levels];
 }
 
-// a 3D region's slices are bytesPerImage apart in the buffer
 - (void)copyFromBuffer:(id)src
            sourceOffset:(NSUInteger)srcOff
       sourceBytesPerRow:(NSUInteger)srcPitch
@@ -1295,7 +1267,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     }
 }
 
-// a Managed resource's VRAM copy back to the memory the CPU reads; the rest is shared with it
+// only Managed resources have a VRAM copy, the rest is shared memory
 - (void)synchronizeResource:(id)resource
 {
     MalachiteBuffer *b = [resource isKindOfClass:[MalachiteTexture class]] ? ((MalachiteTexture *)resource)->_backing
@@ -1318,10 +1290,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     [self synchronizeResource:texture];
 }
 
-// each level from the one above it, a layer at a time: a compute kernel samples the level above linearly at the
-// centre of each 2x2 (2x2x2 for a 3D texture) and writes the level below through single-level views. An sRGB one is
-// filtered as linear colour, read through its own format and written through the same bytes in a plain one, the
-// kernel encoding, as stores don't.
+// An sRGB texture is written through a plain view with the kernel encoding, as stores don't.
 - (void)generateMipmapsForTexture:(id)texture
 {
     MalachiteTexture *t = texture;
@@ -1365,7 +1334,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
                                                                                               : MTLTextureType2D
                                                           levels:NSMakeRange(l - 1 + i, 1)
                                                           slices:NSMakeRange(layer, 1)];
-                malachite_keep(_cb, view);  // which keeps it alive
+                malachite_keep(_cb, view);
                 views[i] = view;
             }
             NSUInteger w = MAX(t.width >> l, 1u), h = MAX(t.height >> l, 1u), d = MAX(t.depth >> l, 1u);
@@ -1380,8 +1349,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
 }
 @end
 
-// Pipeline state base (private). Its initWithDevice:pipelineStateDescriptor: does the generic bookkeeping; the
-// concrete driver supplies the limits below and keeps whatever it needs to launch.
+// the base does the bookkeeping; the driver supplies the limits
 @interface _MTLComputePipelineState : NSObject
 - (instancetype)initWithDevice:(id)device pipelineStateDescriptor:(id)descriptor;
 @end
@@ -1389,28 +1357,27 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
 @interface MalachiteComputePipelineState : _MTLComputePipelineState {
 @public
     struct nvk_header _kernel;
-    id<MTLBuffer> _code;  // the SASS, GPU-mapped like any buffer so its gpuAddress is the program VA
-    NSString *_label;     // the kernel's name, for the trace
+    id<MTLBuffer> _code;
+    NSString *_label;
     NSUInteger _asked;    // the descriptor's maxTotalThreadsPerThreadgroup, 0 for none
-    bool _cl;             // an OpenCL kernel: its arguments are bound MALACHITE_CL_FIRST further on
+    bool _cl;             // arguments bound from MALACHITE_CL_FIRST
 }
 @end
 
-enum { MALACHITE_CL_FIRST = 3 };  // the buffer index OpenCL's renderer binds a kernel's first argument at
+enum { MALACHITE_CL_FIRST = 3 };  // where OpenCL's renderer binds a kernel's first argument
 
 @implementation MalachiteComputePipelineState
-// as many as the SM's registers hold: they're four partitions of 16K, a threadgroup's warps dealt out among them
-// in turn and each warp's allocated in 8-register units a thread; past that the launch faults
+// Past what the SM's four 16K-register partitions hold, at 8-register units a thread, the launch faults.
 - (NSUInteger)maxTotalThreadsPerThreadgroup
 {
     NSUInteger regs = (MAX(_kernel.reg_count, 1u) + 7) & ~7u, n = MIN(1024u, 16384 / (regs * 32) * 4 * 32);
-    // and no more than the kernel says it was written for: MPS sizes its threadgroup arrays to that
+    // MPS sizes its threadgroup arrays to the kernel's own limit
     if (_kernel.max_threads)
         n = MIN(n, _kernel.max_threads);
     return _asked ? MIN(n, _asked) : n;
 }
 - (NSUInteger)threadExecutionWidth { return 32; }
-// in the 16-byte units setThreadgroupMemoryLength takes, as Apple's reports it
+// rounded to setThreadgroupMemoryLength's 16 bytes, as Apple's is
 - (NSUInteger)staticThreadgroupMemoryLength { return (_kernel.shared_size + 15) & ~15u; }
 @end
 
@@ -1418,25 +1385,21 @@ enum { MALACHITE_CL_FIRST = 3 };  // the buffer index OpenCL's renderer binds a 
 - (instancetype)initWithDevice:(id)device pipelineStateDescriptor:(id)descriptor;
 @end
 
-#define MALACHITE_DYNAMIC_STRIDE UINT32_MAX  // a layout's MTLBufferLayoutStrideDynamic
+#define MALACHITE_DYNAMIC_STRIDE UINT32_MAX
 
 @interface MalachiteRenderPipelineState : _MTLRenderPipelineState {
 @public
     struct nvk_header _vertex, _fragment;
-    id<MTLBuffer> _vcode, _fcode;  // each stage's SPH then SASS, GPU-mapped
-    uint32_t _write_mask[8], _blend[8][7];  // each colour attachment's, as nvgpu_draw carries them
-    uint32_t _alpha_control;                // alpha to coverage and to one, as nvgpu_draw carries them
-    uint32_t _attributes[32];         // the vertex descriptor's attributes, as nvgpu_draw carries them
-    uint32_t _strides[16];            // its layouts: the stride of the vertex buffer each stream reads, or 0, or
-                                      // MALACHITE_DYNAMIC_STRIDE for the one it's bound with
-    uint32_t _divisors[16];           // and the instances per step, 0 for a buffer read per vertex
-    uint8_t _stream_buffer[16];       // the vertex buffer each stream reads
+    id<MTLBuffer> _vcode, _fcode;  // SPH then SASS
+    uint32_t _write_mask[8], _blend[8][7];  // as nvgpu_draw carries them
+    uint32_t _alpha_control;
+    uint32_t _attributes[32];
+    uint32_t _strides[16];            // 0, or MALACHITE_DYNAMIC_STRIDE for the one it's bound with
+    uint32_t _divisors[16];           // 0 per vertex
+    uint8_t _stream_buffer[16];
     int _zero_stream;                 // 1 + the stream that reads zeros for attributes it can't fetch, 0 for none
-    NSString *_label;                 // vertex/fragment function names, for the trace
-    // a post-tessellation vertex function's: SET_TESSELLATION_PARAMETERS (0 for any other), whether the factors
-    // are scaled, the vertex stage generated to run before it, and the tessellation init stage's description and
-    // code (with its register count) by control point count: one for a function that gives the count, any a draw
-    // asks for otherwise
+    NSString *_label;
+    // post-tessellation vertex functions only; init stages by control point count
     uint32_t _tess;
     bool _tess_scaled;
     struct nvk_header _tv;
@@ -1451,8 +1414,7 @@ static id<MTLBuffer> malachite_tess_stage(id<MTLDevice> device, const struct air
                                       NSString **why);
 
 @implementation MalachiteRenderPipelineState
-// the tessellation init stage for patches of points control points (the function's own count if it has one),
-// generated on device the first time it's wanted, and its register count; nil, and *why, if it can't be
+// generated on first use; the function's own control point count wins
 - (id<MTLBuffer>)tessInit:(NSUInteger)points
                    device:(id<MTLDevice>)device
                      regs:(uint32_t *)regs
@@ -1477,8 +1439,7 @@ static id<MTLBuffer> malachite_tess_stage(id<MTLDevice> device, const struct air
 }
 @end
 
-// a texture over an image's buffer: a plain one over all of it (64 KB rows of RGBA32Float, the buffer made a
-// whole number of them; a heap's block under 64 KB one row), whose getters the image's fields replace
+// 64 KB rows of RGBA32Float over the whole buffer, which is sized to a whole number of them
 static MalachiteTexture *malachite_image_over(MalachiteBuffer *buf, MTLTextureUsage usage)
 {
     NSUInteger length = ((id<MTLBuffer>)buf).length, row = MIN(length, (NSUInteger)65536);
@@ -1505,14 +1466,12 @@ static uint32_t *malachite_heap_header(uint32_t e);
 static uint32_t malachite_heap_sampler(const uint32_t samp[8]);
 static int malachite_fill_texture_header(uint32_t out[8], id texture, id cb);
 
-// The CPU copies go through each surface's rows, or an image's GOBs.
 @implementation MalachiteTexture
 - (MTLTextureUsage)usage
 {
     return _usage;
 }
 
-// mipmaps are made on a command buffer (generateMipmapsForTexture:), not by the texture itself
 - (BOOL)canGenerateMipmapLevels
 {
     return NO;
@@ -1530,7 +1489,6 @@ static int malachite_fill_texture_header(uint32_t out[8], id texture, id cb);
                                         slices:NSMakeRange(0, _image ? _layers : 1)];
 }
 
-// t read through swizzle, unless it's the identity
 static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizzleChannels swizzle)
 {
     if (!t || (swizzle.red == MTLTextureSwizzleRed && swizzle.green == MTLTextureSwizzleGreen &&
@@ -1544,8 +1502,7 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
     return t;
 }
 
-// a view: the same memory read as another format of the same size per pixel (or block), and of an image, some of
-// its levels and layers as another type; it keeps this texture alive
+// formats must match in size per pixel or block
 - (id)newTextureViewWithPixelFormat:(MTLPixelFormat)format
                         textureType:(MTLTextureType)type
                              levels:(NSRange)levels
@@ -1583,7 +1540,7 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
             t->_zt_kind = _zt_kind;
         }
     } else {
-        // made as the IOSurface textures are, in case these rows aren't ones the base takes
+        // as IOSurface textures are, in case the base won't take these rows
         MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
                                                                                      width:[self width]
                                                                                     height:1
@@ -1598,8 +1555,7 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
     if (t) {
         t->_owned = self;
         t->_type = type;
-        // the storage asked for too: a view of a texture moved to VRAM answering Private had malachite_depth_kind
-        // compress the memory under data the CPU had already written
+        // a moved texture's view answering Private let malachite_depth_kind compress over the CPU's data
         t->_asked = _asked;
         t->_moved = _moved;
         t->_swizzled = _swizzled;
@@ -1716,7 +1672,7 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
         malachite_heap_release(_heap_entry);
 }
 
-// what an argument buffer holds for the texture: its descriptor heap entry
+// the descriptor heap entry argument buffers hold
 - (MTLResourceID)gpuResourceID
 {
     if (!_heap_entry) {
@@ -1738,7 +1694,6 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
     [self replaceRegion:region mipmapLevel:level slice:0 withBytes:bytes bytesPerRow:stride bytesPerImage:0];
 }
 
-// a region of the texture to or from the CPU's bytes, a 3D region's slices bytesPerImage apart
 - (void)copyRegion:(MTLRegion)region level:(NSUInteger)level slice:(NSUInteger)slice bytes:(uint8_t *)bytes
             stride:(NSUInteger)stride image:(NSUInteger)image in:(bool)in
 {
