@@ -43,8 +43,7 @@ struct disp_output {
     uint32_t nmodes;
     uint8_t edid[512];      // base block and the first three extensions
     uint32_t edid_size;
-    // DisplayPort sinks: receiver capabilities (DPCD 0x0-0xf, DP 1.4's extended ones when the sink has them) and
-    // the fastest link both the sink and the GPU do, rate in 0.27 Gbps units; lanes 0 until the DPCD was read
+    // DP: DPCD 0x0-0xf (DP 1.4 extended caps if present), fastest shared link in 0.27 Gbps units; lanes 0 until read
     uint8_t dpcd[16];
     uint32_t dp_bw, dp_lanes;
 };
@@ -102,34 +101,31 @@ struct disp {
 };
 
 int disp_probe(struct gsp *s, struct disp *d, const struct disp_size *scaled, uint32_t nscaled);
-// out[] again from what GSP-RM says is connected now; the order stays that of the board's displays
+// refills out[] from what GSP-RM says is connected, in the board's display order
 void disp_read_outputs(struct disp *d);
-// the scaled modes of every output anew, for these sizes; modes[] index of the others stay
+// rebuilds every output's scaled modes for these sizes; other modes[] keep their index
 void disp_set_scaled(struct disp *d, const struct disp_size *sizes, uint32_t n);
 int disp_mode_possible(struct disp *d, int head, const struct disp_mode *t);
 void disp_fini(struct disp *d);
-// what disp_fini frees, once GSP-RM is gone with the display objects in it (a power cycle): no RPCs
+// disp_fini without RPCs, for when GSP-RM and its display objects are already gone
 void disp_forget(struct disp *d);
 
-// head shows fb (A8R8G8B8, VRAM) on output out in mode t (one of its modes[]); again to change the mode.
-// DISP_NO_OUTPUT when the output can't be driven (no SOR, no DisplayPort link for the mode) and the display
-// channels are as they were; -1 when the display engine may need disp_reset()
+// head shows fb (A8R8G8B8, VRAM) on output out in mode t (one of its modes[]). DISP_NO_OUTPUT when the output
+// can't be driven (no SOR or DP link), channels untouched; -1 when the engine may need disp_reset()
 int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, uint64_t fb, uint32_t pitch);
 #define DISP_NO_OUTPUT (-2)
 // the display channels' memory, notifier, LUTs and cursor images freed; their objects in GSP-RM go separately
 void disp_modeset_fini(struct disp *d);
 // the display channels torn down after a modeset the engine refused; the next disp_modeset() starts over
 void disp_reset(struct disp *d);
-// The display engine keeps its channels allocated after GSP-RM frees them (core channel IDLE, not DEALLOC), even across
-// a GSP-RM unload, and a GSP-RM booted on that hangs allocating a core channel. Every allocated channel is
-// deallocated, leaving the engine as GSP-RM finds it at power-on (or EFI_OPERATION after the firmware).
+// The engine keeps channels allocated after GSP-RM frees them (core IDLE, not DEALLOC), even across an unload, and
+// a fresh GSP-RM then hangs allocating the core channel; this deallocates them all, as at power-on.
 void disp_release_channels(struct gpu *g);
-// the semaphore words in the notifier memory a head's flips wait for (VRAM, d->ntfy + DISP_FLIP_SEMA(head, k)): three
-// a head, flips taking them in turn. The window writes a flip's release value when the next flip takes over, so the
-// copy for a flip may only write the word of the one three before, which has been released by then.
+// three flip semaphores per head at d->ntfy + DISP_FLIP_SEMA, used in turn. The window releases one when the next
+// flip takes over, so a flip's copy may only write the word of the flip three before.
 #define DISP_FLIP_SEMA(head, k) (0x400 + (head) * 0x30 + ((k) % 3) * 0x10)
-// fb shown from the first vblank after the head's flip semaphore k reads `acquire`; returns once the window channel
-// has the methods, which it takes when the flip before is through
+// fb shown from the first vblank after semaphore k reads `acquire`; returns once the window channel has the
+// methods, which it takes when the previous flip is through
 int disp_flip_queue(struct disp *d, int head, uint64_t fb, uint32_t acquire, unsigned k);
 // whether the head's last queued flip has been taken up (its notifier written)
 int disp_flip_taken(struct disp *d, int head);
@@ -147,11 +143,11 @@ int dp_aux_read(struct disp *d, uint32_t id, uint32_t addr, uint8_t *buf, uint32
 int dp_aux_write(struct disp *d, uint32_t id, uint32_t addr, const uint8_t *buf, uint32_t size);
 // o's DPCD capabilities and the fastest link it and the GPU share; -1 when the sink doesn't answer over AUX
 int disp_dp_caps(struct disp *d, struct disp_output *o, int quiet);
-// the EDID read over I2C-over-AUX into buf, base block and as many extensions as fit; the bytes read
+// EDID over I2C-over-AUX into buf, base block plus whatever extensions fit; returns bytes read
 uint32_t disp_dp_edid(struct disp *d, uint32_t id, uint8_t *buf, uint32_t size);
 // whether the fastest link o can train carries mode t at 8 bpc
 int disp_dp_fits(const struct disp *d, const struct disp_output *o, const struct disp_mode *t);
-// the smallest link that carries t trained for o on the SOR, and the head's SST stream set up on it
+// trains the smallest link that carries t for o on the SOR and sets up the head's SST stream on it
 int disp_dp_link(struct disp *d, int head, uint32_t sor, struct disp_output *o, const struct disp_mode *t);
 // after o raised IRQ_HPD: its service requests acknowledged, the head's link trained again if it dropped
 void disp_dp_service(struct disp *d, int head, const struct disp_output *o);

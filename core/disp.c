@@ -1,5 +1,4 @@
-// The display engine through GSP-RM, after nouveau's rm/r535/disp.c: instance memory, NV04_DISPLAY_COMMON,
-// and what is connected where
+// The display engine through GSP-RM, after nouveau's rm/r535/disp.c
 #include "../nvrm/disp.h"
 #include "../nvrm/gsp.h"
 #include "disp.h"
@@ -47,8 +46,7 @@ static void add_mode(struct disp_output *o, const uint8_t *b)
     keep_mode(o, t);
 }
 
-// a 20-byte DisplayID detailed timing (Type I in 1.x, clock in 10 kHz units; Type VII in 2.0, in 1 kHz), every
-// field stored minus one; polarities in the top bits of the sync offsets
+// 20-byte DisplayID timing (Type I: 10 kHz clock, Type VII: 1 kHz), fields minus one, polarity in sync offset bit 15
 static void displayid_timing(struct disp_output *o, const uint8_t *b, uint32_t clock_unit)
 {
 #define F16(i) ((uint32_t)(b[i] | b[i + 1] << 8))
@@ -104,8 +102,7 @@ static struct disp_mode cvt_rb_mode(uint32_t w, uint32_t h, uint32_t hz, uint32_
     return t;
 }
 
-// a progressive mode by the default GTF, in integers as drm_gtf_mode_complex has it, and clocked for the exact rate as
-// NVIDIA has it; negative hsync, positive vsync
+// default GTF in integers (drm_gtf_mode_complex), clocked for the exact rate; negative hsync, positive vsync
 static struct disp_mode gtf_mode(uint32_t w, uint32_t h, uint32_t hz)
 {
     uint32_t hfreq = (h + 1) * 2 * 1000 * hz / ((1000000 - 550 * hz) / 500);  // Hz
@@ -127,8 +124,8 @@ static struct disp_mode gtf_mode(uint32_t w, uint32_t h, uint32_t hz)
     return t;
 }
 
-// a standard timing at the preferred size faster than any detailed one: where a 75 Hz monitor may keep its top rate.
-// Before EDID 1.4 one outside DMT means GTF (parseEdidStandardTimingDescriptor); the other sizes stay out of the list
+// standard timings at the preferred size faster than any detailed one (some 75 Hz monitors list it only there);
+// before EDID 1.4 a non-DMT one means GTF (parseEdidStandardTimingDescriptor)
 static void add_standard(struct disp_output *o, const uint8_t *e)
 {
     // 16:10, 4:3, 5:4, 16:9
@@ -150,8 +147,7 @@ static void add_standard(struct disp_output *o, const uint8_t *e)
     }
 }
 
-// every refresh rate of the panel's own size again for each image that suits it: bigger, of the same shape, and no
-// more than the twice the 2-tap scaler takes (NV_EVO_SCALER_2TAPS)
+// native-size modes again per image that suits: bigger, same aspect, at most 2x (NV_EVO_SCALER_2TAPS)
 static void add_scaled(struct disp_output *o, const struct disp_size *sizes, uint32_t n)
 {
     if (!o->nmodes)
@@ -183,8 +179,7 @@ void disp_set_scaled(struct disp *d, const struct disp_size *sizes, uint32_t n)
     }
 }
 
-// manufacturer, name and the detailed timings out of an EDID: the base block's (the first is the preferred mode)
-// and those of CEA-861 extension blocks
+// name and timings from the base block (first is preferred) and CEA-861/DisplayID extensions
 static void edid_describe(const uint8_t *e, uint32_t size, struct disp_output *o)
 {
     if (size < 128 || e[0] != 0 || e[1] != 0xff) {
@@ -251,7 +246,7 @@ static void hotplug_event(void *ctx, uint32_t client, uint32_t event, const void
     d->hotplug |= h->plugDisplayMask | h->unplugDisplayMask;
 }
 
-// an event object under our subdevice that GSP-RM posts notifier index's events to, again and again
+// event object under our subdevice that GSP-RM posts index's events to, repeatedly
 static int listen(struct disp *d, uint32_t handle, uint32_t index)
 {
     NV0005_ALLOC_PARAMETERS ev = {
@@ -344,7 +339,6 @@ int disp_probe(struct gsp *s, struct disp *d, const struct disp_size *scaled, ui
                 cr->bIsMultistreamSupported ? ", MST" : "", cr->bHasIncreasedWatermarkLimits ? ", increased watermarks" : "");
     }
 
-    // hotplug and DisplayPort IRQ_HPD: GSP-RM posts them to event objects under our subdevice
     if (listen(d, DISP_HOTPLUG, NV2080_NOTIFIERS_HOTPLUG))
         log_msg("disp: no hotplug events\n");
     if (listen(d, DISP_DP_IRQ, NV2080_NOTIFIERS_DP_IRQ))
@@ -355,7 +349,7 @@ int disp_probe(struct gsp *s, struct disp *d, const struct disp_size *scaled, ui
     return 0;
 }
 
-// a DisplayPort sink's modes its fastest link can't carry left out, so neither the first lighting nor macOS picks one
+// drops DP modes the fastest link can't carry, so neither first lighting nor macOS picks one
 static void drop_unfit_modes(const struct disp *d, struct disp_output *o, int quiet)
 {
     uint32_t n = 0;
@@ -383,7 +377,7 @@ void disp_read_outputs(struct disp *d)
     NV0073_CTRL_SYSTEM_GET_CONNECT_STATE_PARAMS *cp =
         rm_control(s, d->c.client, DISP_COMMON, NV0073_CTRL_CMD_SYSTEM_GET_CONNECT_STATE, &cs, sizeof(cs));
     uint32_t connected = cp ? cp->displayMask : 0;
-    int quiet = d->n && connected == d->connected;  // asked again with nothing changed: no need to say it all
+    int quiet = d->n && connected == d->connected;  // nothing changed: don't log it all again
     d->connected = connected;
     if (!quiet)
         log_msg("disp: %u heads, windows %#x, displays %#x, connected %#x\n", d->heads, d->windows, supported,

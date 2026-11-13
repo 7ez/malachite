@@ -33,17 +33,15 @@ struct gsp_info {
 struct gsp *gsp_start(struct gpu *g);
 // unloads GSP-RM, releases WPR2 and frees everything gsp_start and gsp_dma allocated
 void gsp_stop(struct gsp *s);
-// A power cycle: GSP-RM unloaded and WPR2 released, what lived in GSP-RM (the golden context) dropped; s's system
-// memory, gsp_dma() buffers, VRAM allocations and channel IDs stay. 0 when FWSEC-SB ran and WPR2 came down.
+// GSP-RM unloaded and WPR2 released, its state (golden context) lost; system memory, gsp_dma() buffers, VRAM
+// allocations and channel IDs kept. 0 when FWSEC-SB ran and WPR2 came down.
 int gsp_unload(struct gsp *s);
-// and booted again on them; 0 once it has initialised, else the GPU is cleaned up again and s is left unloaded
+// boots GSP-RM again on what gsp_unload kept; 0 once initialised, else GPU cleaned up and s left unloaded
 int gsp_boot(struct gsp *s);
-// A power cycle that keeps GSP-RM's state (its clients, VA spaces, channels and engine objects) in system memory, as
-// a suspend does: channel scheduling stopped, GSP-RM unloaded for a power transition and WPR2 saved and released.
-// VRAM of ours isn't saved. -1 with GSP-RM still running if the copy couldn't be set up.
+// unload that saves GSP-RM's state (clients, VA spaces, channels, objects) and WPR2 to system memory, as a suspend
+// does; our VRAM isn't saved. -1 with GSP-RM still running if the copy couldn't be set up.
 int gsp_suspend(struct gsp *s);
-// After gsp_suspend() or gsp_unload(): 0 when GSP-RM came back from the copy with everything it had, 1 when it was
-// booted afresh with nothing (no copy, or it didn't resume from it), -1 when it isn't up
+// after gsp_suspend/gsp_unload: 0 resumed with everything, 1 booted afresh with nothing, -1 not up
 int gsp_resume(struct gsp *s);
 // FWSEC-SB and Booter-Unload for a GPU left with GSP-RM loaded
 int gsp_cleanup(struct gpu *g);
@@ -60,12 +58,12 @@ struct gsp_fault {
     uint32_t engine;     // NV_PFAULT_MMU_ENG_ID_*, 0x40 graphics
 };
 
-// called from message processing when GSP-RM recovers a channel; must not send RPCs itself. fault is NULL when
-// the recovery wasn't for an MMU fault and only lives for the call.
+// called from message processing on a channel recovery; must not send RPCs. fault: NULL unless an MMU fault, valid
+// only during the call
 typedef void (*gsp_rc_fn)(void *ctx, uint32_t engine, uint32_t chid, uint32_t exception,
                           const struct gsp_fault *fault);
-// Channel IDs, one space for every client of ours: the core keeps 1-5 (copy, its tests, golden context, the
-// kernel's graphics channel), contexts and the frontend's clients take the rest from first on; -1 when all are taken
+// one channel ID space for all our clients: core keeps 1-5 (copy, tests, golden context, kernel graphics), others
+// take from first on; -1 when full
 #define GSP_CHIDS 2048
 int gsp_chid_get(struct gsp *s, uint32_t first);
 void gsp_chid_put(struct gsp *s, uint32_t chid);
@@ -81,7 +79,7 @@ void gsp_on_event(struct gsp *s, gsp_event_fn fn, void *ctx);
 int gsp_pending(const struct gsp *s);  // whether GSP-RM has messages waiting
 void gsp_poll(struct gsp *s);
 
-// interrupts: the platform calls gsp_irq() from its handler; it acks, handles messages and says what came in
+// gsp_irq(), called from the platform's handler, acks, handles messages and returns GSP_IRQ_* bits
 #define GSP_IRQ_MSG 1
 #define GSP_IRQ_GR 2  // graphics or copy engine nonstall: a semaphore release with an interrupt
 #define GSP_IRQ_VBLANK(head) (0x100 << (head))  // a head's vblank, once the display enabled it

@@ -82,8 +82,7 @@ struct gsp {
     uint32_t irqs;
     uint32_t chids[GSP_CHIDS / 32];  // channel IDs handed out (the first few are the core's own, fixed)
     uint64_t fb_rsvd;  // VRAM GSP-RM reserves between the last usable region and its non-WPR heap
-    // held from gsp_suspend() to gsp_resume(): WPR2 as Booter-Unload saved it (radix3, described by meta) and
-    // GSP-RM's VRAM outside WPR2, saved by GSP-RM itself (FBSR)
+    // gsp_suspend to gsp_resume: WPR2 saved by Booter-Unload (radix3, meta), GSP-RM's own FBSR copy of the rest
     struct {
         struct dma data, lvl0, lvl1, lvl2, meta, fbsr;
     } sr;
@@ -391,7 +390,7 @@ static void fb_layout(struct gsp *s, uint64_t *frts_addr, uint64_t *frts_size)
     m->fbSize = fb;
     m->vgaWorkspaceOffset = vga;
     m->vgaWorkspaceSize = fb - vga;
-    // as the Linux driver boots Turing to Ada: without it GSP-RM sits in P0 when idle, with it P8 (P0 under load)
+    // without it GSP-RM idles in P0 instead of P8 (Turing to Ada)
     m->flags |= GSP_FW_FLAGS_CLOCK_BOOST;
 
     log_msg("gsp: fb %llu MB, wpr2 %#llx, heap %#llx (+%llu MB), elf %#llx, frts %#llx\n",
@@ -488,8 +487,7 @@ static int run_sequencer(struct gsp *s, rpc_run_cpu_sequencer_v17_00 *seq)
     return 0;
 }
 
-// RmRCCommonJournal_RECORD then RmRcDiag_RECORD (rmcd.h) as GSP-RM lays them out, pNext a 64-bit pointer: what a
-// channel recovery's rcJournalBuffer holds, one after another. data starts at 0x44.
+// RmRCCommonJournal_RECORD + RmRcDiag_RECORD (rmcd.h) with 64-bit pNext, back to back in rcJournalBuffer; data at 0x44
 struct rc_diag {
     uint8_t group, type;  // NVCD_RECORD; RmRcDiagReport is type 147
     uint16_t size;        // of the whole record
@@ -506,8 +504,7 @@ struct rc_diag {
     } data[];
 };
 
-// NV_PFAULT_FAULT_TYPE_*, NV_PFAULT_ACCESS_TYPE_* and NV_PFAULT_CLIENT_HUB_* from open-gpu's
-// hwref/ampere/ga100/dev_fault.h, the nearest published to GA10x
+// NV_PFAULT_* from open-gpu's hwref/ampere/ga100/dev_fault.h, the nearest published to GA10x
 static const char *const fault_types[] = {
     "PDE", "PDE size", "PTE", "VA limit", "unbound instance block", "privilege", "read-only", "write-only",
     "pitch mask", "work creation", "unsupported aperture", "compression", "unsupported kind", "region", "poisoned",
@@ -535,8 +532,7 @@ static const char *fault_name(const char *const *names, uint32_t n, uint32_t i)
     return i < n && names[i] ? names[i] : "unknown";
 }
 
-// NV_PFAULT_CLIENT_GPC_*: the unit and, for the per-TPC ones, which (else -1). dev_fault.h names 0x31-0x38
-// LTP_UTLB_8-15 as well; they're taken as the per-TPC units here.
+// NV_PFAULT_CLIENT_GPC_*: unit and per-TPC index (else -1); 0x31-0x38, also named LTP_UTLB_8-15, taken as per-TPC
 static const char *gpc_unit(uint32_t c, int *n)
 {
     *n = -1;
@@ -624,13 +620,10 @@ static void fault_client(char *s, int gpc, uint32_t gpc_id, uint32_t client)
     }
 }
 
-// GSP-RM handles a graphics channel's MMU fault itself: it copies to a client's shadow buffer only faults UVM
-// services (copy engine or PBDMA faults of channels with replayable faults on, _kgmmuFaultEntryRmServiceable_GV100),
-// so registering one gets nothing here. What it does pass on is an RC diagnostic record in the recovery's journal:
-// entries at offset 0 tagged 0x22d-0x233 holding FIFO_MMU_EXCEPTION_DATA's addrLo, addrHi, faultType, clientId (with
-// bGpc as its attribute), gpcId, accessType and faultEngineId, in that order. The tags aren't in the open sources;
-// the order and the values (engine 0x40 graphics, GPC 0-2 on GA106) give them away. The last such record wins;
-// 0 when there is none.
+// GSP-RM only shadow-buffers faults UVM services (_kgmmuFaultEntryRmServiceable_GV100), never graphics ones, so the
+// fault comes from the RC diag record in the journal: offset-0 entries tagged 0x22d-0x233 = FIFO_MMU_EXCEPTION_DATA's
+// addrLo, addrHi, faultType, clientId (attribute bGpc), gpcId, accessType, faultEngineId. Tags are unpublished,
+// inferred from order and values. Last record wins; 0 when none.
 static int rc_fault(const uint8_t *journal, uint32_t size, struct gsp_fault *f)
 {
     const uint32_t head = offsetof(struct rc_diag, data);
@@ -750,9 +743,8 @@ static int msgq_recv(struct gsp *s, int timeout_ms)
         break;
     }
     case NV_VGPU_MSG_EVENT_MMU_FAULT_QUEUED: {
-        // GSP-RM took a fault off the hub's non-replayable buffer (gmcapiMmuFaultQueued); the channel recovery that
-        // follows carries its details (rc_fault). The hub's own latch (nouveau's tu102_fault_info_fault) only holds
-        // a fault that went to no buffer, otherwise stale bits with valid clear.
+        // taken off the non-replayable buffer (gmcapiMmuFaultQueued); the recovery that follows has the details. The
+        // hub latch (nouveau's tu102_fault_info_fault) only holds faults that went to no buffer.
         uint32_t lo = rd32(s->g, 0xb83080), hi = rd32(s->g, 0xb83084), info0 = rd32(s->g, 0xb83088),
                  insthi = rd32(s->g, 0xb8308c), info1 = rd32(s->g, 0xb83090);
         if (!(info1 & 0x80000000))
@@ -897,8 +889,7 @@ static uint32_t top_mask(struct gsp *s)
     return m;
 }
 
-// graphics and copy engines: their nonstall interrupts are semaphore releases NVK sleeps on (several engines may
-// share a vector)
+// graphics and copy engines: their nonstall interrupts are semaphore releases clients sleep on; vectors may be shared
 static int is_work_engine(uint32_t idx)
 {
     return idx == MC_ENGINE_IDX_GR0 || (idx >= MC_ENGINE_IDX_CE0 && idx <= MC_ENGINE_IDX_CE13);
@@ -1145,8 +1136,7 @@ static int gsp_query(struct gsp *s)
     return gr_info(s);
 }
 
-// FWSEC-SB restores the pre-OS state on the GSP falcon, Booter-Unload releases WPR2, saving it first to the
-// suspend copy arg points at (0xff/0xff: none)
+// FWSEC-SB restores the falcon's pre-OS state; Booter-Unload saves WPR2 to arg's copy (0xff/0xff: none), releases it
 static int teardown(struct gpu *g, uint64_t arg)
 {
     int ret = 0;
@@ -1240,8 +1230,7 @@ void gsp_stop(struct gsp *s)
     free_all(s);
 }
 
-// after a power-up the GPU's firmware runs devinit itself (GFW boot), and nothing else may touch it until it's done
-// (nouveau's tu102_devinit_wait); a GPU that kept power reads done already
+// after power-up GFW boot runs devinit and nothing may touch the GPU until done (nouveau's tu102_devinit_wait)
 static void gfw_wait(struct gpu *g)
 {
     uint64_t end = time_us() + 2000000;
@@ -1268,8 +1257,7 @@ static struct gsp *gsp_alloc(struct gpu *g)
     return s;
 }
 
-// Booter-Load with arg (the WPR metadata, or the suspend copy's), then GSP-RM's core started and its initialisation
-// waited for
+// Booter-Load with arg (WPR meta or the suspend copy's), then wait for GSP-RM to initialise
 static int run_rm(struct gsp *s, uint64_t arg)
 {
     struct gpu *g = s->g;
@@ -1335,8 +1323,8 @@ static int schedule_channels(struct gsp *s, int on)
 
 #define FBSR_MEMLIST 0xcaf00003
 
-// GSP-RM's VRAM outside WPR2 (its non-WPR heap, what it reserves below that, the VGA workspace, the compression
-// backing store) is GSP-RM's own to save: it gets system memory for it as a memory list, as nouveau's r570 FBSR does
+// GSP-RM saves its VRAM outside WPR2 (non-WPR heap, reserve below it, VGA workspace, compression store) itself, into
+// a system memory list we give it (nouveau's r570 FBSR)
 static int fbsr_init(struct gsp *s)
 {
     const GspFwWprMeta *m = s->wpr_meta.cpu;
@@ -1355,7 +1343,7 @@ static int fbsr_init(struct gsp *s)
         log_msg("gsp: FBSR needs more than a memory list describes\n");
         return -1;
     }
-    // the list is a client's of ours (ogkm's memory manager client, nouveau's internal one), not GSP-RM's
+    // the list goes under a client of ours, not GSP-RM's internal one
     struct rm_client c;
     if (dma(s, &s->sr.fbsr, size, 0) || rm_client(s, &c))
         return -1;

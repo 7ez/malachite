@@ -1,6 +1,5 @@
-// Lighting displays: the root display object, the core channel and each head's window and window-immediate
-// channels, DisplayPort link training through GSP-RM and the methods nvkms and nouveau send for a head with one
-// window (head h, window 2h)
+// Lighting displays: root object, core and window channels, and the methods nvkms and nouveau send for a head with
+// one window (head h, window 2h)
 #include "chip.h"
 #include "../hw/clc37a.h"
 #include "../hw/clc37b.h"
@@ -120,8 +119,7 @@ static void ctxdma_insert(struct disp *d, uint32_t chid, uint32_t handle, uint32
 {
     struct gpu *g = gsp_gpu(d->s);
 
-    // nouveau's nvkm_ramht_hash, which it runs Ampere under GSP-RM with (RM's instmemHashFunc_v03_00 also folds
-    // in the client's low bits)
+    // nouveau's nvkm_ramht_hash; RM's instmemHashFunc_v03_00 also folds in the client's low bits
     uint32_t hash = 0;
     for (uint32_t h = handle; h; h >>= RAMHT_BITS)
         hash ^= h & ((1u << RAMHT_BITS) - 1);
@@ -218,8 +216,8 @@ static void imp_head(NVC372_CTRL_IS_MODE_POSSIBLE_PARAMS *p, int head, const str
     w->lut = w->tmoLut = NVC372_CTRL_IMP_LUT_USAGE_1025;
 }
 
-// What GSP-RM says of head showing t next to what the others show, as nvkms asks before a modeset: the display engine
-// takes a mode beyond it and then stops, and macOS restores it at every boot
+// GSP-RM's check of t on head alongside the other heads: the engine accepts an impossible mode and then stops, and
+// macOS restores that mode every boot
 int disp_mode_possible(struct disp *d, int head, const struct disp_mode *t)
 {
     if (!d->imp)
@@ -240,8 +238,8 @@ int disp_mode_possible(struct disp *d, int head, const struct disp_mode *t)
     return possible;
 }
 
-// one interlocked update of the core and a window, as nvkms does (UpdateWindowC3, UpdateCoreC3): the window
-// waits for the core; returns once the core channel is idle again, i.e. GSP-RM's supervisors have run
+// window update interlocked with the core (UpdateWindowC3, UpdateCoreC3); returns once the core is idle, i.e.
+// GSP-RM's supervisors have run
 static int commit(struct disp *d, int head)
 {
     struct gpu *g = gsp_gpu(d->s);
@@ -328,8 +326,7 @@ static int detach(struct disp *d, int head, uint32_t sor)
     return commit(d, head);
 }
 
-// display sleep: the head off its OR and the sink told to power down (DPCD SET_POWER D3), so the monitor sees no
-// signal and goes to standby; disp_modeset() brings it back
+// head off its OR and DP sink to D3 (DPCD 0x600) so the monitor goes to standby; disp_modeset() wakes it
 int disp_blank(struct disp *d, int head, int out)
 {
     const struct disp_output *o = &d->out[out];
@@ -393,7 +390,7 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
         log_msg("disp: no SOR for display %#x (other heads' %#x)\n", o->id, as.sorExcludeMask);
         return DISP_NO_OUTPUT;
     }
-    // the protocol on the OR it now has (the probe asked before any was assigned: a TMDS port may be on link B)
+    // protocol on the assigned OR; the probe asked before assignment and a TMDS port may be on link B
     NV0073_CTRL_SPECIFIC_OR_GET_INFO_PARAMS orq = { .displayId = o->id };
     NV0073_CTRL_SPECIFIC_OR_GET_INFO_PARAMS *ori =
         rm_control(d->s, d->c.client, DISP_COMMON, NV0073_CTRL_CMD_SPECIFIC_OR_GET_INFO, &orq, sizeof(orq));
@@ -409,7 +406,7 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
     hd->sor = sor;
     hd->timing = *t;
     hd->display = o->id;
-    // take the head off whatever the EFI firmware lit first (nvkms shuts heads down before reattaching them)
+    // detach from whatever the firmware lit first, as nvkms shuts heads down before reattaching
     struct dchan *c = &d->core, *wc = &hd->wndw;
     if (detach(d, head, sor))
         return -1;
@@ -520,9 +517,8 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
     dmthd(&hd->wimm, NVC37B_SET_POINT_OUT(0), 0);
 
     vram_flush(gsp_gpu(d->s));  // RAMHT, context DMAs, LUTs and the framebuffer were written through PRAMIN
-    // completion notifiers: the core's at +0, the window's at +0x40 * head + 0x10 or 0x20 (status in bits 31:30,
-    // 2 = finished), cleared so a later modeset doesn't read the last one's. The window writes none where its last
-    // update wrote one, so take the one the last flip didn't use
+    // notifiers: core at +0, window at +0x40 * head + 0x10 or 0x20, bits 31:30 = 2 when done. The window writes none
+    // where its last update wrote one, so use the slot the last flip didn't
     uint32_t wn = hd->wndw_ntfy ^ 0x30;
     vram_wr32(gsp_gpu(d->s), d->ntfy, 0);
     vram_wr32(gsp_gpu(d->s), d->ntfy + wn, 0);
@@ -543,8 +539,8 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
     log_msg("disp: head %d lit, showing %#llx (SOR%u pwr %#x)\n", head, (unsigned long long)fb, sor,
             rd32(gsp_gpu(d->s), 0x61c004 + sor * 0x800));
     if (hdmi) {
-        // SET_HDMI_ENABLE leaves the output on DVI signalling, which sinks may refuse above 165 MHz. HDMI proper goes
-        // on with this and the packet that clears AV mute (hdmiPacketWrite9171, tu102_sor_hdmi_gcp)
+        // SET_HDMI_ENABLE leaves DVI signalling, which sinks may refuse above 165 MHz; CTRL_HDMI and a GCP clearing
+        // AV mute switch to HDMI (hdmiPacketWrite9171, tu102_sor_hdmi_gcp)
         struct gpu *g = gsp_gpu(d->s);
         NV0073_CTRL_SPECIFIC_CTRL_HDMI_PARAMS ch = { .displayId = o->id, .bEnable = 1 };
         if (!rm_control(d->s, d->c.client, DISP_COMMON, NV0073_CTRL_CMD_SPECIFIC_CTRL_HDMI, &ch, sizeof(ch)))
@@ -558,8 +554,7 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
     return 0;
 }
 
-// shows fb (same size and pitch as the modeset's) from the next vblank on, window channel only (wndwc37e_image_set);
-// returns the microseconds until the window's notifier said begun, or -1
+// fb must match the modeset's size and pitch; window channel only (wndwc37e_image_set)
 int disp_flip_queue(struct disp *d, int head, uint64_t fb, uint32_t acquire, unsigned k)
 {
     struct gpu *g = gsp_gpu(d->s);
@@ -589,7 +584,7 @@ int disp_flip_taken(struct disp *d, int head)
     return vram_rd32(gsp_gpu(d->s), d->ntfy + d->head[head].wndw_ntfy) >> 30 != 0;
 }
 
-// written into the output LUT the head isn't reading, then the head pointed at it by a core update of its own
+// written into the output LUT the head isn't reading, then switched with a core update
 int disp_gamma(struct disp *d, int head, const uint16_t *rgb)
 {
     struct gpu *g = gsp_gpu(d->s);
@@ -626,8 +621,7 @@ int disp_gamma(struct disp *d, int head, const uint16_t *rgb)
 #define CURS_MAX 256  // W256_H256, the largest size the head takes
 #define CURS_USER(head) (0x6d8000 + (head) * 0x1000)
 
-// the head's cursor: a PIO channel for its position (no push buffer: nouveau's r535_curs_init) and room in VRAM
-// for its image; after the first modeset
+// PIO channel for position (no push buffer, nouveau's r535_curs_init) and VRAM for images; after the first modeset
 int disp_cursor_init(struct disp *d, int head)
 {
     struct disp_head *hd = &d->head[head];
@@ -652,7 +646,7 @@ int disp_cursor_init(struct disp *d, int head)
 struct curs_plane {
     struct gpu *g;
     uint64_t img;
-    uint64_t window;  // the 64 KB of VRAM PRAMIN shows: set when a pixel is past it, not for every pixel
+    uint64_t window;  // the 64 KB PRAMIN window, moved only when a pixel is past it
 };
 
 static void curs_put(void *ctx, uint32_t index, uint32_t px)
@@ -673,13 +667,11 @@ int disp_cursor_image(struct disp *d, int head, const uint32_t *argb, uint32_t w
     struct disp_head *hd = &d->head[head];
     if (!hd->curs_img || !w || !h || w > CURS_MAX || h > CURS_MAX)
         return -1;
-    // the head scans its image out all the time, and writing one through PRAMIN takes long enough to be caught half
-    // done: the new image goes into the other one, then the head moves
+    // the head scans out constantly and a PRAMIN write is slow enough to be seen half done: write the other image
     hd->curs_back ^= 1;
     int back = hd->curs_back;
     struct curs_plane plane = { g, hd->curs_img + (uint64_t)back * CURS_MAX * CURS_MAX * 4, ~0ull };
-    // the plane is always the head's largest size, so the size class never changes together with the offset; the
-    // image sits in its top left corner with clear pixels around it
+    // plane always at the largest size so the size class never changes with the offset; image top left, clear around
     cursor_pack(curs_put, &plane, CURS_MAX, hd->curs_w[back], hd->curs_h[back], argb, w, h);
     hd->curs_w[back] = w;
     hd->curs_h[back] = h;
@@ -698,8 +690,8 @@ int disp_cursor_image(struct disp *d, int head, const uint32_t *argb, uint32_t w
     return commit(d, head);
 }
 
-// the cursor's top left at (x, y) on the head, which may be off it; two register writes, safe without the lock.
-// With the channel's FIFO full the move is dropped (nouveau's curs507a_space): the next one carries a newer position
+// cursor top left to (x, y), may be off the head; safe without the lock. Dropped when the FIFO is full
+// (nouveau's curs507a_space); the next move carries a newer position
 void disp_cursor_move(struct disp *d, int head, int x, int y)
 {
     struct gpu *g = gsp_gpu(d->s);
@@ -739,8 +731,7 @@ void disp_modeset_fini(struct disp *d)
     d->set_up = 0;
 }
 
-// after a modeset the display engine refused, its channels stay stuck: they go with their RM objects and memory,
-// and the next disp_modeset() sets everything up afresh
+// channels stay stuck after a refused modeset: free them with their RM objects so disp_modeset() starts afresh
 void disp_reset(struct disp *d)
 {
     if (!d->core.pb.cpu)
@@ -773,8 +764,8 @@ void disp_release_channels(struct gpu *g)
     log_msg("disp: %u hardware channels deallocated, core control %#x, state now %#x\n", n, core, st);
 }
 
-// what the EFI firmware is showing (its window 0 is still armed before our modeset), copied into fb scaled to fit
-// and centred, the rest black. -1 if the firmware's window doesn't look like a plain A8R8G8B8 surface.
+// firmware's screen (window 0, still armed before our modeset) into fb, fitted and centred on black; -1 unless it
+// looks like plain A8R8G8B8
 int disp_copy_firmware(struct gpu *g, uint64_t fb, uint32_t pitch, uint32_t w, uint32_t h)
 {
     uint32_t size = rd32(g, 0x690800 + 0x224), params = rd32(g, 0x690800 + 0x22c);

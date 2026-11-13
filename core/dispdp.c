@@ -1,6 +1,5 @@
-// DisplayPort through GSP-RM, after nouveau's r535 DP code and NVIDIA's DisplayPort library: AUX transfers, the
-// sink's capabilities and EDID, the smallest link that carries a mode, its training, and the SST stream's
-// watermark and blanking symbols. GSP-RM does the training itself (NV0073_CTRL_CMD_DP_CTRL); single stream only.
+// DisplayPort through GSP-RM, after nouveau's r535 DP code and NVIDIA's DisplayPort library.
+// GSP-RM does the training itself (NV0073_CTRL_CMD_DP_CTRL); single stream only.
 #include "../nvrm/disp.h"
 #include "../nvrm/gsp.h"
 #include "disp.h"
@@ -42,8 +41,7 @@ int dp_aux_write(struct disp *d, uint32_t id, uint32_t addr, const uint8_t *buf,
     return rm_control(d->s, d->c.client, DISP_COMMON, NV0073_CTRL_CMD_DP_AUXCH_CTRL, &a, sizeof(a)) ? 0 : -1;
 }
 
-// one I2C-over-AUX transfer on the sink's DDC bus; mot leaves the I2C transaction open, no bytes is a bare stop.
-// Reads return how many bytes came back, writes 0.
+// I2C-over-AUX on the DDC bus; mot keeps the transaction open, size 0 is a bare stop. Reads return the bytes, writes 0.
 static int aux_i2c(struct disp *d, uint32_t id, uint32_t addr, int read, int mot, uint8_t *buf, uint32_t size)
 {
     NV0073_CTRL_DP_AUXCH_CTRL_PARAMS a = {
@@ -67,8 +65,8 @@ static int aux_i2c(struct disp *d, uint32_t id, uint32_t addr, int read, int mot
     return (int)n;
 }
 
-// EDID block b: E-DDC segment b / 2 (pointer at 0x30), then 16 bytes at a time from DDC address 0x50, the offset
-// written before each read so a short reply can't leave us out of step with the sink's
+// E-DDC segment b / 2 via 0x30, then 16 bytes at a time from 0x50, offset rewritten each time so short replies can't
+// desync us
 static int edid_block(struct disp *d, uint32_t id, uint32_t b, uint8_t *out)
 {
     uint8_t seg = (uint8_t)(b / 2), sum = 0;
@@ -129,9 +127,8 @@ struct dp_stream {
 
 #define PREC 100000ull  // the fixed point NVIDIA's DisplayPort library works the stream out in
 
-// the SST stream for mode t at 24 bpp on lanes x bw, with 64-symbol transfer units: the watermark, and the
-// symbols left in horizontal and vertical blanking for secondary data (the library's and nouveau's
-// nv50_sor_dp_watermark_sst arithmetic); -1 if the link can't carry the mode
+// SST watermark and blanking symbols for secondary data, t at 24 bpp, 64-symbol TUs (as nv50_sor_dp_watermark_sst);
+// -1 if the link can't carry t
 static int dp_stream(const struct disp *d, const struct disp_mode *t, uint32_t bw, uint32_t lanes, int ef,
                      struct dp_stream *st)
 {
@@ -147,8 +144,7 @@ static int dp_stream(const struct disp *d, const struct disp_mode *t, uint32_t b
         return -1;
     if (wm < least)
         wm = least;
-    // blanking start and end (twice with enhanced framing), VB-ID, Mvid and Maud four times each, and the
-    // padding when the active width doesn't split evenly over the lanes
+    // BS/BE (twice with enhanced framing), VB-ID, Mvid, Maud x4 each, plus padding for widths uneven over the lanes
     uint64_t bits = 3 * 8 * lanes * (ef ? 2 : 1) + 3 * 8 * 4 + (w % lanes ? (lanes - w % lanes) * depth : 0);
     uint64_t min_hblank = bits * PREC / (8 * lanes) * pclk / link / PREC + 12;
     if (min_hblank > htotal - w)
@@ -201,7 +197,7 @@ static int dp_train(struct disp *d, const struct disp_output *o, uint32_t bw, ui
     return 0;
 }
 
-// most lanes at the lowest rate first, as nouveau picks; a config that fails to train gives way to the next
+// most lanes at the lowest rate first, as nouveau; on a training failure try the next
 int disp_dp_link(struct disp *d, int head, uint32_t sor, struct disp_output *o, const struct disp_mode *t)
 {
     struct disp_head *hd = &d->head[head];

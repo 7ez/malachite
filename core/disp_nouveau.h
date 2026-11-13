@@ -1,8 +1,6 @@
 #pragma once
-// head 0 and window 0 as nouveau leaves them armed on this card;
-// replayed before our own methods so nothing we don't set is left at reset values; only offsets that are
-// C67D/C67E methods (tools/check-methods.py), the rest of the armed state isn't ours to send; not the cursor's
-// either (0x209c, 0x20a0), or every modeset would turn the hardware cursor off
+// head 0 and window 0 as nouveau leaves them armed, replayed before our methods so nothing we skip stays at reset
+// values. Only C67D/C67E methods (tools/check-methods.py); cursor 0x209c/0x20a0 left out or modesets hide the cursor.
 static const uint32_t nouveau_head0[][2] = {
     { 0x2004, 0xfc000050 },
     { 0x200c, 0x085e5580 },
