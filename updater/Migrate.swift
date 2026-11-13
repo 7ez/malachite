@@ -22,8 +22,12 @@ func ours(_ path: String) -> Bool {
 
 // the driver itself, not just its app
 func oldDriverInstalled() -> Bool {
-    let paths = ["/Library/GPUBundles/NVMTLDriver.bundle", oldSupportDir] + oldKexts.map { "/Library/Extensions/\($0).kext" }
-    return paths.contains(where: exists)
+    exists(oldSupportDir) || oldBundles().contains(where: exists)
+}
+
+// the old install's kexts and Metal driver; another driver uses some of the same names
+func oldBundles() -> [String] {
+    (["/Library/GPUBundles/NVMTLDriver.bundle"] + oldKexts.map { "/Library/Extensions/\($0).kext" }).filter(ours)
 }
 
 // NVBring.kext is turned off in OpenCore; set once that is done, so a rerun doesn't need the EFI again for it
@@ -91,11 +95,10 @@ func moveToMalachite(efi: String?, steps: Steps, say: Say) throws {
         say("  NVBring.kext off in OpenCore (config.plist backed up to \(configBackup))")
     }
 
-    for k in oldKexts {
-        try steps.remove("/Library/Extensions/\(k).kext")
+    for path in oldBundles() {
+        try steps.remove(path)
     }
     try steps.remove(oldCtl)
-    try steps.remove("/Library/GPUBundles/NVMTLDriver.bundle")
     try steps.remove("/Library/GPUBundles/NVMTLDriver.bundle.new")
     if let efi {
         try steps.remove("\(efi)/EFI/OC/Kexts/NVBring.kext")

@@ -377,8 +377,7 @@ func uninstall(_ o: UninstallOptions, say: @escaping Say) -> Bool {
         // an install from before the rename, if the move to Malachite never finished
         let old = oldDriverInstalled()
         if old {
-            paths += ["/Library/GPUBundles/NVMTLDriver.bundle", oldSupportDir, "/Applications/NVIDIA Driver.app"]
-            paths += oldKexts.map { "/Library/Extensions/\($0).kext" }
+            paths += [oldSupportDir, "/Applications/NVIDIA Driver.app"] + oldBundles()
         }
         for path in paths {
             try steps.remove(path)
