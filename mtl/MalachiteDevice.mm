@@ -5242,11 +5242,8 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
     return true;
 }
 
-// Attachment n sampled as a texture by a draw that draws to it (CoreAnimation reads the backdrop so): the draw
-// samples a copy of it as it was before the draw. Otherwise a pixel reads neighbours the same draw has already
-// covered, and a quad's second triangle samples what its first drew, a streak along the diagonal. A refraction
-// samples any distance away, so the pass's first such draw copies all of the attachment and later ones what the
-// draws since have covered (their scissors).
+// A draw sampling its own target (CoreAnimation's backdrop) reads a copy, or a quad's second triangle samples its
+// first, a streak along the diagonal. Refraction reads any distance away, so later copies cover what draws touched since.
 - (void)attachment:(unsigned)n copy:(unsigned int *)header of:(const struct nvgpu_draw &)d
 {
     struct nvgpu_target ct = malachite_target(d, n);
@@ -5278,7 +5275,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
     if (copy) {
         struct nvgpu_draw c = {};
         c.target = to;
-        c.pitch = ct.blocklinear ? 0 : pitch;  // a block-linear target has none, and the scratch's 64-byte rows aren't 128
+        c.pitch = ct.blocklinear ? 0 : pitch;  // the scratch's 64-byte rows aren't 128
         c.width = ct.width;
         c.height = ct.height;
         c.target_blocklinear = ct.blocklinear;
@@ -5318,8 +5315,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
     malachite_record(_cb, MALACHITE_CMD_COPY_2D, &c, sizeof(c));
 }
 
-// the trace: every colour attachment as this draw left it, copied out of where it's drawn and saved once the GPU
-// is done, raw after a one-line header
+// raw after a one-line header
 - (void)snapshot:(const struct nvgpu_draw &)d suffix:(const char *)suffix
 {
     static int draws;
@@ -5330,7 +5326,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
         struct nvgpu_target ct = malachite_target(d, i);
         uint32_t bpp = tex_format_info((enum tex_format)_formats[i]).bytes, bytes = ct.width * bpp;
         uint32_t h = ct.height, w = ct.width;
-        // only the rect copied when there is one: a frame of whole-target copies runs the machine out of memory
+        // a frame of whole-target copies runs the machine out of memory
         const uint32_t *r = malachite_snap_rect;
         bool cut = r[2] && ct.width >= r[0] + r[2] && ct.height >= r[1] + r[3];
         uint32_t keep = cut ? r[2] * bpp : bytes, rows = cut ? r[3] : h, pitch = (keep + 255) & ~255u;
@@ -5363,9 +5359,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
     }
 }
 
-// The recorder. A recording is a directory of raw files and a manifest.txt of key=value lines naming them, written
-// last; tools/mtl/mtlplay.m describes the keys. A buffer is recorded from its offset to its end (16 MB at most),
-// and a process stops recording once it has written 2 GB (a dispatch's buffers are whole, 256 MB each at most).
+// Recording keys are described in tools/mtl/mtlplay.m. A process stops recording after 2 GB.
 enum { MALACHITE_REC_BUFFER = 16 << 20 };
 
 static bool malachite_rec_reserve(uint64_t bytes)
@@ -5377,8 +5371,7 @@ static bool malachite_rec_reserve(uint64_t bytes)
     return false;
 }
 
-// lines rows of bytes, pitch apart from src or block-linear there (one-GOB blocks, rows high) when rows isn't 0,
-// copied on the GPU where the command buffer has got to and written packed to path once it's done
+// copied on the GPU in command order, written packed once it's done
 static bool malachite_rec_copy(id cb, NSString *path, uint64_t src, uint32_t pitch, uint32_t rows, uint32_t bytes,
                            uint32_t lines)
 {
@@ -5402,7 +5395,7 @@ static bool malachite_rec_copy(id cb, NSString *path, uint64_t src, uint32_t pit
     return true;
 }
 
-// size bytes of memory at src, likewise
+// likewise
 static bool malachite_rec_bytes(id cb, NSString *path, uint64_t src, uint32_t size)
 {
     if (!size || !malachite_rec_reserve(size))
@@ -5421,14 +5414,14 @@ static bool malachite_rec_bytes(id cb, NSString *path, uint64_t src, uint32_t si
     return true;
 }
 
-// a stage's function, with the AIR it was compiled from and its linked functions' ([air, [linked], [names]])
+// [air, [linked], [names]]
 static void malachite_rec_function(id cb, NSString *dir, NSMutableString *m, NSString *stage, id<MTLFunction> fn,
                                NSArray *air)
 {
     if (!fn)
         return;
     [m appendFormat:@"%@.name=%@\n", stage, fn.name];
-    // Metal hands the driver a specialised function's AIR with the values in, so these are only what it declares
+    // a specialised function's AIR already has the values in, so these are only declarations
     for (MTLFunctionConstant *c in fn.functionConstantsDictionary.allValues)
         [m appendFormat:@"%@.constant.%lu=%@,%lu,%d\n", stage, (unsigned long)c.index, c.name, (unsigned long)c.type,
                         c.required];
@@ -5451,7 +5444,7 @@ static void malachite_rec_function(id cb, NSString *dir, NSMutableString *m, NSS
     }];
 }
 
-// whether a stage's shader reads the [[buffer(n)]], [[texture(n)]] or [[sampler(n)]] slot
+// whether the stage reads the slot
 static bool malachite_reads(const struct nvk_header *h, uint8_t kind, unsigned slot)
 {
     for (uint32_t i = 0; i < h->nargs; i++)
@@ -5460,7 +5453,7 @@ static bool malachite_reads(const struct nvk_header *h, uint8_t kind, unsigned s
     return false;
 }
 
-// the format whose layout the GPU keeps f's pixels in (see malachite_format), which a replay has to use
+// the layout the GPU keeps f in (see malachite_format), which a replay has to use
 static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
 {
     switch (f) {
@@ -5472,7 +5465,7 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
     }
 }
 
-// colour attachment i, all of it, where the pass draws it (its shadow, if it has one)
+// where the pass draws it, shadow included
 - (bool)record:(NSString *)path attachment:(unsigned)i of:(const struct nvgpu_draw &)d
 {
     struct nvgpu_target ct = malachite_target(d, i);
@@ -5505,7 +5498,7 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
     if (t->_swizzled)
         [m appendFormat:@"%@.swizzle=%u,%u,%u,%u\n", key, t->_swizzle[0], t->_swizzle[1], t->_swizzle[2],
                         t->_swizzle[3]];
-    // an attachment's own memory and level, which the draw reads as it was before it (see attachment:copy:)
+    // the draw reads its own attachment as it was before (see attachment:copy:)
     uint64_t at = [(MTLIOAccelBuffer *)t->_backing gpuAddress] + t->_offset;
     for (unsigned n = 0; n < 8; n++)
         if (_attached[n] && _attached[n]->_backing &&
@@ -5536,8 +5529,7 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
     }
 }
 
-// everything the draw reads as it is where the command buffer has got to, into dir; the attachments as the draw
-// leaves them and the manifest follow it (record:manifest:after:)
+// the attachments after the draw and the manifest come from record:manifest:after:
 - (void)record:(NSString *)dir
       manifest:(NSMutableString *)m
           draw:(const struct nvgpu_draw &)d
@@ -5604,7 +5596,7 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
                         i, (unsigned long)malachite_stored_format(f), i, (unsigned long)f, i,
                         tex_format_info((enum tex_format)_formats[i]).bytes, i, (unsigned long)ca.loadAction, i,
                         (unsigned long)ca.storeAction, i, (unsigned long)ca.level, i, (unsigned long)ca.slice];
-        // the pass's clear, which this draw does first: the targets before it are as the pass found them
+        // this draw does the pass's clear first, so the targets before it are as the pass found them
         MTLClearColor c = ca.clearColor;
         if (i ? d.more[i - 1].clear : d.clear)
             [m appendFormat:@"attachment.%u.clear=%.9g,%.9g,%.9g,%.9g\n", i, c.red, c.green, c.blue, c.alpha];
@@ -5653,7 +5645,7 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
                     d.fill_lines, d.depth_clamp, d.blend_const[0], d.blend_const[1], d.blend_const[2],
                     d.blend_const[3], d.stencil_ref, d.depth_bias[0], d.depth_bias[1], d.depth_bias[2]];
 
-    // what the shaders read: the vertex buffers the descriptor streams from too
+    // vertex buffers the descriptor streams from too
     for (unsigned b = 0; b < 31; b++) {
         bool stream = false;
         for (unsigned s = 0; s < 16; s++)
@@ -5797,8 +5789,7 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
          index:index offset:offset type:indexType];
 }
 
-// what the pass's first draw, or its clears when it has none, starts from: the shadows' contents, and a depth
-// texture's apart from its stencil texture
+// before the first draw, or the clears of a pass with none
 - (void)loadAttachments
 {
     for (unsigned i = 0; i < 8; i++)
@@ -5833,8 +5824,7 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
     for (unsigned i = 0; i < 2; i++)
         if (_zresolve[i].to && _zattached && (_drawn || cleared))
             malachite_zresolve(_cb, _zattached, &_zresolve[i]);
-    // the trace: each attachment as the pass left it, once the GPU is done, raw after a one-line header (depth and
-    // stencil as attachment 9: block-linear, one-GOB blocks, rows padded to 64 bytes)
+    // depth and stencil as attachment 9, block-linear with rows padded to 64 bytes
     static int passes;
     int n = passes;
     if (malachite_trace)
@@ -5878,9 +5868,7 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
 }
 @end
 
-// An MTLVertexFormat as SET_VERTEX_ATTRIBUTE_A's component widths (26:21), numerical type (29:27) and R/B swap
-// (31) fields; 0 for one we don't handle. as_float: read by a shader as floats, which integers convert to by value
-// (Apple's GL renderer passes GL's attributes that aren't normalised so).
+// SET_VERTEX_ATTRIBUTE_A fields. as_float converts integers by value, as Apple's GL renderer passes unnormalised ones.
 static uint32_t malachite_vertex_format(MTLVertexFormat f, bool as_float)
 {
     enum { SNORM = 1, UNORM = 2, SINT = 3, UINT = 4, USCALED = 5, SSCALED = 6, FLOAT = 7 };
@@ -5940,15 +5928,14 @@ static uint32_t malachite_vertex_format(MTLVertexFormat f, bool as_float)
     case MTLVertexFormatUInt1010102Normalized: w = A2B10G10R10, t = UNORM; break;
     case MTLVertexFormatInt1010102Normalized: w = A2B10G10R10, t = SNORM; break;
     case MTLVertexFormatFloatRG11B10: w = B10G11R11, t = FLOAT; break;
-    default: return 0;  // RGB9E5: the fetch unit has no such format
+    default: return 0;  // the fetch unit has no RGB9E5
     }
     if (as_float && (t == SINT || t == UINT))
         t = t == SINT ? SSCALED : USCALED;
     return w << 21 | t << 27;
 }
 
-// A parallel render pass as its sub-encoders one after another, in the order they were made (the order Metal runs
-// them in): the first loads as the pass says, the rest load what the one before stored, and all but the last store.
+// Sub-encoders run in creation order, as Metal runs them; each loads what the one before stored.
 @interface MalachiteParallelRenderCommandEncoder : NSObject <MTLParallelRenderCommandEncoder>
 @property (copy, atomic) NSString *label;
 @end
@@ -6051,29 +6038,23 @@ static MTLStoreAction malachite_stored(MTLStoreAction action)
 @end
 
 
-// What the CPU changed in Managed buffers goes to their VRAM copies in a command buffer committed just before cb on
-// its queue: WindowServer's vertices are Managed, so this is on the way of every frame and doesn't wait. That can't
-// work for a cb enqueued already, which runs first, or on a queue short of command buffers, where asking for one more
-// blocks if the app holds them all; those go through a queue of ours, waited for. The caller holds a lock across
-// this, so the copy is in its queue before another thread's commit, and a commit on another queue lets it finish: it
-// has to see the data, and a copy arriving later would overwrite what the GPU has written there since.
-//
-// The wait is for the copy alone, which the last copy of each batch reports by writing its number into a word here. A
-// command buffer's completion can't say that: it comes in order, behind whatever draws were queued before it.
+// WindowServer's vertices are Managed, so the upload goes on cb's own queue without waiting. A cb already enqueued, or
+// a queue the app has drained of command buffers, uses our queue and waits. The caller's lock keeps a later copy from
+// overwriting what the GPU wrote since. The wait watches a word the batch's last copy writes, as completion comes in
+// order behind earlier draws.
 static uint32_t malachite_upload_sent;
 static id<MTLBuffer> malachite_upload_ack;
 
 static void malachite_upload_wait(void)
 {
     volatile uint32_t *done = (volatile uint32_t *)malachite_upload_ack.contents;
-    // bounded: a command buffer ahead of the copy can be waiting for an event this commit is to signal
+    // bounded, as a command buffer ahead may wait on an event this commit signals
     for (int i = 0; i < 5000 && (int32_t)(*done - malachite_upload_sent) < 0; i++)
         usleep(20);
 }
 
-// Whether the queue has a command buffer to spare now. Asking for one waits on the queue's semaphore with no timeout,
-// and WindowServer can hold every one of its own until the one being committed is through: its main thread hung there
-// for good. Taken and given straight back, so another thread can still take it first, which only delays this one.
+// Asking for a command buffer waits with no timeout, and WindowServer's main thread hung for good holding all of its
+// own. Given straight back; losing it to another thread only delays this one.
 static bool malachite_queue_has_room(id<MTLCommandQueue> queue)
 {
     static Ivar ivar;
@@ -6147,7 +6128,7 @@ static void malachite_upload_managed(MalachiteCommandBuffer *cb)
         malachite_upload_wait();
 }
 
-// the copies back of what the command buffer's OpenCL kernels wrote (MalachiteBuffer _writeback), after them
+// see MalachiteBuffer _writeback
 static void malachite_write_back(MalachiteCommandBuffer *cb)
 {
     for (MalachiteBuffer *b in cb->_writeback) {
@@ -6163,7 +6144,7 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
 }
 
 @implementation MalachiteCommandBuffer
-// the trace: a command buffer whose completion comes late, from commit to its completed handlers
+// late completions, from commit to the completed handlers
 - (void)commit
 {
     malachite_write_back(self);
@@ -6183,8 +6164,7 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
     [super commit];
 }
 
-// The base writes its own commands for these and ends the storage's segment, which left ours to end a segment that
-// was gone (Chromium's GPU process crashed at commit): the draws before go first, in a segment closed here.
+// The base ends the segment for its own commands, leaving ours to end one that was gone (Chromium crashed at commit).
 - (void)encodeSignalEvent:(id<MTLEvent>)event value:(uint64_t)value
 {
     malachite_run_flush(self);
@@ -6199,8 +6179,8 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
     [super encodeWaitForEvent:event value:value];
 }
 
-// WindowServer's every frame. The base enqueues before it commits, which would send the upload to the queue that's
-// waited for: until the GPU has finished what other processes queued, a game's next frames among them.
+// WindowServer's every frame. The base enqueues first, which would send the upload to our waited queue, behind other
+// processes' work.
 - (void)commitAndWaitUntilSubmitted
 {
     malachite_write_back(self);
@@ -6210,14 +6190,12 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
         malachite_upload_managed(self);
     }
     [super commitAndWaitUntilSubmitted];
-    // WindowServer hands a capture to its client once this returns, and the client's CPU lock doesn't wait for our
-    // GPU (only for Apple's): it read the surface's previous frame, or one half drawn
+    // the capture's client locks the surface without waiting for our GPU, and read half-drawn frames
     if (_writes_capture)
         [self waitUntilCompleted];
 }
 
-// A drawable goes to WindowServer once its draws are done, not once they're scheduled. WindowServer reads it with no
-// wait of its own, so one sent early would show half drawn, and the frame after it would replace it on screen.
+// WindowServer reads a drawable without waiting, so it goes once its draws are done, not scheduled.
 - (void)presentDrawable:(id<MTLDrawable>)drawable
 {
     if (opengl_renderer) {
@@ -6266,8 +6244,7 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
     return [self computeCommandEncoder];
 }
 
-// The base's would make its own encoders, whose segments in the command storage ours don't expect: Chromium's GPU
-// process crashed at its first commit. Counter sample attachments are dropped: the device samples no counters.
+// The base's encoders leave segments ours don't expect (Chromium crashed at its first commit). We sample no counters.
 - (id)computeCommandEncoderWithDescriptor:(MTLComputePassDescriptor *)descriptor
 {
     return [self computeCommandEncoder];
@@ -6294,7 +6271,7 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
     return [[MalachiteParallelRenderCommandEncoder alloc] initWithCommandBuffer:self descriptor:descriptor];
 }
 
-// sparse textures aren't supported, so there's no resource state to encode
+// no sparse textures, so no resource state
 - (id)resourceStateCommandEncoder
 {
     return nil;
@@ -6316,9 +6293,7 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
 }
 @end
 
-// MTLAddDevice asserts the class conformsToProtocol: both MTLDevice (public) and MTLDeviceSPI (private). The real
-// superclass implements the methods at runtime; the formal conformance is what the assert checks (the runtime matches
-// protocols by name). MTLDeviceSPI isn't in the public SDK, so declare it inheriting MTLDevice.
+// MTLAddDevice asserts conformance to the private MTLDeviceSPI, which the runtime matches by name.
 @protocol MTLDeviceSPI <MTLDevice>
 @end
 
@@ -6326,8 +6301,7 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor heap:(MalachiteHeap *)heap offset:(NSUInteger)offset;
 @end
 
-// a resource's range of a heap: whole pages. An image needs its GOBs on 512 bytes, as its layers and levels are
-// already, and nothing in a heap's memory takes a PTE kind (see newImage:layout:placed:).
+// Whole pages; images need 512-byte GOBs, and heap memory takes no PTE kind (see newImage:layout:placed:).
 static MTLSizeAndAlign malachite_range_in_heap(uint64_t bytes)
 {
     NSUInteger page = vm_page_size;
@@ -6427,7 +6401,7 @@ static MTLSizeAndAlign malachite_range_in_heap(uint64_t bytes)
 {
 }
 
-// anything else the block answers for, as the IOAccel resource underneath this
+// the block is the IOAccel resource underneath
 - (id)forwardingTargetForSelector:(SEL)selector
 {
     return _heap->_block;
@@ -6519,7 +6493,7 @@ static MTLSizeAndAlign malachite_range_in_heap(uint64_t bytes)
 
 - (void)giveBack:(NSUInteger)offset size:(NSUInteger)size
 {
-    if (_desc.type == MTLHeapTypePlacement)  // nothing was taken
+    if (_desc.type == MTLHeapTypePlacement)  // nothing was tracked
         return;
     os_unfair_lock_lock(&_lock);
     _free += size;
@@ -6536,7 +6510,7 @@ static MTLSizeAndAlign malachite_range_in_heap(uint64_t bytes)
     os_unfair_lock_unlock(&_lock);
 }
 
-// the free range [offset, offset + size) taken out of whichever hole holds it; false if no hole does
+// false if no hole holds [offset, offset + size)
 - (bool)take:(NSUInteger)offset size:(NSUInteger)size
 {
     auto h = _holes.upper_bound(offset);
@@ -6555,8 +6529,7 @@ static MTLSizeAndAlign malachite_range_in_heap(uint64_t bytes)
     return true;
 }
 
-// A resource's range of the block: in a placement heap at offset, which must be aligned as the range is; in an
-// automatic one at offset if that's free, else in the first hole it fits aligned. nil when it doesn't fit.
+// a placement heap's offset must be aligned; an automatic heap tries offset, then the first hole that fits
 - (MalachiteHeapBuffer *)place:(NSUInteger)length
                           size:(MTLSizeAndAlign)range
                        options:(MTLResourceOptions)options
