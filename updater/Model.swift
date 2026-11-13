@@ -179,7 +179,7 @@ final class Model: ObservableObject {
             step("Checking download")
             let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize
             guard size == m.size, try sha256(of: file) == m.sha256 else {
-                throw UpdateError.failed("Download is corrupt, not installed.")
+                throw UpdateError.failed("Download is corrupt, nothing installed. Install again to download it afresh.")
             }
             step("Unpacking")
             try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
