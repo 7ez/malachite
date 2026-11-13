@@ -165,6 +165,87 @@ static unsigned warps(unsigned regs)
     return w < 48 ? w : 48;
 }
 
+// The stage compiled into k, and again without the passes that can cost it warps, keeping what runs the most.
+// airc_batched says whether the one kept has fetches moved.
+static int compile_best(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct airc_source *linked, unsigned nlinked,
+                        const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
+                        const struct airc_constant *fc, unsigned nfc, int print_ir, struct airc_kernel *k)
+{
+    g_error = k->error;
+    g_error_size = sizeof(k->error);
+    airc_no_unroll = airc_unrolled = 0;
+    airc_no_texvec = airc_texvec_shared = 0;
+    int ret = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, 0, k);
+    int batched = airc_batched;
+    // an unrolled loop's copies hold more values at once: compiled again with its loops as they were, that is kept
+    // if the unrolled one runs fewer than 7/8 of its warps. A dispatch of a few thousand threads has a handful of
+    // warps on each SM whatever the registers, and gains from each warp having more loads in flight.
+    if (!ret && airc_unrolled) {
+        struct airc_kernel *r = calloc(1, sizeof(*r));
+        char *error = g_error;
+        g_error = r->error;
+        g_error_size = sizeof(r->error);
+        airc_no_unroll = 1;
+        int again = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, 0, r);
+        g_error = error;
+        g_error_size = sizeof(k->error);
+        if (!again && 8 * warps(k->h.reg_count) < 7 * warps(r->h.reg_count)) {
+            free(k->sass);
+            *k = *r;
+            batched = airc_batched;
+        } else {
+            free(r->sass);
+            airc_no_unroll = 0;
+        }
+        free(r);
+    }
+    // a shader that needs many registers runs few warps at a time, which leaves memory waits unhidden: compiled
+    // again with values made where they are read, it is kept if that runs more warps (or as many in less code)
+    if (ret || k->h.reg_count > 40) {
+        struct airc_kernel *r = calloc(1, sizeof(*r));
+        char *error = g_error;
+        g_error = r->error;
+        g_error_size = sizeof(r->error);
+        int again = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, 1, r);
+        g_error = error;
+        g_error_size = sizeof(k->error);
+        if (!again && (ret || warps(r->h.reg_count) > warps(k->h.reg_count) ||
+                       (warps(r->h.reg_count) == warps(k->h.reg_count) && r->h.sass_size < k->h.sass_size))) {
+            free(k->sass);
+            *k = *r;
+            ret = 0;
+            batched = airc_batched;
+        } else {
+            free(r->sass);
+        }
+        free(r);
+    }
+    // texture ops sharing operand registers hold them longer, which can cost a register granule: compiled again
+    // with copies, both with and without remat, and kept if that runs more warps (40 registers or fewer run all 48)
+    for (int again_remat = 0; again_remat < 2 && !ret && airc_texvec_shared && k->h.reg_count > 40; again_remat++) {
+        struct airc_kernel *r = calloc(1, sizeof(*r));
+        char *error = g_error;
+        g_error = r->error;
+        g_error_size = sizeof(r->error);
+        airc_no_texvec = 1;
+        int again = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, again_remat, r);
+        airc_no_texvec = 0;
+        g_error = error;
+        g_error_size = sizeof(k->error);
+        if (!again && warps(r->h.reg_count) > warps(k->h.reg_count)) {
+            free(k->sass);
+            *k = *r;
+            batched = airc_batched;
+        } else {
+            free(r->sass);
+        }
+        free(r);
+    }
+    airc_no_unroll = airc_no_texvec = 0;
+    airc_batched = batched;
+    return ret;
+}
+
 int airc_compile(const void *air, size_t len, const struct airc_constant *fc, unsigned nfc, int print_ir,
                  struct airc_kernel *k)
 {
@@ -196,72 +277,25 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
             LLVMDisposeMemoryBuffer(mb);
             return -1;
         }
-    airc_no_unroll = airc_unrolled = 0;
-    airc_no_texvec = airc_texvec_shared = 0;
     airc_samples = samples;
-    int ret = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, 0, k);
-    // an unrolled loop's copies hold more values at once: compiled again with its loops as they were, that is kept
-    // if the unrolled one runs fewer than 7/8 of its warps. A dispatch of a few thousand threads has a handful of
-    // warps on each SM whatever the registers, and gains from each warp having more loads in flight.
-    if (!ret && airc_unrolled) {
+    int ret = compile_best(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, k);
+    // fetches started together hold their results longer, which can cost a register granule: all compiled again
+    // with them as they come, which is kept if that runs more warps
+    if (!ret && airc_batched && k->h.reg_count > 40) {
         struct airc_kernel *r = calloc(1, sizeof(*r));
-        char *error = g_error;
-        g_error = r->error;
-        g_error_size = sizeof(r->error);
-        airc_no_unroll = 1;
-        int again = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, 0, r);
-        g_error = error;
-        g_error_size = sizeof(k->error);
-        if (!again && 8 * warps(k->h.reg_count) < 7 * warps(r->h.reg_count)) {
-            free(k->sass);
-            *k = *r;
-        } else {
-            free(r->sass);
-            airc_no_unroll = 0;
-        }
-        free(r);
-    }
-    // a shader that needs many registers runs few warps at a time, which leaves memory waits unhidden: compiled
-    // again with values made where they are read, it is kept if that runs more warps (or as many in less code)
-    if (ret || k->h.reg_count > 40) {
-        struct airc_kernel *r = calloc(1, sizeof(*r));
-        char *error = g_error;
-        g_error = r->error;
-        g_error_size = sizeof(r->error);
-        int again = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, 1, r);
-        g_error = error;
-        g_error_size = sizeof(k->error);
-        if (!again && (ret || warps(r->h.reg_count) > warps(k->h.reg_count) ||
-                       (warps(r->h.reg_count) == warps(k->h.reg_count) && r->h.sass_size < k->h.sass_size))) {
-            free(k->sass);
-            *k = *r;
-            ret = 0;
-        } else {
-            free(r->sass);
-        }
-        free(r);
-    }
-    // texture ops sharing operand registers hold them longer, which can cost a register granule: compiled again
-    // with copies, both with and without remat, and kept if that runs more warps (40 registers or fewer run all 48)
-    for (int again_remat = 0; again_remat < 2 && !ret && airc_texvec_shared && k->h.reg_count > 40; again_remat++) {
-        struct airc_kernel *r = calloc(1, sizeof(*r));
-        char *error = g_error;
-        g_error = r->error;
-        g_error_size = sizeof(r->error);
-        airc_no_texvec = 1;
-        int again = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, again_remat, r);
-        airc_no_texvec = 0;
-        g_error = error;
-        g_error_size = sizeof(k->error);
-        if (!again && warps(r->h.reg_count) > warps(k->h.reg_count)) {
+        airc_batch = 0;
+        if (!compile_best(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, r) &&
+            warps(r->h.reg_count) > warps(k->h.reg_count)) {
             free(k->sass);
             *k = *r;
         } else {
             free(r->sass);
         }
         free(r);
+        airc_batch = 4;
+        g_error = k->error;
+        g_error_size = sizeof(k->error);
     }
-    airc_no_unroll = airc_no_texvec = 0;
     for (unsigned i = 0; i < nlinked; i++) {
         LLVMDisposeModule(lmod[i]);
         LLVMDisposeMemoryBuffer(lmb[i]);

@@ -2917,6 +2917,209 @@ static void loads_first(struct ir_func *f)
     free(ok);
 }
 
+// Fetches left where they're read get the registers the one before was just read from, so each waits alone. Each
+// goes up instead, with what its address takes, to just after the one before, while at most airc_batch are waiting
+// and the block's peak of live registers holds; never past anything that may change what it reads.
+int airc_batch = 4, airc_batched;
+
+static int batchable(const struct ir_val *v)
+{
+    return v->op == IR_TEX || v->op == IR_LDG;
+}
+
+static int movable(const struct ir_val *v)
+{
+    return v->op != IR_PHI && (pure(v) || v->op == IR_IPA || (v->op == IR_ALD && !(v->aux & IR_ATTR_OUTPUT)));
+}
+
+// the load a value reads, through IR_PROJ
+static struct ir_val *load_read(struct ir_val *s)
+{
+    s = s && s->op == IR_PROJ ? s->src[0] : s;
+    return s && batchable(s) ? s : NULL;
+}
+
+// per value of b: how many fetches it reads first (reads), and how many fetches before it wait to be read there
+// (pend). One read only in other blocks holds its registers whatever the order, and isn't counted.
+static void count_pending(struct ir_block *b, int *reads, int *pend, char *seen)
+{
+    for (struct ir_val *v = b->first; v; v = v->next)
+        seen[v->id] = 0;
+    for (struct ir_val *v = b->first; v; v = v->next) {
+        reads[v->id] = 0;
+        if (v->op != IR_PROJ)
+            for (unsigned i = 0; i < v->nsrc; i++) {
+                struct ir_val *l = load_read(v->src[i]);
+                if (l && l->block == b && !seen[l->id]) {
+                    seen[l->id] = 1;
+                    reads[v->id]++;
+                }
+            }
+    }
+    int n = 0;
+    for (struct ir_val *v = b->first; v; v = v->next) {
+        pend[v->id] = n;
+        n += (batchable(v) && seen[v->id]) - reads[v->id];
+    }
+}
+
+// the registers a value holds, roughly: a wide load's and a texture op's are its IR_PROJs'
+static int regs_of(const struct ir_val *v)
+{
+    if (v->type == IR_VOID || v->op == IR_CONST || v->op == IR_UNDEF || (v->op == IR_CBUF && !v->nsrc))
+        return 0;
+    return v->type == IR_I64 ? 2 : 1;
+}
+
+// the registers live just before each value of b (pr, by id), from its values' last reads in it: one read in
+// another block (out) is live to the end. Returns the most.
+static int block_pressure(struct ir_block *b, const char *out, int *pr, int *pos, int *last, int *stamp, int *diff,
+                          struct ir_val **before, int mark)
+{
+    int n = 0, nbefore = 0;
+    for (struct ir_val *v = b->first; v; v = v->next) {
+        pos[v->id] = n++;
+        stamp[v->id] = mark;
+        last[v->id] = -1;
+    }
+    for (struct ir_val *v = b->first; v; v = v->next)
+        for (unsigned i = 0; i < v->nsrc; i++) {
+            struct ir_val *s = v->src[i];
+            if (!s)
+                continue;
+            if (stamp[s->id] != mark) {  // made before the block
+                stamp[s->id] = mark;
+                before[nbefore++] = s;
+            }
+            last[s->id] = pos[v->id];
+        }
+    memset(diff, 0, (n + 2) * sizeof(*diff));
+    for (struct ir_val *v = b->first; v; v = v->next) {
+        int end = out[v->id] ? n : last[v->id];
+        if (end > pos[v->id]) {
+            diff[pos[v->id] + 1] += regs_of(v);
+            diff[end + 1] -= regs_of(v);
+        }
+    }
+    for (int i = 0; i < nbefore; i++) {
+        diff[0] += regs_of(before[i]);
+        diff[last[before[i]->id] + 1] -= regs_of(before[i]);
+    }
+    int live = 0, most = 0;
+    struct ir_val *v = b->first;
+    for (int k = 0; k < n; k++, v = v->next) {
+        live += diff[k];
+        pr[v->id] = live;
+        most = live > most ? live : most;
+    }
+    return most;
+}
+
+static void batch_loads(struct ir_func *f)
+{
+    enum { MAX_MOVED = 32 };
+    airc_batched = 0;
+    if (!airc_batch || airc_pass_off("AIRC_NOBATCH"))
+        return;
+    int n = 0;
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            if (v->id >= n)
+                n = v->id + 1;
+    int *reads = malloc(n * sizeof(*reads)), *pend = malloc(n * sizeof(*pend)), *pr = malloc(n * sizeof(*pr));
+    int *pos = malloc(n * sizeof(*pos)), *last = malloc(n * sizeof(*last)), *stamp = calloc(n, sizeof(*stamp));
+    int *diff = malloc((n + 2) * sizeof(*diff)), marks = 0;
+    struct ir_val **before = malloc(n * sizeof(*before));
+    char *seen = malloc(n), *need = calloc(n, 1), *out = calloc(n, 1);
+    for (struct ir_block *b = f->entry; b; b = b->next)
+        for (struct ir_val *v = b->first; v; v = v->next)
+            for (unsigned i = 0; i < v->nsrc; i++)
+                if (v->src[i] && (v->src[i]->block != b || v->op == IR_PHI))
+                    out[v->src[i]->id] = 1;
+    for (struct ir_block *b = f->entry; b; b = b->next) {
+        if (b->dead || b->unrolled == 2)
+            continue;
+        count_pending(b, reads, pend, seen);
+        int budget = block_pressure(b, out, pr, pos, last, stamp, diff, before, ++marks);
+        struct ir_val *prev = NULL;
+        for (struct ir_val *v = b->first, *next; v; v = next) {
+            next = v->next;
+            if (!batchable(v))
+                continue;
+            int extra = regs_of(v);
+            while (next && next->op == IR_PROJ && next->src[0] == v) {
+                extra += regs_of(next);
+                next = next->next;
+            }
+            struct ir_val *moved[MAX_MOVED];
+            int nmoved = 0, waiting = pend[v->id];
+            for (unsigned i = 0; i < v->nsrc; i++)
+                if (v->src[i])
+                    need[v->src[i]->id] = 1;
+            struct ir_val *stop = v->prev;
+            for (; stop && stop != prev; stop = stop->prev) {
+                waiting += reads[stop->id];
+                if (waiting >= airc_batch || stop->op == IR_PHI || stop->op == IR_PARAM || stop->op == IR_BAR ||
+                    stop->op == IR_CALL || stop->op == IR_KILL)
+                    break;
+                int sp = store_space(stop);
+                if (sp && sp == load_space(v) && !(v->op == IR_LDG && g_readonly_load[v->id]) &&
+                    !(v->op == IR_LDG && stop->op == IR_STG && apart(v, stop)))
+                    break;
+                if (!need[stop->id]) {
+                    if (pr[stop->id] + extra > budget)
+                        break;
+                    continue;
+                }
+                if (!movable(stop) || nmoved == MAX_MOVED)
+                    break;
+                moved[nmoved++] = stop;
+                extra += regs_of(stop);
+                for (unsigned i = 0; i < stop->nsrc; i++)
+                    if (stop->src[i])
+                        need[stop->src[i]->id] = 1;
+            }
+            for (unsigned i = 0; i < v->nsrc; i++)
+                if (v->src[i])
+                    need[v->src[i]->id] = 0;
+            for (int i = 0; i < nmoved; i++) {
+                need[moved[i]->id] = 0;
+                for (unsigned j = 0; j < moved[i]->nsrc; j++)
+                    if (moved[i]->src[j])
+                        need[moved[i]->src[j]->id] = 0;
+            }
+            prev = v;
+            struct ir_val *at = stop ? stop->next : b->first;
+            while (nmoved && at == moved[nmoved - 1]) {
+                at = at->next;
+                nmoved--;
+            }
+            if (at == v)
+                continue;
+            for (int i = nmoved; i--;)
+                link_before(moved[i], at);
+            for (struct ir_val *x = v, *after; x != next; x = after) {
+                after = x->next;
+                link_before(x, at);
+            }
+            airc_batched = 1;
+            count_pending(b, reads, pend, seen);
+            block_pressure(b, out, pr, pos, last, stamp, diff, before, ++marks);
+        }
+    }
+    free(reads);
+    free(pend);
+    free(pr);
+    free(pos);
+    free(last);
+    free(stamp);
+    free(diff);
+    free(before);
+    free(seen);
+    free(need);
+    free(out);
+}
+
 // v, moved to the start of the entry block, ahead of any use
 static void to_entry_start(struct ir_func *f, struct ir_val *v)
 {
@@ -5249,6 +5452,7 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
     find_readonly_loads(f);
     drop_overwritten_stores(f);
     loads_first(f);
+    batch_loads(f);
     plan_regions(f);
     find_fused_compares(f);
     g_no_mods = airc_pass_off("AIRC_NOMODS");

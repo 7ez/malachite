@@ -68,6 +68,9 @@ void airc_opt(struct ir_func *f);
 extern int airc_no_unroll, airc_unrolled;
 // texture ops share operand registers (airc_back) unless airc_no_texvec is set; airc_texvec_shared says one did
 extern int airc_no_texvec, airc_texvec_shared;
+// airc_back starts up to airc_batch of a block's fetches before their results are read (0: as they come);
+// airc_batched says whether it moved one
+extern int airc_batch, airc_batched;
 // the raster sample count of the pipeline a fragment function is compiled for
 extern unsigned airc_samples;
 // a local array that is only a copy of read-only memory, read from that memory instead; 1 if it changed f (which
