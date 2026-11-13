@@ -8,7 +8,7 @@ private func logText(_ path: String, _ args: [String]) -> String {
     capture(path, args, timeout: 60).text
 }
 
-// grep for any of the words (every line with none given), or without them, then head
+// grep for any of the words (all lines if none), or -v, then head
 private func keep(_ text: String, containing words: [String] = [], skipping: Bool = false, first: Int? = nil) -> String {
     // blank lines stay, as grep -v leaves them
     let all = text.split(separator: "\n", omittingEmptySubsequences: false).dropLast(text.hasSuffix("\n") ? 1 : 0)
@@ -21,14 +21,14 @@ private func keep(_ text: String, containing words: [String] = [], skipping: Boo
 private func kernelLog(_ predicate: String, to file: String, last: String = "boot") {
     FileManager.default.createFile(atPath: file, contents: nil)
     if let handle = FileHandle(forWritingAtPath: file) {
-        // a busy system's log takes minutes to search: what it found by then is kept
+        // a busy system's log takes minutes to search; keep what was found by the timeout
         capture("/usr/bin/log", ["show", "--last", last, "--style", "compact", "--predicate", predicate], timeout: 180,
                 log: handle)
         try? handle.close()
     }
 }
 
-// A file per process, each its first traceLimit bytes: one game's trace in a shared file pushes out the one before it.
+// a file per process, each its first traceLimit bytes, so one process's trace can't push out another's
 private func splitTraces(_ file: String, into folder: String) {
     guard let input = FileHandle(forReadingAtPath: file) else { return }
     defer { try? input.close() }
@@ -91,8 +91,7 @@ func collectLogs(into dir: String, say: Say) throws -> String {
     let out = "\(dest)/\(name)"
     try fm.createDirectory(atPath: out, withIntermediateDirectories: true)
 
-    // everything the driver logged since it loaded, from its own buffer (macOS's logs keep little of it); first, as
-    // it's what a report needs most and it's quick
+    // the driver's own buffer, as macOS's logs keep little of it; first, as it matters most and is quick
     // the old driver's sysctl has its old name
     say("Reading the driver's log")
     var driverLog = capture("/usr/sbin/sysctl", ["-b", "kern.malachite_log"])
@@ -100,7 +99,7 @@ func collectLogs(into dir: String, say: Say) throws -> String {
         driverLog = capture("/usr/sbin/sysctl", ["-b", "kern.nvrm_log"])
     }
     try driverLog.data.write(to: URL(fileURLWithPath: "\(out)/driver.txt"))
-    // what the GPU spent its time on, which a report of "runs badly" needs
+    // where the GPU's time went, for "runs badly" reports
     for name in ["stats", "power"] {
         try capture("/usr/sbin/sysctl", ["-b", "kern.malachite_\(name)"]).data.write(to: URL(fileURLWithPath: "\(out)/\(name).txt"))
     }
@@ -146,7 +145,7 @@ func collectLogs(into dir: String, say: Say) throws -> String {
     kernelLog("eventMessage CONTAINS \"Malachite trace\"", to: "\(out)/traces.tmp")
     splitTraces("\(out)/traces.tmp", into: out)
     try? fm.removeItem(atPath: "\(out)/traces.tmp")
-    // why a kext of the driver's did or didn't load (the auxiliary collection's policy, missing approval, dependencies)
+    // why our kexts did or didn't load: auxiliary collection policy, approval, dependencies
     kernelLog("eventMessage CONTAINS \"pl.aochi\" OR eventMessage CONTAINS \"AuxKC\" OR eventMessage CONTAINS \"NVFB\" "
               + "OR (process == \"kernelmanagerd\" AND eventMessage CONTAINS[c] \"aochi\")", to: "\(out)/kexts.txt")
     // a boot that failed is over by the time someone can send logs

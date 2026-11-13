@@ -25,7 +25,7 @@ private func mountPoint(_ part: String) -> String? {
     return nil
 }
 
-// the GUID of the EFI partition OpenCore booted from, which it names in its boot-path variable (only read here)
+// the GUID of the EFI partition OpenCore booted from, from its boot-path variable (read only)
 private func bootPartition() -> String? {
     let text = capture("/usr/sbin/nvram", ["4D1FDA02-38C7-4A6A-9CC6-4BCCA8B30102:boot-path"]).text
     guard let hd = text.range(of: "HD(") else { return nil }
@@ -34,12 +34,12 @@ private func bootPartition() -> String? {
     return String(parts[2])
 }
 
-// a mounted EFI that holds OpenCore, and the partition to unmount when done if it was mounted for this
+// mounted: the partition to unmount when done, if we mounted it
 struct EFI {
     let path: String
     var mounted: String?
 
-    // a FAT volume left mounted is marked dirty if the Mac is shut down before it is let go
+    // a FAT volume still mounted at shutdown is marked dirty
     func release() {
         if let mounted {
             _ = capture(diskutil, ["unmount", mounted])
@@ -47,8 +47,8 @@ struct EFI {
     }
 }
 
-// the mounted EFI that holds OpenCore: the one given, then the one OpenCore booted from, then the only one of the
-// EFI partitions that does. The partitions mounted only to look are unmounted again.
+// the one given, else the one OpenCore booted from, else the only EFI partition holding OpenCore; partitions mounted
+// only to look are unmounted
 func findEFI(_ given: String?, say: Say) -> EFI? {
     if let given, !given.isEmpty, hasConfig(given) {
         return EFI(path: given)

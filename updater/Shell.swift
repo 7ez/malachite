@@ -26,7 +26,7 @@ func run(_ path: String, _ args: [String]) async -> Output {
     }
 }
 
-// stdout and stderr together, or into `log` when given; a program still running after `timeout` seconds is killed
+// stdout and stderr together, or into `log`; killed after `timeout` seconds
 @discardableResult
 func capture(_ path: String, _ args: [String], cwd: String? = nil, timeout: Double? = nil, log: FileHandle? = nil) -> Output {
     let p = Process()
@@ -58,7 +58,7 @@ func quote(_ s: String) -> String {
     "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
 }
 
-// do shell script drops the output of a command that fails, so the status is echoed and parsed back
+// do shell script drops a failing command's output, so the status is echoed and parsed back
 func admin(_ command: String) async -> Output {
     let shell = "{ \(command); } 2>&1; echo nvstatus=$?"
     let literal = shell.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
@@ -75,8 +75,7 @@ func admin(_ command: String) async -> Output {
     return Output(status: status, text: lines.dropLast().joined(separator: "\n") + "\n")
 }
 
-// admin, with the command's output read back from a file while it runs, for a live log; do shell script itself
-// only returns once the command is done
+// output tailed from a file for a live log, as do shell script returns only when the command is done
 func admin(_ command: String, live: @escaping @MainActor (String) -> Void) async -> Output {
     let log = FileManager.default.temporaryDirectory.appending(path: "nvadmin-\(UUID().uuidString).log")
     FileManager.default.createFile(atPath: log.path, contents: nil)
@@ -95,7 +94,6 @@ func admin(_ command: String, live: @escaping @MainActor (String) -> Void) async
     return Output(status: out.status, text: text + out.text.trimmingCharacters(in: .newlines))
 }
 
-// a download that reports how far it's got
 final class Download: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
     private var task: URLSessionTask?
 

@@ -81,8 +81,8 @@ private func uninstallMode(_ args: [String]) -> Int32 {
     return uninstall(o, say: say) ? 0 : 1
 }
 
-// --root-patch puts the Metal driver on the system volume for browsers again, after a macOS update or once turned
-// off; --remove-root-patch takes it away, and installs leave it off from then on
+// --root-patch puts the Metal driver back on the system volume (for browsers) after a macOS update or removal;
+// --remove-root-patch removes it, and later installs leave it off
 private func rootPatchMode(_ flag: String, _ args: [String]) -> Int32 {
     guard requireRoot(flag, say: say) else { return 1 }
     var dry = false
@@ -147,7 +147,7 @@ private func scaledMode(_ args: [String]) -> Int32 {
     return 0
 }
 
-// the command line modes, for recovery over SSH or with a dark screen; nil when the app should open its window
+// for recovery over SSH or with a dark screen; nil to open the window
 func cli(_ args: [String]) -> Int32? {
     guard args.count > 1 else { return nil }
     setvbuf(stdout, nil, _IOLBF, 0)
@@ -157,7 +157,7 @@ func cli(_ args: [String]) -> Int32? {
     case "--uninstall": return uninstallMode(rest)
     case "--root-patch", "--remove-root-patch": return rootPatchMode(args[1], rest)
     case "--check": return runChecks(say: say) ? 0 : 1
-    // the app that installs is often a copy in Downloads, and a login item has to be registered by the app it launches
+    // the installing app is often a copy in Downloads, and a login item must be registered by the app it launches
     case "--login-item": return (try? SMAppService.mainApp.register()) == nil ? 1 : 0
     case "--collect-logs": return collectMode(rest.first ?? ".")
     case "--scaled": return scaledMode(rest)

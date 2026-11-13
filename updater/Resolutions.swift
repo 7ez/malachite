@@ -22,7 +22,7 @@ struct Size: Hashable {
 
     var text: String { "\(width)x\(height)" }
 
-    // what a framebuffer this size takes, its rows on 256 bytes
+    // rows padded to 256 bytes, as the driver lays them out
     var fits: Bool { ((width * 4 + 255) & ~255) * height <= framebufferBytes }
 
     func suits(_ native: Size) -> Bool {
@@ -34,7 +34,7 @@ private func gcd(_ a: Int, _ b: Int) -> Int {
     b == 0 ? a : gcd(b, a % b)
 }
 
-// the sizes worth offering on a panel, of its shape exactly
+// sizes of exactly the panel's shape
 func presets(for native: Size) -> [Size] {
     let unit = gcd(native.width, native.height)
     let step = Size(native.width / unit, native.height / unit)
@@ -49,7 +49,7 @@ func readScaled() -> [Size] {
     ((try? String(contentsOfFile: scaledFile, encoding: .utf8)) ?? "").split(separator: "\n").compactMap { Size(String($0)) }
 }
 
-// tells the running driver: its modes change at once, and macOS finds them as on a hotplug
+// the running driver's modes change at once; macOS sees a hotplug
 func sendScaled(_ sizes: [Size]) -> Bool {
     let service = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("MalachiteGpu"))
     guard service != 0 else { return false }
@@ -112,7 +112,7 @@ final class Resolutions: ObservableObject {
         set(size, on: true)
     }
 
-    // the fastest macOS was given, the driver leaving out what the display engine can't do
+    // the driver only lists rates the display engine can do
     func topRate(_ size: Size, on monitor: Monitor) -> Int? {
         displayModes(monitor.id).filter { $0.pixelWidth == size.width && $0.width == size.width }
             .map { Int($0.refreshRate.rounded()) }.max()
@@ -126,7 +126,7 @@ final class Resolutions: ObservableObject {
         let text = next.map(\.text).joined(separator: "\n") + "\n"
         var saved = (try? text.write(toFile: scaledFile, atomically: false, encoding: .utf8)) != nil
         if !saved {
-            // an install from an app before this one left the file to root
+            // older apps' installs left the file owned by root
             let file = quote(scaledFile)
             saved = await admin("printf '%s' \(quote(text)) > \(file) && chown root:admin \(file) && chmod 664 \(file)").status == 0
         }
@@ -142,7 +142,7 @@ final class Resolutions: ObservableObject {
         }
     }
 
-    // the mode turns up a moment after the driver is told, so a size just added is waited for
+    // a just-added size shows up a moment after the driver is told
     func use(_ size: Size, on monitor: Monitor) {
         Task {
             let rate = CGDisplayCopyDisplayMode(monitor.id)?.refreshRate ?? 0
