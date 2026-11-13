@@ -4068,7 +4068,12 @@ IOReturn Gpu::sync_ctx(uintptr_t handle)
     auto done = [](const gpu_ctx *c) {
         return !c->draw_pending || !c->compute_sem || (int32_t)(*c->compute_sem - c->draw_pending) >= 0;
     };
-    for (bool flushed = false;;) {
+    // what this call waits for: work another thread of the task queues meanwhile is for its own sync to wait on
+    uint32_t target = 0;
+    auto reached = [&](const gpu_ctx *c) {
+        return !target || !c->compute_sem || (int32_t)(*c->compute_sem - target) >= 0;
+    };
+    for (bool flushed = false, first = true;;) {
         take();
         gpu_ctx *c = ctx_of(handle);
         if (!c || c->refused_until > time_us()) {
@@ -4082,13 +4087,25 @@ IOReturn Gpu::sync_ctx(uintptr_t handle)
                 recover(c);
         }
         uint64_t waited = time_us() - t0;
-        if (!flushed && done(c)) {
+        if (first) {
+            target = c->draw_pending;
+            first = false;
+        }
+        if (!flushed && reached(c)) {
             l2_sysmem(c, false);
+            target = c->draw_pending;
             flushed = true;
         }
-        if ((flushed && done(c)) || waited > 2000000) {
+        if ((flushed && reached(c)) || waited > 2000000) {
             stats[ST_SYNC]++;
-            IOReturn r = settle(drain(c, 10));
+            IOReturn r;
+            if (done(c) || waited > 2000000) {
+                r = settle(drain(c, 10));
+            } else {
+                // more work is queued since: drain would wait for it too and drop it if it ran out of time
+                memset(c->pass_targets, 0, sizeof(c->pass_targets));
+                r = settle(kIOReturnSuccess);
+            }
             stats[ST_SYNC_US] += time_us() - t0;
             give();
             return r;
