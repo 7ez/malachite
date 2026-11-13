@@ -732,6 +732,19 @@ static int flatten(struct ir_func *f, struct ir_block *b)
     return 1;
 }
 
+// A block only b leads to, and b to nothing else, goes on the end of b. OpenCL's front end leaves loop bodies in
+// chains of such blocks, which kept them from being unrolled.
+static int merge(struct ir_func *f, struct ir_block *b)
+{
+    if (b->nsucc != 1 || !b->last || b->last->op != IR_BR)
+        return 0;
+    struct ir_block *m = b->succ[0];
+    if (m == b || m == f->entry || m->npreds != 1 || m->func != b->func || !m->first || m->first->op == IR_PHI)
+        return 0;
+    splice(b, m);
+    return 1;
+}
+
 static int has_effect(const struct ir_val *v)
 {
     switch (v->op) {
@@ -1816,7 +1829,7 @@ void airc_opt(struct ir_func *f)
             for (struct ir_val *v = b->first; v; v = v->next)
                 changed |= fold(f, v);
             if (!reshaped)
-                reshaped = fold_branch(b) || inline_kill(b) || flatten(f, b);
+                reshaped = fold_branch(b) || inline_kill(b) || flatten(f, b) || merge(f, b);
         }
         changed |= reshaped;
         resolve(f);
