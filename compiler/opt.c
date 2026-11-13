@@ -1,6 +1,5 @@
-// IR clean-up before instruction selection: constant folding, constant branches, dead block and dead code
-// removal, trivial phi elimination, run to a fixed point. Specialising a shader on its function constants
-// turns most of its branches constant, so folding them away is what makes the big SkyLight shaders tractable.
+// IR clean-up before instruction selection. Function constants turn most branches constant, and folding them is
+// what makes the big SkyLight shaders tractable.
 #include <float.h>
 #include <math.h>
 #include <stdlib.h>
@@ -8,11 +7,10 @@
 #include "airc_int.h"
 #include "sass86.h"
 
-// Replacing a value points it at its stand-in; its users are repointed in one sweep (resolve), not one sweep
-// each, which is what dominates compile time on a big shader.
+// Users are repointed in one sweep (resolve), as a sweep per replacement dominated compile time on big shaders
 static unsigned g_pending;
-static int g_no_range;  // AIRC_NORANGE=1: no folding that rests on a value's known upper bound
-static int g_no_sat;    // AIRC_NOSAT=1: a clamp to [0, 1] stays a min, a max and an add
+static int g_no_range;  // AIRC_NORANGE=1
+static int g_no_sat;    // AIRC_NOSAT=1
 static int g_no_local_forward;
 
 static int is_float(const struct ir_val *v, uint32_t bits)
@@ -29,9 +27,7 @@ static struct ir_val *live(struct ir_val *v)
     return v;
 }
 
-// not c, made before at: a compare's opposite compare (integers EQ and NE, LT and GE, LE and GT; floats the
-// predicate's complement, ordered less than becoming unordered or greater or equal), which a select or a load
-// guard takes in P0 as it is
+// the opposite compare rather than a PNOT, so a select or load guard takes it in P0 as it is
 static struct ir_val *negated(struct ir_val *c, struct ir_val *at)
 {
     if (c->op != IR_CMP) {
@@ -123,9 +119,7 @@ static struct ir_val *new_const(struct ir_val *at, int64_t imm)
     return k;
 }
 
-// Integer sums and products gather their constants in the last term, where a shared-memory access takes it as its
-// offset: (x + c1) * c2 is x * c2 + c1 * c2, a + (b + c) is (a + b) + c, and a constant in the first place moves
-// to the second.
+// constants gather in the last term, where a shared-memory access takes it as its offset
 static int reassociate(struct ir_val *v)
 {
     if ((v->op != IR_ADD && v->op != IR_MUL) || v->type != IR_I32)
@@ -163,13 +157,13 @@ static int reassociate(struct ir_val *v)
     return 1;
 }
 
-// fold v if its operands allow; 1 when something changed
+// 1 when something changed
 static int fold(struct ir_func *f, struct ir_val *v)
 {
     for (unsigned i = 0; i < v->nsrc; i++)
         v->src[i] = live(v->src[i]);
     struct ir_val *x = v->nsrc > 0 ? v->src[0] : NULL, *y = v->nsrc > 1 ? v->src[1] : NULL;
-    if ((v->nsrc > 0 && !x) || (v->nsrc > 1 && !y))  // a shared or local access at a fixed offset
+    if ((v->nsrc > 0 && !x) || (v->nsrc > 1 && !y))  // a shared or local access at a fixed offset has no address
         return 0;
     if (reassociate(v))
         return 1;
@@ -181,7 +175,7 @@ static int fold(struct ir_func *f, struct ir_val *v)
             return 1;
         }
     }
-    // a global access at a constant element (an unrolled loop's): its offset in the access, as the front end has it
+    // an unrolled loop's constant element goes into the access's offset
     if ((v->op == IR_LDG || v->op == IR_STG) && x->op == IR_ADDR && x->src[1]->op == IR_CONST) {
         int64_t k = x->aux ? (int32_t)x->src[1]->imm : (uint32_t)x->src[1]->imm, imm = v->imm + k * x->imm;
         if (imm >= -(1 << 23) && imm < (1 << 23) - 256) {
@@ -202,7 +196,7 @@ static int fold(struct ir_func *f, struct ir_val *v)
         replace_all(f, v, x->op != IR_CONST || x->imm ? v->src[1] : v->src[2]);
         return 1;
     }
-    // LLVM's and and or that keep a poison operand from mattering: select c, x, false and select c, true, x
+    // LLVM's poison-safe and/or: select c, x, false and select c, true, x
     if (v->op == IR_SEL && v->type == IR_PRED) {
         struct ir_val *z = v->src[2];
         if (z->op == IR_CONST && !z->imm) {
@@ -217,9 +211,7 @@ static int fold(struct ir_func *f, struct ir_val *v)
             return 1;
         }
     }
-    // a select of a select that gives the same value one way, as an if flattened in a flattened if leaves them: one
-    // select on both conditions. sel(c, a, sel(d, b, a)) is sel(!c && d, b, a), sel(c, sel(d, b, z), z) is
-    // sel(c && d, b, z)
+    // nested flattened ifs leave sel(c, a, sel(d, b, a)), which is sel(!c && d, b, a)
     if (v->op == IR_SEL && v->type != IR_PRED) {
         struct ir_val *a = v->src[1], *z = v->src[2];
         int in_false = z->op == IR_SEL && z->uses == 1 && live(z->src[2]) == a;
@@ -282,7 +274,7 @@ static int fold(struct ir_func *f, struct ir_val *v)
             make_const(v, (uint32_t)(a & b));
             return 1;
         case IR_OR:
-            if (v->type != x->type)  // a reinterpreting bitcast: keep it, it marks the change of type
+            if (v->type != x->type)  // a bitcast, kept as it marks the change of type
                 return 0;
             make_const(v, (uint32_t)(a | b));
             return 1;
@@ -306,7 +298,7 @@ static int fold(struct ir_func *f, struct ir_val *v)
         }
         case IR_FADD:
             if (v->aux & IR_FADD_SAT) {
-                // as FADD.FTZ.SAT: a NaN or a denormal gives 0
+                // as FADD.FTZ.SAT, a NaN or a denormal gives 0
                 float sum = fa + fb;
                 make_const(v, from_float(sum >= FLT_MIN ? fminf(sum, 1.0f) : 0.0f));
             } else {
@@ -332,7 +324,7 @@ static int fold(struct ir_func *f, struct ir_val *v)
             break;
         }
     }
-    // saturate(z) is min(max(z, 0), 1) + 0 (the sum flushes a denormal): one FADD.SAT
+    // saturate(z) arrives as min(max(z, 0), 1) + 0, the add flushing a denormal
     if (!g_no_sat && v->op == IR_FADD && !v->aux && v->type == IR_F32 && is_float(y, 0) && x->op == IR_FMIN &&
         is_float(live(x->src[1]), 0x3f800000) && live(x->src[0])->op == IR_FMAX &&
         is_float(live(live(x->src[0])->src[1]), 0) && live(live(x->src[0])->src[0])->op != IR_CONST) {
@@ -340,19 +332,18 @@ static int fold(struct ir_func *f, struct ir_val *v)
         v->aux = IR_FADD_SAT;
         return 1;
     }
-    // an unsigned min that can't bite: the clamp on a local array's index after the index was clamped already
+    // a local array's index clamp after the index was clamped already
     if (!g_no_range && v->op == IR_MIN && !v->aux && v->type == IR_I32 && y->op == IR_CONST &&
         umax(x, 0) <= (uint32_t)y->imm) {
         replace_all(f, v, x);
         return 1;
     }
-    // a mask of low bits that clears none the value can have: a conversion saturated to 255 packed as a byte
+    // a low-bit mask that clears nothing, such as a conversion saturated to 255 packed as a byte
     if (!g_no_range && v->op == IR_AND && v->type == IR_I32 && y->op == IR_CONST &&
         !((uint32_t)y->imm & ((uint32_t)y->imm + 1)) && umax(x, 0) <= (uint32_t)y->imm) {
         replace_all(f, v, x);
         return 1;
     }
-    // x op identity
     if (v->nsrc == 2 && y->op == IR_CONST && v->type == x->type) {
         int64_t c = y->imm;
         int zero_id = v->op == IR_ADD || v->op == IR_SUB || v->op == IR_OR || v->op == IR_XOR || v->op == IR_SHL ||
@@ -388,9 +379,7 @@ static void add_pred(struct ir_block *to, struct ir_block *from)
     to->preds[to->npreds++] = from;
 }
 
-// Blocks in reverse postorder from the entry, then those of each subroutine a call reaches, each in reverse
-// postorder from its own entry; unreachable ones dropped, predecessor lists rebuilt from the edges, phis matched
-// to them again.
+// reverse postorder from the entry, then from each subroutine's; rebuilds predecessor lists and phi order
 static void reorder(struct ir_func *f)
 {
     struct ir_block **post = ir_alloc(f->nblocks * sizeof(*post));
@@ -444,7 +433,7 @@ static void reorder(struct ir_func *f)
         }
 }
 
-// a conditional branch on a constant becomes an unconditional one; reorder() then rebuilds the edges
+// reorder() rebuilds the edges after
 static int fold_branch(struct ir_block *b)
 {
     struct ir_val *t = b->last;
@@ -457,9 +446,8 @@ static int fold_branch(struct ir_block *b)
     return 1;
 }
 
-// `if (c) discard_fragment();`: a branch to a block that only discards and rejoins becomes a kill on c in line.
-// The branch would split the warp with nothing to bring it back together, and a derivative after it would read
-// quad neighbours that aren't there; a killed thread lives on as a helper, so the quad stays whole.
+// `if (c) discard_fragment();` becomes a kill on c in line. The branch would split the warp with nothing to
+// reconverge it, and later derivatives would miss quad neighbours; a killed thread lives on as a helper.
 static int inline_kill(struct ir_block *b)
 {
     struct ir_val *t = b->last;
@@ -520,8 +508,7 @@ static int takes_derivatives(const struct ir_val *v)
            (v->op == IR_TEX && IR_TEXA_OP(v->aux) == SASS_TEX && lod != SASS_LOD_ZERO && lod != SASS_LOD_LOD);
 }
 
-// a block a branch of b's alone leads to, of nothing with an effect, going on to m; *deriv set if it takes
-// derivatives
+// s is reached only from b, has no effects and goes on to m
 static int side_of(struct ir_block *s, struct ir_block *b, struct ir_block *m, int *deriv, int loads)
 {
     if (s->npreds != 1 || s->preds[0] != b || s->nsucc != 1 || s->succ[0] != m || s == m)
@@ -555,7 +542,6 @@ static void move_to(struct ir_block *s, struct ir_block *b)
     s->nsucc = 0;
 }
 
-// m, b's lone successor, goes on the end of b
 static void splice(struct ir_block *b, struct ir_block *m)
 {
     ir_remove(b->last);
@@ -579,14 +565,12 @@ static void splice(struct ir_block *b, struct ir_block *m)
     m->nsucc = 0;
 }
 
-// by block id: how many loops it is in, a loop being the blocks from its header to its back edge in layout order
+// loop depth by block id, a loop being the blocks from its header to its back edge in layout order
 static unsigned char *g_loops;
 
-// by block id: in an innermost loop that loads, leaves only at its back edge and whose ifs hold nothing but
-// arithmetic and loads, FLATTEN_LOOP_VALUES values at most: flattened whole it is one block, which can be unrolled
-// to have its loads in flight together. An if of more than FLATTEN_LOOP_SIDE values is flattened only when it runs
-// unless two integers are equal (a loop over all elements that skips its own): another may run on few trips, and
-// flattened it costs every trip (a collision test's response)
+// Small innermost loops that load are flattened whole so they can be unrolled with their loads in flight together.
+// A bigger if is flattened only when it skips one element (x != y), as others may run on few trips and flattened
+// cost every trip.
 #define FLATTEN_LOOP_VALUES 40
 #define FLATTEN_LOOP_SIDE 8
 static unsigned char *g_flat_loop;
@@ -629,10 +613,8 @@ static void find_loops(struct ir_func *f)
                     g_flat_loop[c->id] = 1;
 }
 
-// A derivative (or an implicit-LOD sample) needs its whole quad, and a branch that splits the quad leaves it a
-// neighbour short: an Apple GPU has its value anyway. So an if, or an if/else, around one, of side-effect-free
-// code only, runs on both paths and selects the result. Where the paths met goes on the end, so an enclosing if
-// sees one block. So does a tiny one in a loop: the loop is then one block, which can be unrolled.
+// A derivative needs its whole quad, which a branch can split, while an Apple GPU gets the value anyway. So a
+// side-effect-free if around one runs both paths and selects. Tiny ifs in loops too, so the loop can be unrolled.
 #define FLATTEN_VALUES 2
 
 static int flatten(struct ir_func *f, struct ir_block *b)
@@ -693,7 +675,6 @@ static int flatten(struct ir_func *f, struct ir_block *b)
         if (side[k])
             move_to(s[k], b);
     int joined = m->npreds == 2 && m != f->entry;  // b alone reaches m now
-    // each phi's inputs from the two paths become one from b
     for (struct ir_val *p = m->first, *next; p && p->op == IR_PHI; p = next) {
         next = p->next;
         struct ir_val *in[2] = { NULL, NULL };
@@ -735,8 +716,7 @@ static int flatten(struct ir_func *f, struct ir_block *b)
     return 1;
 }
 
-// A block only b leads to, and b to nothing else, goes on the end of b. OpenCL's front end leaves loop bodies in
-// chains of such blocks, which kept them from being unrolled.
+// OpenCL's front end leaves loop bodies in chains of blocks, which kept them from being unrolled
 static int merge(struct ir_func *f, struct ir_block *b)
 {
     if (b->nsucc != 1 || !b->last || b->last->op != IR_BR)
@@ -781,7 +761,7 @@ static int dce(struct ir_func *f)
                 if (v->src[i])
                     v->src[i]->uses++;
     int changed = 0;
-    // each block last to first, so a chain of dead values in it goes in one sweep
+    // last to first, so a chain of dead values goes in one sweep
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->last; v;) {
             struct ir_val *prev = v->prev;
@@ -797,7 +777,6 @@ static int dce(struct ir_func *f)
     return changed;
 }
 
-// a phi all of whose inputs are one value (or itself) is that value
 static int simplify_phis(struct ir_func *f)
 {
     int changed = 0;
@@ -824,10 +803,8 @@ static int simplify_phis(struct ir_func *f)
     return changed;
 }
 
-// Common subexpressions: a value computed again where an equal one is already available (made in a block that
-// dominates this one) is that one. Only values that depend on nothing but their sources: no texture sample, no
-// derivative or lane exchange (which read other lanes, so the same sources give different values under another
-// active mask), and a load only when nothing in the shader could write memory it reads. AIRC_NOCSE=1 turns it off.
+// No derivatives or lane exchanges, as they read other lanes and differ under another active mask; loads only when
+// nothing in the shader writes memory. AIRC_NOCSE=1 turns CSE off.
 static int cse_pure(const struct ir_val *v, int loads_pure)
 {
     switch (v->op) {
@@ -854,7 +831,7 @@ static int cse_pure(const struct ir_val *v, int loads_pure)
     }
 }
 
-// an add's or subtract's wrap flags don't make it another value: the one kept carries the flags both have
+// wrap flags don't make an add another value
 static int cse_aux(const struct ir_val *v)
 {
     return v->op == IR_ADD || v->op == IR_SUB ? 0 : v->aux;
@@ -892,8 +869,7 @@ static int cse(struct ir_func *f)
                 loads_pure = 0;
         }
     }
-    // dominators (Cooper, Harvey, Kennedy) over the blocks in the order reorder() left them: reverse postorder
-    // from each entry. idom and the preorder numbers are by position in that order.
+    // Cooper-Harvey-Kennedy dominators, indexed by position in reorder()'s reverse postorder
     struct ir_block **blocks = malloc(nb * sizeof(*blocks));
     int *pos = calloc(f->nblocks, sizeof(*pos)), *idom = malloc(nb * sizeof(*idom)), *tin = malloc(nb * sizeof(*tin)),
         *tout = malloc(nb * sizeof(*tout)), *child = malloc(nb * sizeof(*child)), *sibling = malloc(nb * sizeof(*sibling)),
@@ -1012,9 +988,7 @@ static int cse(struct ir_func *f)
     return changed;
 }
 
-// The most a float value can be, INFINITY when nothing is known: a clamp's top, scaled. A value with a bound is
-// never a NaN, which the min's needs (a min with a NaN is its other side). Rounding is monotonic, so x <= a gives
-// x * k <= a * k for k > 0; not for k = 0, as -inf * 0 is a NaN.
+// A bounded value is never a NaN, as a min with a NaN is its other side. k = 0 is excluded since -inf * 0 is a NaN.
 static float fmax_of(const struct ir_val *v, int depth)
 {
     if (!v || v->type != IR_F32 || depth > 8)
@@ -1042,7 +1016,6 @@ static float fmax_of(const struct ir_val *v, int depth)
     }
 }
 
-// The most a 32-bit integer value can be, unsigned; UINT32_MAX when nothing is known.
 static uint64_t umax(const struct ir_val *v, int depth)
 {
     if (!v || v->type != IR_I32 || depth > 8)
@@ -1069,9 +1042,9 @@ static uint64_t umax(const struct ir_val *v, int depth)
         return v->src[1]->op == IR_CONST ? umax(v->src[0], depth + 1) >> (v->src[1]->imm & 31) : UINT32_MAX;
     case IR_LDG:
     case IR_LDS:
-    case IR_LDL:  // a byte or halfword is loaded zero-extended (LDG.U8, .U16)
+    case IR_LDL:  // bytes and halfwords load zero-extended
         return v->aux == 1 ? 0xff : v->aux == 2 ? 0xffff : UINT32_MAX;
-    case IR_F2I: {  // F2I.U32.TRUNC: a NaN or anything below 0 is 0
+    case IR_F2I: {  // F2I.U32.TRUNC gives 0 for a NaN or anything below 0
         float f = fmax_of(v->src[0], depth + 1);
         if (v->aux || !(f < 4294967296.0f))
             return UINT32_MAX;
@@ -1082,7 +1055,6 @@ static uint64_t umax(const struct ir_val *v, int depth)
     }
 }
 
-// v made in b in front of at
 static struct ir_val *insert_before(struct ir_val *at, enum ir_op op, enum ir_type type, unsigned nsrc)
 {
     struct ir_val *v = ir_add(at->block, op, type, nsrc);
@@ -1097,13 +1069,9 @@ static struct ir_val *insert_before(struct ir_val *at, enum ir_op op, enum ir_ty
     return v;
 }
 
-// A local array a shader fills from read-only memory (a struct passed by value, copied to the stack and then
-// indexed) costs a load, a store and the thread's local memory for each word, where reading the memory itself costs
-// a load a use. This applies when the shader's first blocks (a run of them with no branch out or in) copy words
-// into local memory and nothing else ever writes it, nothing in the shader writes memory a load could see, and
-// every local load lands on a word the copy
-// filled (an index the shader clamps is bounded by what the clamp says). The loads then read the source, and the
-// copy and the local memory go. AIRC_NOCONSTLOCAL=1 turns it off.
+// A struct passed by value and copied to the stack costs a load, store and local memory per word. When the entry
+// blocks copy it from read-only memory and nothing else writes it, the local loads read the source instead.
+// AIRC_NOCONSTLOCAL=1 turns it off.
 int airc_const_locals(struct ir_func *f, struct airc_info *info)
 {
     if (airc_pass_off("AIRC_NOCONSTLOCAL") || !info->local_size)
@@ -1114,7 +1082,7 @@ int airc_const_locals(struct ir_func *f, struct airc_info *info)
     uint8_t *filled = calloc(info->local_size / 4 + 1, 1), *straight = calloc(f->nblocks, 1);
     int ok = filled && straight;
     int seen_ldl = 0;
-    // every other block comes after the last of these, and so after the copy
+    // every other block comes after these, so after the copy
     for (struct ir_block *b = f->entry; ok && b;) {
         straight[b->id] = 1;
         b = b->nsucc == 1 && b->succ[0]->npreds == 1 ? b->succ[0] : NULL;
@@ -1196,15 +1164,13 @@ int airc_const_locals(struct ir_func *f, struct airc_info *info)
     return 1;
 }
 
-// Local memory at fixed addresses, within a block: a load of a word stored there earlier is the value stored, and a
-// store overwritten before anything could read it goes. Code built without optimisation (Apple's GL compiler's)
-// changes a vector in memory a lane at a time, loading all of it and storing all of it back each time. A store of
-// an undefined value goes too. AIRC_NOLOCALFWD=1 turns it off.
+// Apple's GL compiler emits unoptimised code that changes a vector in local memory a lane at a time, loading and
+// storing all of it each time. AIRC_NOLOCALFWD=1 turns the forwarding off.
 struct local_word {
     int64_t at;
     int bytes;
-    struct ir_val *val;    // what the bytes hold, as far as this block knows
-    struct ir_val *store;  // the store that put it there, while nothing could have read it since
+    struct ir_val *val;
+    struct ir_val *store;  // while nothing could have read it since
 };
 
 static int local_forward(struct ir_func *f)
@@ -1264,7 +1230,7 @@ static int local_forward(struct ir_func *f)
                 }
                 continue;
             }
-            if (w[same].val && live(w[same].val) == live(v->src[1])) {  // what's there already
+            if (w[same].val && live(w[same].val) == live(v->src[1])) {
                 ir_remove(v);
                 changed = 1;
                 continue;
@@ -1283,16 +1249,15 @@ static int local_forward(struct ir_func *f)
         }
     }
     free(w);
-    resolve(f);  // before dce: a load another is now read as has no readers of its own yet
+    resolve(f);  // before dce, or forwarded loads still look unread
     return changed;
 }
 
-// What a 32-bit value is known to be a multiple of, as a power of two up to 16 (4). The kernel's threadgroup
-// variables are laid out 16-byte aligned from 0, and the dispatcher puts each [[threadgroup(n)]] buffer after them
-// aligned as much.
+// log2 of the known alignment, up to 4. Threadgroup variables are laid out 16-byte aligned from 0, and the
+// dispatcher aligns each [[threadgroup(n)]] buffer after them as much.
 static int known_align(const struct ir_val *v, const struct airc_info *info, int depth)
 {
-    if (!v)  // a shared access at a fixed address
+    if (!v)  // a shared access at a fixed offset
         return 4;
     if (depth > 8 || v->type != IR_I32)
         return 0;
@@ -1356,7 +1321,6 @@ static int fence(const struct ir_val *x, enum ir_op op)
     return has_effect(x);
 }
 
-// v and the words after it, n of them in all, as one access if they're there: 1 if they were
 static int widen(struct ir_val *v, int n, const struct airc_info *info)
 {
     enum ir_op op = v->op;
@@ -1378,8 +1342,7 @@ static int widen(struct ir_val *v, int n, const struct airc_info *info)
     for (int k = 0; k < n; k++)
         if (!lane[k])
             return 0;
-    // The lanes meet at the first load or the last store, passing other accesses of the kind only where those are
-    // to other words off the same base: shared atomics are plain LDS and STS, and two on one word keep their order.
+    // Lanes pass other accesses only to other words off the same base, as shared atomics are plain LDS and STS
     for (struct ir_val *x = first; x != last; x = x->next) {
         int member = 0;
         for (int k = 0; k < n; k++)
@@ -1417,15 +1380,9 @@ static int widen(struct ir_val *v, int n, const struct airc_info *info)
     return 1;
 }
 
-// Words of threadgroup memory read or written one at a time side by side become one LDS or STS .64 or .128 (MPS's
-// convolutions read their filters a float4 at a time as four floats). Sound because the lanes are one base value
-// plus constant offsets a word apart, so they're the very words the wide access moves; its address is proven a
-// multiple of its size, as a misaligned one faults; and the lanes move past no other access of their kind but to
-// other words off the same base, nothing else with an effect (a store, atomic, barrier, fence, call or discard)
-// and, for stores, no shared load, so gathering them changes nothing another access sees. Quads go first, so a
-// pair doesn't take half of one.
-// Device memory stays as it is: a buffer is only bound aligned to its element type, so nothing proves an address
-// that a scalar access uses aligned to more.
+// MPS's convolutions read their filters a float4 at a time as four floats. A misaligned wide access faults, so the
+// address must be proven aligned; quads go first so a pair doesn't take half of one. Device memory is left alone, as a
+// buffer is only bound aligned to its element type.
 void airc_widen_shared(struct ir_func *f, const struct airc_info *info)
 {
     for (int n = 4; n >= 2; n -= 2)
@@ -1434,14 +1391,10 @@ void airc_widen_shared(struct ir_func *f, const struct airc_info *info)
                 v = (shared_word(v, IR_LDS) || shared_word(v, IR_STS)) && widen(v, n, info) ? b->first : v->next;
 }
 
-// A loop of one block that branches back to itself and runs a few times known up front becomes that many copies of
-// its body in a row: the copies' loads (a convolution's taps) are all in flight at once rather than one iteration's
-// at a time, and the counter folds into their addresses. The counter is an i32 phi that starts at a constant, steps
-// by a constant and is compared with a constant to leave; running it gives the trip count. A loop with a barrier, a
-// call, a discard, a derivative or a lane exchange stays a loop: those depend on how the lanes converge, which the
-// back end plans around the loop as it is.
+// Full unrolling puts a convolution's taps in flight at once. Barriers, calls, discards, derivatives and lane
+// exchanges keep the loop, as the back end plans lane convergence around it as it is.
 #define UNROLL_TRIPS 16
-#define UNROLL_VALUES 320  // the copies' values at most
+#define UNROLL_VALUES 320
 
 static struct ir_val *phi_from(const struct ir_val *p, const struct ir_block *b)
 {
@@ -1451,7 +1404,6 @@ static struct ir_val *phi_from(const struct ir_val *p, const struct ir_block *b)
     airc_fail("phi lost the input of a predecessor");
 }
 
-// what x adds a constant to, with the constant in *step; NULL if it doesn't
 static const struct ir_val *stepped(const struct ir_val *x, uint32_t *step)
 {
     if ((x->op != IR_ADD && x->op != IR_SUB) || x->src[1]->op != IR_CONST)
@@ -1460,8 +1412,6 @@ static const struct ir_val *stepped(const struct ir_val *x, uint32_t *step)
     return x->src[0];
 }
 
-// a global address only loads and stores of its own block read (an offset from another address is one only they
-// take)
 static int only_accessed(const struct ir_func *f, const struct ir_val *a)
 {
     for (struct ir_block *c = f->entry; c; c = c->next)
@@ -1472,10 +1422,7 @@ static int only_accessed(const struct ir_func *f, const struct ir_val *a)
     return 1;
 }
 
-// The elements loop b's phi j moves on by a trip, when it's stepped by a constant that LLVM says doesn't wrap round
-// as an address extends it (signed when ext): each unrolled copy's element is then the first copy's that many times
-// on. 0 when it isn't. A sum of such a phi and a value from outside the loop, not wrapping round either, moves on
-// with it.
+// Elements j moves on per trip, 0 unless LLVM's nsw/nuw (as ext extends it) says it doesn't wrap
 static int64_t flat_step(const struct ir_val *j, const struct ir_block *b, int ext)
 {
     int flag = ext ? IR_NSW : IR_NUW;
@@ -1496,13 +1443,13 @@ static int64_t flat_step(const struct ir_val *j, const struct ir_block *b, int e
     return x->op == IR_ADD ? c : -c;
 }
 
-// how many times loop b, entered from pre, runs; 0 if that isn't known or is more than UNROLL_TRIPS
+// 0 if unknown or over UNROLL_TRIPS
 static int trip_count(const struct ir_block *b, const struct ir_block *pre)
 {
     const struct ir_val *cmp = b->last->src[0];
     if (cmp->op != IR_CMP || cmp->block != b || (cmp->aux & IR_FCMP) || cmp->src[1]->op != IR_CONST)
         return 0;
-    // the compare reads the counter or the counter plus a constant (its next value, as a rule)
+    // the compare usually reads the counter's next value
     const struct ir_val *k = cmp->src[0];
     uint32_t off = 0, step;
     if (k->op != IR_PHI)
@@ -1548,7 +1495,7 @@ static int unroll(struct ir_func *f)
         int trip = keep || !n ? 0 : trip_count(b, pre);
         if (!trip || trip * n > UNROLL_VALUES)
             continue;
-        // map: what each of b's values is in the copy being made, a phi's what it holds at that copy's start
+        // a phi maps to what it holds at the start of the copy being made
         struct ir_val **map = calloc(maxid + 1, sizeof(*map)), **phis = malloc(nphi * sizeof(*phis)),
                       **body = malloc(n * sizeof(*body)), **next = malloc(nphi * sizeof(*next));
         nphi = n = 0;
@@ -1561,7 +1508,7 @@ static int unroll(struct ir_func *f)
             }
         }
         for (int it = 0; it < trip; it++) {
-            // all at once, so phis that take each other's values (a swap) see the last copy's
+            // all at once, so swapping phis see the last copy's values
             for (unsigned i = 0; it && i < nphi; i++) {
                 struct ir_val *s = phi_from(phis[i], b);
                 next[i] = s->block == b ? map[s->id] : s;
@@ -1577,7 +1524,6 @@ static int unroll(struct ir_func *f)
                 map[v->id] = c;
             }
         }
-        // after the loop a phi is what it held in the last iteration, a body value what the last copy made
         for (unsigned i = 0; i < nphi; i++) {
             replace_all(f, phis[i], map[phis[i]->id]);
             ir_remove(phis[i]);
@@ -1600,13 +1546,9 @@ static int unroll(struct ir_func *f)
     return changed;
 }
 
-// A loop of one block that loads, with a trip count only known when it starts, gets a loop of four copies of its
-// body ahead of it (two, if that makes more than UNROLL_LOADS loads), which runs while a whole round of copies is
-// left; the loop as it was runs the rest. The copies' loads are then in flight together. The counter has to step
-// by a power of two towards a bound the loop doesn't change (by one to a bound it stops at only when equal), which
-// gives the trip count up front. Working that out costs
-// about as much as a trip of a small body, and a loop inside another pays it every time round the outer one, often
-// for a few trips (a 3x3 filter's rows): such a loop is unrolled only when its body is bigger than that.
+// Runtime trip counts get a 4x (or 2x past UNROLL_LOADS loads) copy ahead of the loop. The count costs about a trip
+// of a small body, and inner loops pay it per outer trip, often for few trips (a 3x3 filter's rows), so small inner
+// bodies stay rolled.
 #define UNROLL_LOADS 8
 #define UNROLL_INNER_VALUES 12
 
@@ -1642,8 +1584,7 @@ static int in_loop(const struct ir_val *v, const struct ir_block *b)
     return v->block == b && v->op != IR_CONST;
 }
 
-// how loop b goes round as the condition it stays in on, its counter's compare reading the counter (or the counter
-// plus *off) as its first source and the bound as its second; -1 if it can't be counted
+// the condition b loops on, with the counter (plus *off) first and the bound second; -1 if it can't be counted
 static int stays_while(const struct ir_block *b, struct ir_val **counter, uint32_t *off, int32_t *step)
 {
     struct ir_val *cmp = b->last->src[0];
@@ -1665,12 +1606,12 @@ static int stays_while(const struct ir_block *b, struct ir_val **counter, uint32
     *counter = (struct ir_val *)k;
     *step = (int32_t)s;
     int cond = cmp->aux & 7;
-    if (side)  // the bound first: LT and GT swap, LE and GE
+    if (side)
         cond = cond < IR_LT ? cond : cond < IR_GT ? cond + 2 : cond - 2;
-    if (b->succ[0] != b)  // EQ and NE, LT and GE, LE and GT
+    if (b->succ[0] != b)
         cond = cond < IR_LT ? cond ^ 1 : 7 - cond;
     int up = *step > 0;
-    // a bound it has to hit exactly is only sure to be hit a step of one at a time
+    // an exact bound is only sure to be hit a step of one at a time
     if ((cond == IR_NE && mag == 1) || cond == (up ? IR_LT : IR_GT) || cond == (up ? IR_LE : IR_GE))
         return cond;
     return -1;
@@ -1704,8 +1645,7 @@ static int unroll_partial(struct ir_func *f)
         struct ir_val *cmp = b->last->src[0], *bound = cmp->src[in_loop(cmp->src[0], b)];
         int sign = cmp->aux & IR_SIGNED;
 
-        // g: the trips less one, d, and from them the copies' share, all; bu: the copies; h: into the loop for the
-        // rest, if any is left; join: after it, where the loop's values read past it meet
+        // g counts the trips, bu runs the copies, h enters the loop for the rest, join is where values meet after it
         struct ir_block *g = ir_block(f), *bu = ir_block(f), *h = ir_block(f), *join = ir_block(f);
         g->func = bu->func = h->func = join->func = b->func;
         struct ir_val *init = phi_from(k, pre), *first = init;
@@ -1715,8 +1655,7 @@ static int unroll_partial(struct ir_func *f)
         struct ir_val *d = step > 0 ? ir_op2(g, IR_SUB, IR_I32, bound, first) : ir_op2(g, IR_SUB, IR_I32, first, bound);
         int sh = __builtin_ctz(step > 0 ? (uint32_t)step : -(uint32_t)step);
         if (cond != IR_NE) {
-            // a bound the counter starts past: one trip; d - 1 steps of 2^sh reach a strict bound in
-            // (d - 1) / 2^sh + 1 steps, without wrapping round
+            // one trip if the counter starts past the bound; d - 1 reaches a strict bound in (d - 1) / 2^sh + 1 steps
             struct ir_val *in = cmp2(g, cond | sign, first, bound);
             int strict = cond == IR_LT || cond == IR_GT;
             if (sh) {
@@ -1765,8 +1704,7 @@ static int unroll_partial(struct ir_func *f)
             }
             for (unsigned i = 0; i < n; i++) {
                 struct ir_val *v = body[i], *c;
-                // the counter runs from its start to the bound without wrapping round, as unsigned or signed as
-                // its compare: an element it indexes, extended the same way, is the first copy's a few on
+                // the counter doesn't wrap as its compare is signed or not, so an index extended the same way doesn't
                 int64_t d = 0;
                 if (it && v->op == IR_ADDR && !in_loop(v->src[0], b) && only_accessed(f, v))
                     d = v->src[1] == k && !v->aux == !sign && cond != IR_NE ? step : flat_step(v->src[1], b, v->aux);
@@ -1806,7 +1744,7 @@ static int unroll_partial(struct ir_func *f)
                     phis[i]->src[j] = q;
                 }
         }
-        // what the loop's values read past it are when no trip is left for it: its last copies'
+        // when no trip is left for the loop, values read past it are the last copies'
         struct ir_val **past = calloc(maxid + 1, sizeof(*past));
         for (struct ir_block *c = f->entry; c; c = c->next)
             for (struct ir_val *u = c == b ? NULL : c->first; u; u = u->next)
@@ -1863,7 +1801,7 @@ void airc_opt(struct ir_func *f)
     g_no_range = airc_pass_off("AIRC_NORANGE");
     g_no_sat = airc_pass_off("AIRC_NOSAT");
     g_no_local_forward = airc_pass_off("AIRC_NOLOCALFWD");
-    // right after the front end each phi's inputs follow its block's predecessor order
+    // the front end leaves phi inputs in predecessor order
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v && v->op == IR_PHI; v = v->next) {
             v->phi_blocks = ir_alloc(b->npreds * sizeof(*v->phi_blocks));
@@ -1886,24 +1824,22 @@ void airc_opt(struct ir_func *f)
         changed |= cse(f);
         changed |= local_forward(f);
         changed |= dce(f);
-        // unrolled only once the rest is clean, so a body's size is what's left of it
+        // unroll only once clean, so body sizes are final
         if (!changed && !unroll(f) && !unroll_partial(f))
             break;
     }
 }
 
-// A value made early and read a long way on holds its register all that way, and in a big shader (CoreAnimation's
-// uber shader: its configuration read up front, each field used a thousand values later) those registers are most
-// of what it needs. Values that are cheap to make again are made again in the blocks that read them instead.
+// CoreAnimation's uber shader reads its configuration up front and uses each field a thousand values later, so
+// long-lived registers are most of what it needs. Cheap values are made again where they are read.
 
-#define REMAT_FAR 64      // values between a definition and a read in another block before it is made again
-#define REMAT_SIZE 4      // values a copy makes at most
-#define REMAT_VALUES 45000  // what a shader and its copies may come to: past it the back end has too many values
+#define REMAT_FAR 64      // distance in values before a read in another block remakes it
+#define REMAT_SIZE 4
+#define REMAT_VALUES 45000  // past this the back end has too many values
 
-static int g_loads_pure;  // nothing in the function writes global memory, so a load gives the same each time
+static int g_loads_pure;
 
-// the values making v again takes, with its inputs that are cheap too; -1 if v can't be made again. An input that
-// can't stays as it is and live (an anchor), counted in *anchors.
+// -1 if v can't be made again; inputs that can't stay live and count in *anchors
 static int remat_size(const struct ir_val *v, int depth, int *anchors)
 {
     int size = 1;
@@ -1917,7 +1853,7 @@ static int remat_size(const struct ir_val *v, int depth, int *anchors)
     case IR_PROJ:
         if (v->src[0]->op != IR_LDG || !g_loads_pure)
             return -1;
-        return 0;  // the load it reads is made once a block, whichever lanes are read
+        return 0;  // its load is made once a block, whichever lanes are read
     default:
         if (v->op < IR_ADD || v->op > IR_FRND || v->op == IR_MUFU)
             return -1;
@@ -1956,7 +1892,6 @@ static struct ir_val *find_copy(const struct ir_val *v, const struct ir_block *b
     return NULL;
 }
 
-// v made again in b, in front of at (the value that reads it, or b's last) together with what it takes
 static struct ir_val *copy_into(struct ir_val *v, struct ir_block *b, struct ir_val *at)
 {
     struct ir_val *c = find_copy(v, b);
@@ -1973,7 +1908,7 @@ static struct ir_val *copy_into(struct ir_val *v, struct ir_block *b, struct ir_
     c->aux = v->aux;
     c->imm = v->imm;
     memcpy(c->src, src, v->nsrc * sizeof(*src));
-    // ir_add appends (before the terminator); move it in front of at
+    // ir_add appends before the terminator
     ir_remove(c);
     c->next = at;
     c->prev = at->prev;
@@ -2011,7 +1946,7 @@ void airc_remat(struct ir_func *f)
         for (struct ir_val *v = b->first; v; v = v->next)
             pos[v->id] = n++;
     }
-    // a loop is the blocks from its header to its last back edge in layout order
+    // loops by layout order, header to last back edge
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (unsigned i = 0; i < b->nsucc && !b->dead; i++)
             if (b->succ[i]->func == b->func && index[b->succ[i]->id] <= index[b->id])
@@ -2026,7 +1961,7 @@ void airc_remat(struct ir_func *f)
         if (b->dead)
             continue;
         for (struct ir_val *u = b->first; u; u = u->next) {
-            if (u->id > maxid || g_ncopies >= budget)  // one of the copies, or all that may be made
+            if (u->id > maxid || g_ncopies >= budget)  // a copy, or out of budget
                 continue;
             for (unsigned i = 0; i < u->nsrc; i++) {
                 struct ir_val *s = u->src[i];

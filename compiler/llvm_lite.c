@@ -1,7 +1,5 @@
-// A minimal LLVM bitcode reader behind the LLVM-C subset in llvm_lite.h. It reads what Metal's front end
-// emits for AIR (recent LLVM bitcode, opaque pointers, STRTAB names): types, constants, module metadata and
-// function bodies. Debug info, attributes and use lists are skipped. Value and metadata numbering follow
-// BitcodeReader.cpp so operands resolve exactly as libLLVM resolves them.
+// Bitcode reader for what Metal emits as AIR, behind llvm_lite.h's LLVM-C subset. Value and metadata numbering
+// follow BitcodeReader.cpp so operands resolve as libLLVM resolves them.
 #include "llvm_lite.h"
 #include <setjmp.h>
 #include <stdarg.h>
@@ -20,33 +18,33 @@ enum tkind { T_VOID, T_INT, T_FP, T_PTR, T_FUNC, T_LABEL, T_MD, T_ARRAY, T_VECTO
 struct ll_type {
     struct ll_module *m;
     enum tkind kind;
-    unsigned bits;  // integer / float width
-    int elem;       // pointer, array, vector element; -1 for an opaque pointer
-    unsigned as;    // pointer address space
-    int ret;        // function return type
+    unsigned bits;
+    int elem;       // -1 for an opaque pointer
+    unsigned as;
+    int ret;
     unsigned nparams;
     int *params;
     int vararg;
-    int *members;   // struct member types
+    int *members;
     unsigned nmembers;
 };
 
 enum vkind { V_PLACEHOLDER, V_FUNCTION, V_ARG, V_INST, V_CINT, V_CFP, V_CONST, V_GLOBAL, V_MDSTRING, V_MDNODE, V_MDVALUE };
 
 struct ll_value {
-    struct ll_module *m;  // owner, to resolve type ids
+    struct ll_module *m;  // to resolve type ids
     enum vkind kind;
-    unsigned char undef;  // constant: 1 undef, 2 poison
-    unsigned char zero;   // constant: an all-zero vector/aggregate
-    unsigned char constant;  // global variable: declared constant
+    unsigned char undef;  // 1 undef, 2 poison
+    unsigned char zero;   // an all-zero vector or aggregate
+    unsigned char constant;
     int type;
-    int elty;  // a GEP's source element type, a global variable's value type; -1 otherwise
+    int elty;  // a GEP's source element type, a global's value type; -1 otherwise
     LLVMOpcode op;
     int pred;
     unsigned nops;
     struct ll_value **ops;  // a call keeps its callee last, like LLVM
     unsigned nblocks;
-    struct ll_block **blocks;  // branch successors, phi incoming blocks
+    struct ll_block **blocks;
     struct ll_value *next;
     const char *name;
     uint64_t ival;
@@ -58,16 +56,15 @@ struct ll_value {
     unsigned nargs;
     struct ll_value **args;
     struct ll_block *body;
-    unsigned indices[4], nindices;  // extractvalue/insertvalue: the member indices, outermost first
-    unsigned align;            // a load's or store's alignment in bytes, 0 for none given
-    unsigned init;             // a global variable's initializer: value id + 1, or 0 for none
-    const struct attr_list *attrs;  // a function's attributes, NULL for none
-    unsigned char contract;    // a floating-point operation's contract or fast flag
-    unsigned char wrap;        // an integer operation's flags: 1 nuw, 2 nsw
+    unsigned indices[4], nindices;  // outermost first
+    unsigned align;            // bytes, 0 for none given
+    unsigned init;             // value id + 1, 0 for none
+    const struct attr_list *attrs;
+    unsigned char contract;    // contract or fast
+    unsigned char wrap;        // 1 nuw, 2 nsw
 };
 
-// The attributes airc asks about (ATTR_*, a bit each) of a function (index ~0), its result (0) or its
-// parameter i (index i + 1)
+// index ~0 is the function, 0 its result, i + 1 parameter i
 struct attr_list {
     unsigned n;
     struct {
@@ -118,12 +115,12 @@ struct ll_module {
     struct ll_value **mds;
     unsigned nmds, capmds;
     struct named_md *named;
-    struct ll_value **globals;  // functions and global objects, named from the STRTAB once it is read
+    struct ll_value **globals;  // named from the STRTAB once it is read
     unsigned nglobals, capglobals;
     struct ll_value **bodies;
     unsigned nbodies, capbodies, next_body;
     struct abbrevs blockinfo[32];
-    struct attr_group *groups;  // those with an attribute airc asks about
+    struct attr_group *groups;  // only those with an attribute airc asks about
     unsigned ngroups, capgroups;
     const struct attr_list **lists;
     unsigned nlists, caplists;
@@ -424,10 +421,8 @@ static void parse_blockinfo(struct ll_module *m, struct bits *b)
     leave(&c, &r);
 }
 
-// Attributes: only noinline, readonly, noalias and Metal's "air-buffer-no-alias". A group entry is [id, index,
-// attrs...], each attr a kind and its operands; kind 0 an enum attribute, 1 one with an integer, 3 and 4 strings,
-// 5 and 6 types. The others (constant ranges) are sorted after these but before the strings, so the group is left
-// at the first of them.
+// Attr kinds are 0 enum, 1 integer, 3 and 4 strings, 5 and 6 types. Others (constant ranges) sort after these but
+// before the strings, so a group is left at the first of them.
 enum { ATTR_NOINLINE = 1, ATTR_READONLY = 2, ATTR_NOALIAS = 4, ATTR_BUFFER_NO_ALIAS = 8 };
 
 static void parse_attr_groups(struct ll_module *m, struct bits *b)
@@ -552,7 +547,6 @@ static int vec_type(struct ll_module *m, int elem, unsigned n)
     return t;
 }
 
-// the pointer type to elem (-1: an opaque pointer) in address space as
 static int ptr_to(struct ll_module *m, int elem, unsigned as)
 {
     for (unsigned i = 0; i < m->ntypes; i++)
@@ -592,7 +586,7 @@ static struct ll_value *val_slot(struct ll_module *m, unsigned id, int ty)
     return m->vals[id];
 }
 
-// the next value id, reusing the placeholder a forward reference may already have made for it
+// reuses the placeholder a forward reference may already have made
 static struct ll_value *define_value(struct ll_module *m, enum vkind kind, int ty)
 {
     struct ll_value *v = val_slot(m, m->nvals++, ty);
@@ -673,7 +667,7 @@ static void parse_types(struct ll_module *m, struct bits *b)
         case 10:  // HALF
             add_type(m, T_FP, 16);
             break;
-        case 23:  // BFLOAT: the top half of a float, which is why its width here is 17, not 16
+        case 23:  // BFLOAT, width 17 to tell it from half
             add_type(m, T_FP, 17);
             break;
         case 13:
@@ -792,7 +786,7 @@ static void parse_constants(struct ll_module *m, struct bits *b)
             continue;
         }
         struct ll_type *t = type(m, cur);
-        // a splat is an integer or float record of a vector type: the element's value, in every lane
+        // a splat is an integer or float record of a vector type
         struct ll_type *et = t->kind == T_VECTOR ? type(m, t->elem) : t;
         struct ll_value *v;
         if ((r.code == 4 || r.code == 5) && r.n && et->kind == T_INT) {  // INTEGER, WIDE_INTEGER (low word)
@@ -818,8 +812,7 @@ static void parse_constants(struct ll_module *m, struct bits *b)
             for (unsigned i = 0; i < r.n; i++)
                 v->ops[i] = val_slot(m, (unsigned)r.ops[i], t->elem);
         } else if (r.code == 12 || r.code == 20 || r.code == 24 || r.code == 32) {
-            // CE_GEP_OLD, CE_INBOUNDS_GEP, CE_GEP_WITH_INRANGE_INDEX_OLD, CE_GEP:
-            // [source type?, flags?, (type, absolute value id)...]
+            // the CE_GEP family [source type?, flags?, (type, absolute value id)...]
             unsigned i = 0;
             int elty = -1;
             if (r.code == 24 || r.code == 32 || r.n % 2)
@@ -834,16 +827,14 @@ static void parse_constants(struct ll_module *m, struct bits *b)
             for (unsigned k = 0; k < v->nops; k++, i += 2)
                 v->ops[k] = val_slot(m, (unsigned)r.ops[i + 1], (int)r.ops[i]);
         } else if (r.code == 11 && r.n >= 3 && (r.ops[0] == 11 || r.ops[0] == 12)) {
-            // CE_CAST [opcode, operand type, operand]: a pointer bitcast or address-space cast (libLLVM folds
-            // the no-op ones away; airc's strip() looks through them)
+            // CE_CAST [opcode, operand type, operand]; libLLVM folds no-op ones away, airc's strip() looks through them
             v = define_value(m, V_CONST, cur);
             v->op = r.ops[0] == 11 ? LLVMBitCast : LLVMAddrSpaceCast;
             v->nops = 1;
             v->ops = zalloc(m, 2 * sizeof(*v->ops));
             v->ops[0] = val_slot(m, (unsigned)r.ops[2], (int)r.ops[1]);
         } else if ((r.code == 22 || r.code == 8 || r.code == 9) && (t->kind == T_VECTOR || t->kind == T_ARRAY)) {
-            // DATA [raw elements], and an i8 array's STRING and CSTRING (which leaves out the 0 it ends with, read
-            // as the missing element)
+            // DATA, STRING, CSTRING; CSTRING's missing trailing 0 reads as the missing element
             struct ll_type *et = type(m, t->elem);
             v = define_value(m, V_CONST, cur);
             v->nops = r.n;
@@ -929,7 +920,7 @@ static void parse_metadata(struct ll_module *m, struct bits *b)
                 v->ops[i] = r.ops[i] ? md_slot(m, (unsigned)r.ops[i] - 1) : NULL;
             break;
         }
-        case 8:    // OLD_NODE [(type, id)...]: a metadata id, or a value's id, for each operand
+        case 8:    // OLD_NODE [(type, metadata or value id)...]
         case 9: {  // OLD_FN_NODE
             struct ll_value *v = define_md(m, V_MDNODE);
             v->nops = r.n / 2;
@@ -1104,7 +1095,7 @@ static void parse_instruction(struct ll_module *m, struct body *f, const struct 
         v->ops[0] = a;
         v->ops[1] = b2;
         if (fp && more(&o))
-            v->contract = (op(&o) & 0x21) != 0;  // fast-math flags: unsafe algebra (fast) and contract
+            v->contract = (op(&o) & 0x21) != 0;  // unsafe algebra (fast) or contract
         else if (more(&o))
             v->wrap = op(&o) & 3;
         return;
@@ -1139,7 +1130,7 @@ static void parse_instruction(struct ll_module *m, struct body *f, const struct 
         int rty = list[0]->type;
         struct ll_type *bt = rty >= 0 ? type(m, rty) : NULL;
         if (r->code != 43 && bt && bt->kind == T_PTR && bt->elem >= 0) {
-            // typed pointers: the source element type is the pointee, and the result points at what the indices reach
+            // with typed pointers the result points at what the indices reach
             elty = bt->elem;
             int t = elty;
             for (unsigned i = 2; i < n && t >= 0; i++) {
@@ -1192,7 +1183,7 @@ static void parse_instruction(struct ll_module *m, struct body *f, const struct 
         a = val_pair(&o);
         b2 = val_rel(&o, a->type);
         struct ll_value *mask = val_pair(&o);
-        int ty = a->type;  // <mask lanes x element of v1>
+        int ty = a->type;
         if (a->type >= 0 && mask->type >= 0 && type(m, a->type)->kind == T_VECTOR && type(m, mask->type)->kind == T_VECTOR)
             ty = vec_type(m, type(m, a->type)->elem, type(m, mask->type)->bits);
         v = inst(m, f, LLVMShuffleVector, ty, 1, 3);
@@ -1300,7 +1291,7 @@ static void parse_instruction(struct ll_module *m, struct body *f, const struct 
         v = inst(m, f, LLVMLoad, ty, 1, 1);
         v->ops[0] = a;
         if (more(&o)) {
-            uint64_t log2p1 = op(&o);  // log2 of the alignment, plus 1
+            uint64_t log2p1 = op(&o);
             v->align = log2p1 ? 1u << (log2p1 - 1) : 0;
         }
         return;
@@ -1400,7 +1391,7 @@ static void parse_instruction(struct ll_module *m, struct body *f, const struct 
         unsigned idx[4], n = 0;
         while (more(&o) && n < 4)
             idx[n++] = (unsigned)op(&o);
-        int ty = a->type;  // the member type the indices lead to, struct members and array elements alike
+        int ty = a->type;
         for (unsigned i = 0; i < n && ty >= 0; i++) {
             struct ll_type *at = type(m, ty);
             ty = at->kind == T_STRUCT ? (idx[i] < at->nmembers ? at->members[idx[i]] : -1)
@@ -1462,7 +1453,7 @@ static void parse_function(struct ll_module *m, struct bits *b)
             if (id == 11)
                 parse_constants(m, b);
             else
-                skip(m, b);  // function metadata, attachments, symbol table, use lists
+                skip(m, b);
             continue;
         }
         parse_instruction(m, &f, &r);
@@ -1569,7 +1560,7 @@ static void parse_module(struct ll_module *m, struct bits *b)
     leave(&c, &r);
 }
 
-// the module's value symbol table, which names its globals before bitcode version 2 moved them to the STRTAB
+// names the globals before bitcode version 2 moved them to the STRTAB
 static void parse_vst(struct ll_module *m, struct bits *b)
 {
     struct cursor c;
@@ -1680,7 +1671,7 @@ LLVMBool LLVMParseBitcode2(LLVMMemoryBufferRef buf, LLVMModuleRef *out)
         fail(m, "not LLVM bitcode");
     struct bits b = { p, len * 8, 32 };
     while (b.pos + 32 <= b.nbits) {
-        if (rd(m, &b, 2) != 1)  // top level holds only blocks; anything else is end padding
+        if (rd(m, &b, 2) != 1)  // anything but a block at top level is end padding
             break;
         unsigned id = (unsigned)vbr(m, &b, 8);
         if (id == 8)
@@ -1913,12 +1904,12 @@ LLVMValueRef LLVMGetAggregateElement(LLVMValueRef c, unsigned i)
     struct ll_type *t = LLVMTypeOf(c);
     if (!t || (t->kind != T_VECTOR && t->kind != T_ARRAY) || i >= t->bits)
         return NULL;
-    struct ll_value *e = zalloc(c->m, sizeof(*e));  // an undef or zero element, made on demand
+    struct ll_value *e = zalloc(c->m, sizeof(*e));
     e->m = c->m;
     e->type = t->elem;
     e->undef = c->undef;
     enum tkind k = type(c->m, t->elem)->kind;
-    e->zero = !c->undef && (k == T_ARRAY || k == T_VECTOR || k == T_STRUCT);  // a row of a zeroinitializer
+    e->zero = !c->undef && (k == T_ARRAY || k == T_VECTOR || k == T_STRUCT);
     e->kind = c->undef || e->zero ? V_CONST : k == T_FP ? V_CFP : V_CINT;
     return e;
 }
@@ -1996,7 +1987,6 @@ LLVMBasicBlockRef LLVMGetFirstBasicBlock(LLVMValueRef fn)
     return fn->body;
 }
 
-// the module's functions in order, through its global list
 static LLVMValueRef function_from(struct ll_module *m, unsigned i)
 {
     for (; i < m->nglobals; i++)
