@@ -7,18 +7,16 @@ struct gsp_zcull;
 struct rm_client;
 struct chan;
 
-// The 3D class (AMPERE_B, 0xc797) on a graphics channel that compute_setup already made: subchannel 0, next to
-// compute on subchannel 1. Returns 0 on success.
+// Binds the 3D class (AMPERE_B, 0xc797) on subchannel 0 of compute_setup's graphics channel (compute is on 1). 0 on
+// success.
 int render_setup(struct gsp *s, const struct rm_client *c, struct chan *ch);
 
-// the buffer the shaders' local memory comes out of: all of it, and as much a warp (once the channel is idle)
+// shader local memory: the whole buffer and each warp's share (once the channel is idle)
 void render_set_local_memory(struct chan *ch, uint64_t va, uint64_t size, uint32_t per_warp);
-// texture header and sampler pools (32-byte descriptors), as compute_set_tex_pools does for compute; a handle in a
-// shader is header index | sampler index << 20
+// texture header and sampler pools (32-byte descriptors), as compute_set_tex_pools; handle = header | sampler << 20
 void render_set_tex_pools(struct chan *ch, uint64_t header_va, uint32_t headers, uint64_t sampler_va,
                           uint32_t samplers);
-// where a vertex fetch past the end of its stream reads instead: a page of zeros. The channel starts with 0, which
-// faults it.
+// a zero page that vertex fetches past a stream's end read instead; the channel's default of 0 faults
 void render_set_vertex_substitute(struct chan *ch, uint64_t va);
 
 // colour target formats, as SET_COLOR_TARGET_FORMAT takes them

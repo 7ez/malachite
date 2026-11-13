@@ -22,9 +22,8 @@ enum sph_interp { SPH_FLAT = 1, SPH_PERSPECTIVE = 2, SPH_LINEAR = 3 };
 // writing the position and generic outputs 0..outputs-1, xyzw each
 void sph_vertex(uint32_t sph[32], uint32_t inputs, unsigned outputs, unsigned sysvals);
 
-// a tessellation init shader reading the generic attributes in the inputs mask of its patch's vertices, writing
-// those in the outputs mask of its thread's control point and, once a patch, the tessellation levels and
-// patch_outputs generic patch attributes; threads of it run a patch, one a control point
+// tessellation init: reads the inputs mask of its patch's vertices, writes the outputs mask per control point (a
+// thread each, threads per patch) and, once per patch, the levels and patch_outputs generic patch attributes
 void sph_tess_init(uint32_t sph[32], uint32_t inputs, uint32_t outputs, unsigned patch_outputs, unsigned threads);
 
 // a tessellation shader reading the generic attributes in the inputs mask of its patch's control points, writing
@@ -41,9 +40,8 @@ void sph_tess_eval(uint32_t sph[32], uint32_t inputs, unsigned outputs, unsigned
 #define SPH_PS_VIEWPORT 64     // the viewport index
 #define SPH_PS_DEPTH 128      // not a value: the shader writes the depth, in the register after its colours' and one
 
-// a pixel shader reading generic inputs 0..inputs-1 interpolated as interp[i] says and the SPH_PS_* system values
-// in sysvals, writing RGBA of colour targets 0..targets-1 from R0..R3, R4..R7, ...
-// targets: a bit per colour target the shader writes; its outputs come in R0.. a vec4 per target, in target order
+// a pixel shader reading generic inputs 0..inputs-1 interpolated per interp[i] and the SPH_PS_* sysvals; targets has
+// a bit per colour target written, its RGBA from R0 on, a vec4 per target in target order
 void sph_pixel(uint32_t sph[32], const uint8_t *interp, unsigned inputs, unsigned sysvals, unsigned targets);
 
 #ifdef __cplusplus

@@ -15,11 +15,9 @@ static uint32_t aa_mode(uint32_t samples, uint32_t *sx, uint32_t *sy)
     return samples >= 8 ? 4 : samples >= 4 ? 2 : samples >= 2 ? 1 : 0;
 }
 
-// d's samples per pixel: the fragment shader runs once a pixel, its colour going to the samples it covers, or with
-// per_sample once a sample (a pass each, the centroid the pass's sample). The samples sit where D3D, Vulkan and
-// Metal put them (in 16ths of a pixel), the same for each pixel of a 2x2 quad; left at the hardware's default
-// they'd all be at the centre and cover the same. Alpha to coverage dithers over 2x2 pixels with samples to spread,
-// as an Apple GPU's does, and is a plain alpha >= 0.5 test with one.
+// MSAA state: the fragment shader runs per pixel, or with per_sample once per sample (a pass each). Sample positions
+// are D3D/Vulkan/Metal's (16ths, same across a 2x2 quad); the hardware default puts them all at the centre.
+// Alpha to coverage dithers over 2x2 pixels with multiple samples, as Apple GPUs do; with one it's alpha >= 0.5.
 unsigned draw_aa_words(uint32_t *push, const struct render_draw *d)
 {
     static const uint8_t standard[4][8][2] = {
@@ -37,7 +35,7 @@ unsigned draw_aa_words(uint32_t *push, const struct render_draw *d)
         MTHD(0, R_SET_HYBRID_ANTI_ALIAS_CONTROL, 1), passes | (passes > 1) << 4,  // centroid per pass or fragment
         MTHD(0, R_SET_ANTI_ALIAS_ALPHA_CONTROL, 1), d->alpha_control,
         MTHD(0, R_SET_ALPHA_TO_COVERAGE_DITHER_CONTROL, 1), mode != 0,  // footprint 2x2 pixels, or 1x1
-        // the coverage after the shader starts from the rasterizer's, which a [[sample_mask]] output then narrows
+        // post-shader coverage starts from the rasterizer's; a [[sample_mask]] output narrows it
         MTHD(0, R_SET_POST_PS_INITIAL_COVERAGE, 1), 1,
         MTHD(0, R_SET_ANTI_ALIAS_SAMPLE_POSITIONS, 4), 0, 0, 0, 0,
     };
@@ -49,8 +47,7 @@ unsigned draw_aa_words(uint32_t *push, const struct render_draw *d)
     return sizeof(w) / 4;
 }
 
-// d's colour targets: each bound (one absent disabled, format 0), then CT_SELECT over all of them, their write masks
-// and blends; returns the words written
+// each colour target with its write mask and blend (an absent one gets format 0), then CT_SELECT over them all
 unsigned draw_target_words(uint32_t *push, const struct render_draw *d)
 {
     uint32_t sx, sy;
@@ -67,7 +64,7 @@ unsigned draw_target_words(uint32_t *push, const struct render_draw *d)
         ct.height = d->target_height;
         if (j)
             ct = d->more[j - 1];
-        // its own size, which lays a block-linear surface out; the pass's surface clip keeps the draw within all
+        // its own size sets the block-linear layout; the pass's surface clip bounds the draw
         uint32_t width = ct.width ? ct.width : d->width, height = ct.height ? ct.height : d->height;
         // block-linear (one-GOB blocks) takes the width in samples, pitch-linear the row pitch in bytes
         uint32_t w[] = {
@@ -113,8 +110,7 @@ unsigned draw_depth_stencil_words(uint32_t *push, const struct render_draw *d)
 unsigned draw_cull_words(uint32_t *push, const struct render_draw *d)
 {
     unsigned n = 0;
-    // Metal judges winding with +y up, as GL does, so its clockwise is GL's (an Apple GPU says so: the y flip of our
-    // viewport doesn't swap them)
+    // Metal judges winding with +y up like GL (checked on an Apple GPU): our viewport's y flip doesn't swap it
     P(MTHD(0, R_OGL_SET_CULL, 3), d->cull_face != 0, d->front_ccw ? 0x901 : 0x900, d->cull_face ? d->cull_face : 0x405);
     return n;
 }
@@ -124,8 +120,7 @@ unsigned viewport_bind(uint32_t *push, unsigned j, const float *vp, const uint32
     // NDC -1..1 onto the viewport, +y up as Metal has it; NDC depth is 0..1 already, mapped onto near..far
     float hw = vp[2] / 2.0f, hh = vp[3] / 2.0f;
     float zmin = vp[4] < vp[5] ? vp[4] : vp[5], zmax = vp[4] < vp[5] ? vp[5] : vp[4];
-    // clipped to the pixels the viewport covers: a negative height flips it (OpenGL's renderer draws so), and an
-    // origin off the target's top or left stops at 0
+    // clip to the viewport's pixels: a negative height (GL renderer) flips it, an origin off the top/left clamps to 0
     uint32_t clip[2][2];
     for (int a = 0; a < 2; a++) {
         float lo = vp[a] < vp[a] + vp[a + 2] ? vp[a] : vp[a] + vp[a + 2], hi = vp[a] + (vp[a + 2] < 0 ? 0 : vp[a + 2]);
@@ -149,9 +144,8 @@ unsigned draw_viewport_words(uint32_t *push, const struct render_draw *d)
     P(MTHD(0, R_SET_VIEWPORT_SCALE_OFFSET, 1), !d->window_coords);
     // the layer the vertex stage picks, or the first
     P(MTHD(0, R_SET_RT_LAYER, 1), d->shader_layer ? 1u << 16 : 0);
-    // depth 0..1, fragment depth clamped to it; geometry clipped to it by the geometry clipper with a tight z
-    // guardband (before depth bias applies, as NVK has it), or for depth clamp, clipped in x and y only and
-    // clamped to near..far
+    // depth 0..1, fragment depth clamped to it; z clipped by the geometry clipper with a tight guardband (before
+    // depth bias), or with depth_clamp clipped in x/y only and clamped to near..far
     P(MTHD(0, R_SET_VIEWPORT_CLIP_CONTROL, 1),
       d->depth_clamp ? 1 << 16 | 1 << 3 | 1 << 4 | 2 << 11 | 1 << 1 : 1 | 1 << 3 | 1 << 4 | 3 << 11 | 2 << 1);
     P(MTHD(0, R_SET_VIEWPORT_Z_CLIP, 1), 1);  // clip-space z from 0 to w, not GL's -w: Metal's NDC depth is 0..1
@@ -182,7 +176,6 @@ unsigned draw_blend_const_words(uint32_t *push, const struct render_draw *d)
 unsigned draw_shader_words(uint32_t *push, const struct render_draw *d)
 {
     unsigned n = 0;
-    // the vertex and pixel stages run, and for patches the tessellation init and tessellation stages
     for (uint32_t j = 0; j <= PIPE_PIXEL; j++)
         P(MTHD(0, R_SET_PIPELINE_SHADER(j), 1),
           (j == PIPE_VERTEX || j == PIPE_PIXEL || (d->tess && (j == PIPE_TESS_INIT || j == PIPE_TESS))) | j << 4);

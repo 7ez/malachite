@@ -1,7 +1,6 @@
-// Build GA10x texture headers (TIC) and samplers (TSC) from a small description. Used by the Metal plugin
-// (from MTLTextureDescriptor/MTLSamplerDescriptor). Pitch-linear 2D textures, or block-linear
-// ones in one-GOB blocks: 2D, 3D, cube and array textures with mip levels. Field layouts from Maxwell TEXHEAD /
-// TEXSAMP (used through Ampere).
+// Texture headers (TIC) and samplers (TSC) for the Metal plugin, from MTLTextureDescriptor/MTLSamplerDescriptor.
+// Pitch-linear 2D, or block-linear (one-GOB blocks) 2D/3D/cube/array with mips. Maxwell TEXHEAD/TEXSAMP layouts,
+// used through Ampere.
 #pragma once
 #include <stdint.h>
 
@@ -105,8 +104,7 @@ struct tex_desc {
     uint32_t levels;      // mip levels, 0 for one
     uint32_t view_min, view_levels;  // the levels a view sees: the first, how many (0 for all from it)
     uint32_t samples;     // per pixel (block-linear only), 0 or 1 for one; the memory holds a grid of them a pixel
-    // what the shader reads as x, y, z, w when swizzled: MTLTextureSwizzle values (zero, one, red, green, blue,
-    // alpha), red to alpha being the format's own channels
+    // with swizzled: MTLTextureSwizzle values (zero, one, the format's red..alpha) the shader reads as x, y, z, w
     int swizzled;
     uint8_t swizzle[4];
 };
@@ -134,8 +132,7 @@ struct tex_format_info tex_format_info(enum tex_format f);
 
 void tex_fill_header(uint32_t out[8], const struct tex_desc *t);
 void tex_fill_sampler(uint32_t out[8], const struct samp_desc *s);
-// a cube or cube array header made the 2D array of its faces, which texel reads and writes address; any other
-// header is left as it is
+// turns a cube (array) header into the 2D array of its faces, as texel reads/writes address them; others unchanged
 void tex_header_faces_as_layers(uint32_t hdr[8]);
 
 #ifdef __cplusplus

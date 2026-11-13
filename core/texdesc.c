@@ -12,10 +12,9 @@ static void setf(uint32_t out[8], unsigned lo, unsigned hi, uint32_t val)
 enum { SNORM = 1, UNORM = 2, SINT = 3, UINT = 4, FLOAT = 7 };  // TEXHEAD component data types
 enum { I0 = 0, IR = 2, IG = 3, IB = 4, IA = 5, I1_INT = 6, I1 = 7 };  // swizzle sources: zero, a component, one
 
-// TEXHEAD COMPONENTS_SIZES, the data type of R and (when it differs) of G, B and A, where X/Y/Z/W come from (I1 is
-// an integer format's integer one), sRGB decode, bytes per pixel or block, block size and the colour target
-// format; from the sdk's clb097tex.h / cl9097.h and NIL's format table. BGRA formats are their RGBA layout read
-// with R and B swapped.
+// TEXHEAD COMPONENTS_SIZES, R's data type and G/B/A's when different, X/Y/Z/W sources, sRGB, bytes per pixel or
+// block, block size, colour target format. From the sdk's clb097tex.h / cl9097.h and NIL's format table; BGRA is
+// the RGBA layout with R and B swapped.
 struct format {
     uint8_t comps, type, type_gba, swizzle[4], srgb, bytes, block, target;
 };
@@ -190,8 +189,7 @@ void tex_fill_sampler(uint32_t out[8], const struct samp_desc *s)
     setf(out, 36, 37, !s->min_linear ? 1 : a > 1 ? 3 : 2);  // MIN_FILTER: POINT, ANISO, LINEAR
     setf(out, 38, 39, s->mip + 1);                   // MIP_FILTER: NONE, POINT, LINEAR
     setf(out, 40, 41, 2);                            // CUBEMAP_INTERFACE_FILTERING = AUTO_SPAN_SEAM (seamless)
-    // the nearest level to an LOD halfway between two is the lower one in Metal, the upper one here: biased by
-    // -1/256 (MIP_LOD_BIAS, signed 5.8), x.5 picks x
+    // Metal rounds a halfway LOD to the lower level, the hardware to the upper: MIP_LOD_BIAS -1/256 (signed 5.8)
     if (s->mip == TEX_MIP_NEAREST)
         setf(out, 44, 56, 0x1fff);
     if (!s->normalized)

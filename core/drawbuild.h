@@ -1,5 +1,5 @@
-// The methods of a 3D draw, built from a render_draw: shared by the kernel (core/render.c) and the Metal plugin, so
-// both write the same words. Plain C, no kernel or GSP headers.
+// A 3D draw's methods from a render_draw, shared by the kernel (core/render.c) and the Metal plugin so both emit the
+// same words. Plain C, no kernel or GSP headers.
 #pragma once
 #include <stdint.h>
 #include <string.h>
@@ -157,8 +157,7 @@ struct render_draw {
     uint64_t vs, ps;  // shader headers, each followed by its code, 128-byte aligned
     uint32_t vs_regs, ps_regs;
     uint64_t vs_cbuf, ps_cbuf;  // each stage's const bank 0 (0x1000 bytes), or 0 for none
-    // vertex attribute i as SET_VERTEX_ATTRIBUTE_A takes it (stream, offset, format), 0 for unused; each
-    // stream is a vertex buffer, read stride bytes per vertex, 0 for none
+    // SET_VERTEX_ATTRIBUTE_A values (stream, offset, format), 0 unused; streams are vertex buffers, address 0 for none
     uint32_t attributes[RENDER_ATTRIBUTES];
     struct render_stream {
         uint64_t addr;
@@ -177,8 +176,7 @@ struct render_draw {
     uint32_t zt_format, zt_width, zt_height;  // SET_ZT_FORMAT, row stride in pixels, rows (samples, multisampled)
     uint32_t zt_compressed;  // its memory is a compressed kind
     uint32_t zt_zcull;  // zcull region 0 follows it
-    // samples a pixel of the targets has (0 or 1 for one): they're laid out a grid of them per pixel (2x1, 2x2, 4x2),
-    // so a block-linear target is that many times wider and higher in memory
+    // per pixel (0 or 1 for one), a 2x1/2x2/4x2 grid each: block-linear targets are that many times wider and higher
     uint32_t samples;
     uint32_t depth_test, depth_write, depth_func;
     uint32_t stencil_test;
@@ -186,11 +184,9 @@ struct render_draw {
     uint32_t stencil_ref;  // the front's in bits 0-7, the back's in bits 8-15
     uint32_t stencil_read_mask[2], stencil_write_mask[2];
     uint32_t write_mask;  // SET_CT_WRITE: R bit 0, G bit 4, B bit 8, A bit 12
-    // colour target 0's blend, as the SET_BLEND_PER_TARGET_* values: enable, then colour op, source and
-    // destination factor, then the same for alpha
+    // colour target 0's blend as SET_BLEND_PER_TARGET_* values: enable, colour op/src/dst, alpha op/src/dst
     uint32_t blend[7];
-    // colour targets 1..7 beside target 0 (multiple render targets), the size of it; address 0 for none, as
-    // target 0 can be too
+    // colour targets 1..7 (multiple render targets), the size of target 0; address 0 for none, as target 0's can be
     struct render_ct {
         uint64_t addr;
         uint32_t pitch, format, blocklinear, write_mask;
@@ -213,8 +209,8 @@ struct render_draw {
     // the texture header and sampler pools, with this many entries, when the draw has its own; 0 keeps the bound ones
     uint64_t tex_headers, tex_samplers;
     uint32_t tex_count, sampler_count;
-    // a tessellated draw's (RENDER_PATCHES, a vertex a patch) tessellation init and tessellation stages, when tess
-    // (SET_TESSELLATION_PARAMETERS) is set; the tessellation stage reads vs_cbuf
+    // tessellated draw (RENDER_PATCHES, a vertex per patch) when tess (SET_TESSELLATION_PARAMETERS) is set: ti is the
+    // tessellation init stage, ts the tessellation stage, which reads vs_cbuf
     uint32_t tess;
     uint64_t ti, ts;
     uint32_t ti_regs, ts_regs;
@@ -222,9 +218,8 @@ struct render_draw {
     uint32_t alpha_control;  // SET_ANTI_ALIAS_ALPHA_CONTROL
     uint32_t per_sample;     // the pixel stage runs once a sample
     uint32_t ps_depth;       // the pixel stage writes depth
-    // layered targets as nvgpu_draw's: layers deep, colour target j's layer_pitch[j] bytes a layer, the vertex
-    // stage picking the layer when shader_layer is set; each target has target_layers[j] (zt_layers) of them, 0 for
-    // all
+    // layered targets as nvgpu_draw's: colour target j's layers layer_pitch[j] bytes apart, the vertex stage picks the
+    // layer with shader_layer; each target has target_layers[j] (zt_layers) of them, 0 for all
     uint32_t layers, layer_pitch[8], zt_layer_pitch, shader_layer;
     uint32_t target_layers[8], zt_layers;
     // viewports and scissors 1..nviewports - 1 (x, y, width, height, near, far; x, y, width, height), beside 0
@@ -233,7 +228,7 @@ struct render_draw {
     const uint32_t (*scissors)[4];
 };
 
-// stores, not memcpy: the kernel's is a real call here (-fno-builtin), scores of them a draw
+// stores, not memcpy: with -fno-builtin the kernel's memcpy is a real call, dozens per draw
 static inline void put(uint32_t *to, const uint32_t *from, unsigned n)
 {
     for (unsigned i = 0; i < n; i++)
@@ -247,8 +242,8 @@ static inline uint32_t fbits(float f)
     return u;
 }
 
-// SET_DA_PRIMITIVE_RESTART as nvgpu_draw's restart asks: Metal restarts indexed strips only (line strip 3, triangle
-// strip 5), at the largest index the type holds; 2 restarts any indexed draw at restart_index, 1 none
+// SET_DA_PRIMITIVE_RESTART per nvgpu_draw's restart: Metal (0) restarts only indexed strips (3, 5) at the type's max
+// index; 2 restarts any indexed draw at restart_index, 1 never
 static inline uint32_t draw_restarts(uint32_t primitive, uint32_t restart, int indexed)
 {
     return indexed && (restart == 2 || (!restart && (primitive == 3 || primitive == 5)));
