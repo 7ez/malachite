@@ -2723,6 +2723,8 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
         r = pow_ir(a, b, is_fn(name, "powr"), 1);
     else if (is_fn(name, "pown") || is_fn(name, "rootn"))  // n an i32, which widen leaves
         r = pown_ir(a, b, is_fn(name, "rootn"));
+    else if (is_fn(name, "mix") && g_info->denorms)  // OpenCL's (the kernels keeping denormals): a + (b - a) t
+        r = madf(subf(b, a), c, a);
     else if (is_fn(name, "mix"))  // t b + (a - t a), as Apple's: mix(0, 1, inf) is NaN, mix(x, x, t) not always x
         r = madf(c, b, madf(negf(c), a, a));
     else if (is_fn(name, "step"))  // x >= edge ? 1 : 0, so 0 with a NaN as Apple's
