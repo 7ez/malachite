@@ -1,10 +1,5 @@
-// MalachiteDevice: the user-space Metal driver for the GPU. Metal.framework (getMetalPluginClassForService) finds
-// our bundle via Accelerator's MetalPluginName, loads it, resolves the NSPrincipalClass, and requires that class to be
-// a subclass of MTLIOAccelDevice (it checks isSubclassOfClass:). That class is private (dyld shared cache); we declare
-// it here and let the loader bind the real one.
-//
-// MTLIOAccelDevice : _MTLDevice : NSObject (conforms to MTLDeviceSPI). Its designated initializer is
-// initWithAcceleratorPort:, which Metal passes the IOAccelerator service's IOKit port.
+// Metal.framework loads this bundle by the accelerator's MetalPluginName and requires its principal class to subclass
+// the private MTLIOAccelDevice, which the loader binds from the shared cache.
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <dirent.h>
@@ -38,30 +33,23 @@ extern "C" {
 #import "../core/texdesc.h"
 #import "../gpu_bridge.h"
 
-// Private base class, bound from the shared cache at load (built with -undefined dynamic_lookup). Declared as a
-// bare NSObject subclass for compilation only; the real class (MTLIOAccelDevice : _MTLDevice) is used at runtime.
-// MalachiteDevice adds no ivars, so the non-fragile runtime lays it out past MTLIOAccelDevice's real 54424-byte size.
+// Declared on NSObject for compiling only (-undefined dynamic_lookup); the non-fragile runtime lays our class out
+// past the real one's size.
 @interface MTLIOAccelDevice : NSObject
 - (instancetype)initWithAcceleratorPort:(unsigned int)port;
 @end
 
-// Command queue base (private, shared cache). Its initWithDevice:descriptor: opens the kernel command-queue user
-// client (type 8) and wires submission; we inherit all of it.
+// its init opens the kernel's command queue user client (type 8) and wires up submission
 @interface MTLIOAccelCommandQueue : NSObject
 - (instancetype)initWithDevice:(id)device descriptor:(id)descriptor;
 - (NSUInteger)maxCommandBufferCount;
 @end
 
-// Command buffer base (private, shared cache); encoding and commit are inherited.
-// _reserveKernelCommandBufferSpace: is the bump allocator over the kernel command buffer (grows as needed, advances
-// the cursor, returns the write pointer). It does not pre-write a header: we write our own {opcode,len} header and
-// payload into the returned pointer.
 @interface MTLIOAccelCommandBuffer : NSObject
 - (instancetype)initWithQueue:(id)queue retainedReferences:(bool)retained;
+// bump allocator over the kernel command buffer; writes no header, the {opcode, len} is ours
 - (void *)_reserveKernelCommandBufferSpace:(uint64_t)nbytes;
-// Segment bookkeeping: reserving bytes only moves the cursor; the kernel iterates *segments*, so a record must be
-// bracketed by beginSegment: (captures the start) and endCurrentSegment (captures the end + bumps the segment count
-// the kernel reads). Without them the submitted command range is empty and processSegmentKernelCommand never runs.
+// The kernel walks segments, not the cursor, so a record outside beginSegment:/endCurrentSegment is never run.
 - (void)beginSegment:(void *)ptr;
 - (void)endCurrentSegment;
 - (void)commit;
@@ -76,31 +64,29 @@ extern "C" {
 
 @interface MalachiteCommandBuffer : MTLIOAccelCommandBuffer <MTLCommandBuffer> {
   @public
-    bool _in_segment;  // draws go on adding to the segment open
-    // a run of draws written here, not in the kernel: methods in one block, their constants in another
+    bool _in_segment;  // draws keep adding to the open segment
+    // draws are written here, not by the kernel: methods in one block, their constants in another
     uint32_t *_run_cpu;
     uint64_t _run_va;
     uint32_t _run_start, _run_used, _run_cap, _run_draws;  // in words but the last
     uint8_t *_bank_cpu;
     uint64_t _bank_va;
     uint32_t _bank_used, _bank_cap;
-    bool _bank_new;  // memory used before: the constant cache may hold it
-    uint64_t _records;     // counts what the kernel was sent, for telling whether a draw's state is still the channel's
+    bool _bank_new;  // reused memory, the constant cache may hold it
+    uint64_t _records;     // tells whether a draw's state is still the channel's
     const void *_state_of;  // the encoder whose last draw the channel holds
     // members, not associated objects: those retain and autorelease on every look, several times a draw
     NSMutableArray *_kept;
-    const void *_kept_recent[4];  // kept already, so a draw of the same few resources doesn't grow the array
+    const void *_kept_recent[4];  // so draws of the same few resources don't grow the array
     unsigned _kept_next;
     id _uploads, _heap_blocks;
-    NSMutableSet *_writeback;  // mirrored buffers its OpenCL kernels may write, copied back to system memory at commit
+    NSMutableSet *_writeback;  // mirrored buffers OpenCL kernels may write, copied back to system memory at commit
     bool _writes_capture;  // to a surface WindowServer hands to another process (see commitAndWaitUntilSubmitted)
 }
 @end
 
-// Buffer base (private, shared cache). MTLIOAccelBuffer : MTLIOAccelResource : _MTLResource. Its designated init
-// fills the IOAccelNewResourceData header [0x00..0x67] of the args block from the explicit params, then issues the
-// kernel resource-create through the device's shared connection. contents/gpuAddress/length are read from the
-// kernel-created resource (_res) and inherited while pointer is NULL.
+// The designated init fills the args block's IOAccelNewResourceData [0x00..0x67] from its params and creates the
+// kernel resource.
 @interface MTLIOAccelBuffer : NSObject
 - (instancetype)initWithDevice:(id)device
                        pointer:(void *)ptr
@@ -111,21 +97,17 @@ extern "C" {
                           args:(void *)args
                       argsSize:(unsigned int)argsSize
                    deallocator:(id)dealloc;
-- (uint64_t)gpuAddress;  // inherited from MTLIOAccelResource (_res+0x48); the buffer's GPU virtual address
+- (uint64_t)gpuAddress;  // MTLIOAccelResource's _res+0x48
 - (void *)contents;
 - (void)didModifyRange:(NSRange)range;
 @end
 
-// Blit encoder base (private, shared cache). MTLIOAccelBlitCommandEncoder : MTLIOAccelCommandEncoder :
-// _MTLCommandEncoder. Every buffer/texture encode method on the MTLIOAccel path is a doesNotRecognize/report stub, so
-// never call super for one. initWithCommandBuffer: and endEncoding are real and inherited.
+// Every encode method of the base is a doesNotRecognize stub, so never call super for one.
 @interface MTLIOAccelBlitCommandEncoder : NSObject
 - (instancetype)initWithCommandBuffer:(id)cb;
 @end
 
-// Texture base (private, shared cache). A pitch-linear 2D texture is a view over a buffer:
-// initWithBuffer:descriptor:offset:bytesPerRow: keeps buffer/bufferOffset/bufferBytesPerRow, and the GPU
-// address is the buffer's gpuAddress plus the offset. Declared NSObject for compile; real base bound at load.
+// The base only makes pitch-linear 2D textures over a buffer.
 @interface MTLIOAccelTexture : NSObject
 - (instancetype)initWithBuffer:(id)buffer descriptor:(id)descriptor offset:(NSUInteger)offset
                    bytesPerRow:(NSUInteger)bytesPerRow;
@@ -138,50 +120,42 @@ extern "C" {
 - (MTLPixelFormat)pixelFormat;
 @end
 
-// The base only makes linear 2D textures, so a 1D texture is made as a 2D one a row high and a 1D array as one
-// with a row per layer; _type is what the app asked for, and the getters below answer as that.
-//
-// What a pitch-linear texture can't be - mipmapped, an array, a cube, 3D, compressed, a depth/stencil target - is
-// an image: block-linear in one-GOB blocks (64 bytes by 8 rows), a layer's levels one after another, each a row of
-// GOBs wide and its height rounded to 8 rows (a 3D level's slices one after another), the layers _layer_stride
-// apart, as NIL lays them out. It's made as a plain texture over its bytes, so the getters answer from the
-// fields below.
+// A 1D texture is a 2D one a row high, a 1D array a row per layer; the getters answer as _type.
+// Anything else pitch-linear can't be is an image: block-linear in one-GOB blocks, levels in a row per layer, layers
+// _layer_stride apart, as NIL lays them out.
 @class MalachiteHeapBuffer;
 
 @interface MalachiteTexture : MTLIOAccelTexture <MTLTexture> {
 @public
-    __unsafe_unretained id _backing;  // the MTLBuffer holding the pixels
+    __unsafe_unretained id _backing;
     uint64_t _offset;
-    MTLTextureUsage _usage;  // as made (the base reports none: CoreImage then won't write to it)
+    MTLTextureUsage _usage;  // the base reports none, and CoreImage then won't write to it
     uint32_t _pitch;  // an image's: level 0's row of GOBs
     id _owned;  // the backing buffer, when the device made it for the texture
-    MalachiteHeapBuffer *_placed;  // its range of the MTLHeap it was made in, which keeps the heap's memory
+    MalachiteHeapBuffer *_placed;  // keeps the MTLHeap's memory
     MTLTextureType _type;
-    IOSurfaceRef _surface;  // retained, for a texture over an IOSurface's memory
+    IOSurfaceRef _surface;
     bool _capture;  // the surface is a screen or window capture
     NSUInteger _plane;
-    uint32_t _heap_entry;  // its own descriptor heap entry, once asked for its gpuResourceID
-    // a pitch-linear texture's height when the base was made a row high (an IOSurface's rows the base won't take)
+    uint32_t _heap_entry;  // made once asked for its gpuResourceID
+    // when the base was made a row high (an IOSurface's rows the base won't take)
     NSUInteger _linear_height;
-    // rows the texture unit can't read (their pitch or start not on 32 bytes) are sampled from a copy, made by the
-    // copy engine before each command that reads them
+    // rows not on 32 bytes, which the texture unit can't read, are sampled from a copy made before each command
     id<MTLBuffer> _shadow;
-    // a depth/stencil target (an image)
-    uint32_t _zt_format, _zt_bpp;  // SET_ZT_FORMAT value and bytes per pixel, 0 for a colour texture
+    uint32_t _zt_format, _zt_bpp;  // 0 for a colour texture
     uint8_t _zt_kind;              // the PTE kind its memory needs
-    bool _swizzled;                // read through a swizzle (MTLTextureSwizzle values for x, y, z, w)
+    bool _swizzled;
     uint8_t _swizzle[4];
-    // an image: its format, level 0's size, its layers (6 a cube) and levels; a view sees _levels of them from
-    // _view_min, and _offset is its first layer's
+    // a view sees _levels from _view_min, and _offset is its first layer's
     bool _image;
     MTLPixelFormat _format;
     NSUInteger _width, _height;
-    uint32_t _depth;  // a 3D texture's slices, 1 otherwise
-    uint32_t _samples;  // a multisampled texture's per pixel, a grid of them each (see malachite_grid); 0 otherwise
+    uint32_t _depth;
+    uint32_t _samples;  // in a grid per pixel (see malachite_grid); 0 when not multisampled
     uint32_t _layers;
     uint32_t _levels, _image_levels, _view_min;
     uint64_t _layer_stride;
-    // the storage mode asked for, when the device put the texture somewhere else (see malachite_storage)
+    // when the device put the texture somewhere else (see malachite_storage)
     MTLStorageMode _asked;
     bool _moved;
 }
@@ -189,40 +163,34 @@ extern "C" {
             stride:(NSUInteger)stride image:(NSUInteger)image in:(bool)in;
 @end
 
-// with MALACHITE_TRACE set, or /var/tmp/malachite-trace naming the process (for apps launched for you), when the device is made:
-// every pipeline, pass, draw and dispatch logged, for finding what an app draws that comes out wrong
+// MALACHITE_TRACE, or /var/tmp/malachite-trace naming the process for apps launched for you
 static bool malachite_trace;
-static bool malachite_dump;  // every shader's AIR saved, without the trace's logging ("name +dump")
-static bool malachite_snap;  // and with it the attachment snapshots and buffer dumps, which copy on the GPU
+static bool malachite_dump;  // "name +dump": AIR saved without the trace's logging
+static bool malachite_snap;  // attachment snapshots and buffer dumps, which copy on the GPU
 
-// A trace control file this process may act on: a plain file (not a link) nobody else can write, owned by root, or
-// with own_ok by this process's user too (the replay tools write overrides for themselves). Anything else could be
-// planted by another user to make WindowServer write files of its choosing or compile bitcode it supplied.
+// Another user could plant a control file to make WindowServer write where they like or compile their bitcode.
+// own_ok lets the replay tools write overrides for themselves.
 static bool malachite_trusted_file(const char *path, bool own_ok)
 {
     struct stat st;
     return path && !lstat(path, &st) && S_ISREG(st.st_mode) && !(st.st_mode & (S_IWGRP | S_IWOTH)) &&
            (st.st_uid == 0 || (own_ok && st.st_uid == getuid()));
 }
-static NSArray<NSString *> *malachite_snap_only;  // "+snap=A|B": snapshots only of draws whose label has A or B in it
-static bool malachite_snap_gate;  // "+snapgate": and only while /var/tmp/malachite-snap exists, looked at once a pass
-// "+snaprect=x,y,w,h": snapshots of every draw to a target holding the rect whose scissor reaches into it, of the
-// rect alone
+static NSArray<NSString *> *malachite_snap_only;  // "+snap=A|B": only draws whose label has A or B in it
+static bool malachite_snap_gate;  // "+snapgate": only while /var/tmp/malachite-snap exists, checked once a pass
+// "+snaprect=x,y,w,h": only the rect, of every draw whose scissor reaches into it
 static uint32_t malachite_snap_rect[4];
-// "+record=A|B": each draw whose label has A or B in it (in +snaprect's rect if one's given, while +snapgate's file
-// exists if that's given) recorded whole into /tmp/malachite-rec-<pid>-<n>/, for tools/mtl/mtlplay to replay on any GPU;
-// and the first dispatch of each kernel whose name has A or B in it, its buffers only ("+recskip=N": the one after
-// its first N instead)
+// "+record=A|B": matching draws recorded whole into /tmp/malachite-rec-<pid>-<n>/ for tools/mtl/mtlplay, and the
+// buffers of each matching kernel's first dispatch ("+recskip=N": the one after its first N)
 static NSArray<NSString *> *malachite_rec_only;
 static int malachite_rec_skip;
 static bool malachite_rec_bytes(id cb, NSString *path, uint64_t src, uint32_t size);
-static bool malachite_rec_shut;    // the gate's shut
+static bool malachite_rec_shut;
 static bool malachite_rec_full;    // the process has written the recorder's budget
 static bool malachite_snap_gated;  // the gate opens the snapshots too, not only the recorder
-static char malachite_desc_key;    // the recorder: the descriptor a pipeline, sampler or depth/stencil state was made from
-static char malachite_air_key;     // and the AIR a function was compiled from, with its linked functions' and their names
+static char malachite_desc_key;    // the descriptor a pipeline, sampler or depth/stencil state was made from
+static char malachite_air_key;     // the AIR a function was compiled from, with its linked functions and their names
 
-// The texture format behind a pixel format, or -1 for one we don't handle.
 static int malachite_format(MTLPixelFormat f)
 {
     switch (f) {
@@ -291,7 +259,7 @@ static int malachite_format(MTLPixelFormat f)
     case MTLPixelFormatBC6H_RGBUfloat: return TEX_BC6H_UFLOAT;
     case MTLPixelFormatBC7_RGBAUnorm: return TEX_BC7;
     case MTLPixelFormatBC7_RGBAUnorm_sRGB: return TEX_BC7_SRGB;
-    // depth/stencil targets sampled (see malachite_zeta for their layouts)
+    // sampled depth/stencil targets (layouts in malachite_zeta)
     case MTLPixelFormatDepth16Unorm: return TEX_Z16;
     case MTLPixelFormatDepth32Float: return TEX_Z32_FLOAT;
     case MTLPixelFormatDepth24Unorm_Stencil8:
@@ -303,8 +271,7 @@ static int malachite_format(MTLPixelFormat f)
     }
 }
 
-// A depth/stencil format as SET_ZT_FORMAT, bytes per pixel and PTE kind (Turing's); 0 for a colour format.
-// Stencil-only and 24-bit depth formats take the 32-bit float depth + 8-bit stencil layout.
+// Turing's PTE kinds; stencil-only and 24-bit depth take the ZF32_X24S8 layout.
 static uint32_t malachite_zeta(MTLPixelFormat f, uint32_t *bpp, uint8_t *kind)
 {
     enum { ZF32 = 0x0a, Z16 = 0x13, ZF32_X24S8 = 0x19 };
@@ -319,7 +286,7 @@ static uint32_t malachite_zeta(MTLPixelFormat f, uint32_t *bpp, uint8_t *kind)
     }
 }
 
-// bytes per pixel, per 4x4 block for a compressed format; 0 for one we don't handle
+// per 4x4 block for a compressed format
 static NSUInteger malachite_bytes_per_pixel(MTLPixelFormat f)
 {
     int t = malachite_format(f);
@@ -332,8 +299,7 @@ static uint32_t malachite_block(MTLPixelFormat f)
     return t < 0 ? 1 : tex_format_info((enum tex_format)t).block;
 }
 
-// level l of an image whose level 0 is w x h x d texels: its size in blocks, its row of GOBs, its offset in a layer
-// and a slice's bytes; levels at the end of the chain give the layer's size
+// sizes in blocks; a level past the end of the chain gives the layer's size
 struct malachite_lvl {
     uint32_t width, height, depth, pitch, rows;
     uint64_t offset, slice;
@@ -355,8 +321,7 @@ static struct malachite_lvl malachite_image_level(MTLPixelFormat f, NSUInteger w
     return v;
 }
 
-// A pass's clear colour as SET_COLOR_CLEAR_VALUE takes it: an integer target's as the integers' bits, which the 3D
-// class clamps to the format's channels.
+// SET_COLOR_CLEAR_VALUE takes an integer target's colour as the integers' bits, clamped by the 3D class.
 static void malachite_clear_colour(enum tex_format f, MTLClearColor c, float out[4])
 {
     const double v[4] = { c.red, c.green, c.blue, c.alpha };
@@ -373,21 +338,19 @@ static void malachite_clear_colour(enum tex_format f, MTLClearColor c, float out
     }
 }
 
-// the grid of samples a multisampled pixel is in memory: 2x1, 2x2, 4x2, as the 3D class renders them
+// as the 3D class lays samples out in memory
 static void malachite_grid(uint32_t samples, uint32_t *sx, uint32_t *sy)
 {
     *sx = samples >= 8 ? 4 : samples >= 2 ? 2 : 1;
     *sy = samples >= 4 ? 2 : 1;
 }
 
-// One 2D surface of a texture: a level of one slice (an array's layer, a cube's face) at one depth (a 3D level's z):
-// where it starts in the backing buffer, its row (block-linear: a row of GOBs), and its size in blocks (texels for
-// an uncompressed format). False for one the texture lacks.
+// one level of one slice at one z, sized in blocks
 struct malachite_sub {
     uint64_t offset;
     uint32_t pitch;
     uint32_t width, height;
-    uint32_t rows;  // block-linear: the height rounded to a GOB's 8 rows; 0 for pitch-linear
+    uint32_t rows;  // 0 for pitch-linear
     uint32_t bpp, block;
 };
 
@@ -408,7 +371,7 @@ static bool malachite_sub(MalachiteTexture *t, NSUInteger level, NSUInteger slic
     }
     if (level || z)
         return false;
-    bool rows = t->_type == MTLTextureType1DArray;  // a layer is a row
+    bool rows = t->_type == MTLTextureType1DArray;
     if (slice && !rows)
         return false;
     id<MTLTexture> mt = (id<MTLTexture>)t;
@@ -417,16 +380,14 @@ static bool malachite_sub(MalachiteTexture *t, NSUInteger level, NSUInteger slic
     return true;
 }
 
-// where byte x of row y lies in a block-linear surface whose row of GOBs is `pitch` bytes: one-GOB blocks, a GOB
-// 64 bytes by 8 rows of 16-byte sectors
+// a GOB is 64 bytes by 8 rows of 16-byte sectors
 static size_t malachite_gob_offset(uint32_t pitch, size_t x, size_t y)
 {
     size_t gob = y / 8 * (pitch / 64) + x / 64;
     return gob * 512 + (x % 64) / 32 * 256 + (y % 8) / 4 * 128 + (x % 32) / 16 * 64 + (y % 4) * 16 + x % 16;
 }
 
-// a region of one surface (in blocks) to or from rows of bytes on the CPU; block-linear ones 16 bytes (a sector's
-// run) at a time
+// block-linear surfaces a sector's 16 bytes at a time
 static void malachite_copy_sub(uint8_t *pixels, const struct malachite_sub *s, size_t x0, size_t y0, size_t w, size_t h,
                            uint8_t *bytes, NSUInteger stride, bool in)
 {
@@ -447,26 +408,18 @@ static void malachite_copy_sub(uint8_t *pixels, const struct malachite_sub *s, s
     }
 }
 
-// withLength:/withOptions:/withPointer: rounds to a page, fills the args block and forwards to the MTLIOAccelBuffer
-// designated init.
-//
-// A Managed buffer is in system memory for the CPU, and has a copy in VRAM that the GPU uses (gpuAddress answers
-// with it), as a discrete card's driver keeps it: the GPU reading over PCIe was a fifth of a scene's frame time. A
-// range the CPU modified (didModifyRange:, and the whole buffer once it's made) is copied across by the command
-// buffer committed next; synchronizeResource: copies the other way.
+// A Managed buffer has a VRAM copy the GPU uses, as a discrete card's driver keeps it: reading over PCIe was a fifth
+// of a scene's frame time. The next commit copies what the CPU changed; synchronizeResource: copies back.
 @interface MalachiteBuffer : MTLIOAccelBuffer <MTLBuffer> {
 @public
     MalachiteBuffer *_mirror;
-    NSUInteger _dirty_lo, _dirty_hi;  // what the CPU changed since the copy to _mirror was queued
+    NSUInteger _dirty_lo, _dirty_hi;  // changed since the copy to _mirror was queued
     bool _pending;                    // on malachite_pending
-    bool _one_image;                  // made for a single image, so nothing else lies in it
-    bool _compress_asked;             // its colour surface has had a MALACHITE_CMD_COMPRESS
-    // a no-copy one over an app's memory (CL_MEM_USE_HOST_PTR): OpenCL's renderer makes it Managed and the app
-    // reads it with no synchronizeResource (AMD's driver kept such buffers in system memory), so a kernel's writes
-    // are copied back for it. OpenCL's own buffers it reads through copies on the GPU.
+    bool _one_image;                  // nothing but a single image lies in it
+    bool _compress_asked;
+    // CL_MEM_USE_HOST_PTR memory the app reads without synchronizeResource (AMD kept it in system memory)
     bool _writeback;
-    // a no-copy buffer's pointer into its page: the base maps from the page's start, and contents and the GPU
-    // address are the pointer's
+    // the base maps from the page's start
     NSUInteger _page_off;
 }
 - (uint64_t)systemAddress;
@@ -477,16 +430,13 @@ static void malachite_copy_sub(uint8_t *pixels, const struct malachite_sub *s, s
                withDeallocator:(void (^)(void))dealloc;
 @end
 
-// A heap is one block of memory its resources are placed in, as Metal has it: MPS makes its temporaries there and
-// marks them aliasable when done, counting on the next to reuse the same memory. Each with its own VRAM, a graph's
-// temporaries add up to more than the GPU has before it runs any of them. An automatic heap finds each resource a
-// range of the block in its holes; a placement heap puts it where the app says and keeps no track, as the app lays
-// its resources out, over each other where it wants them to alias.
+// A heap must be one real block: MPS marks temporaries aliasable expecting reuse, and given VRAM each, a graph's
+// temporaries outgrow the GPU. Placement heaps keep no track, the app lays out the aliasing.
 @class MalachiteHeap;
 
 @interface MalachiteHeapBuffer : NSObject <MTLBuffer> {
 @public
-    MalachiteHeap *_heap;  // keeps the block, and so the memory, while this lives
+    MalachiteHeap *_heap;  // keeps the block's memory alive
     NSUInteger _offset, _length, _size;
     MTLResourceOptions _options;
     bool _aliasable;
@@ -500,7 +450,7 @@ static void malachite_copy_sub(uint8_t *pixels, const struct malachite_sub *s, s
     MTLHeapDescriptor *_desc;
     id<MTLBuffer> _block;
     os_unfair_lock _lock;
-    std::map<NSUInteger, NSUInteger> _holes;  // offset to length, of what's free in the block
+    std::map<NSUInteger, NSUInteger> _holes;  // offset to length
     NSUInteger _free;
 }
 @property (copy) NSString *label;
@@ -515,9 +465,9 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
 
 static bool opengl_renderer;  // Apple's OpenGL and OpenCL renderer is loaded in this process
 
-// Managed buffers with ranges to copy to VRAM; each commit takes the lot
+// each commit takes the lot
 static NSMutableArray<MalachiteBuffer *> *malachite_pending;
-static uint64_t malachite_allocated;  // bytes of buffers alive, for the device's currentAllocatedSize
+static uint64_t malachite_allocated;  // for currentAllocatedSize
 
 static void malachite_mark_dirty(MalachiteBuffer *b, NSUInteger lo, NSUInteger hi)
 {
@@ -542,7 +492,7 @@ static void malachite_mark_dirty(MalachiteBuffer *b, NSUInteger lo, NSUInteger h
 
 static uint64_t malachite_vram(void);
 
-// memory OpenCL's runtime allocated for itself, which it tags so
+// OpenCL's runtime tags its own allocations
 static bool malachite_opencl_memory(void *ptr)
 {
     vm_address_t at = (vm_address_t)ptr;
@@ -567,16 +517,13 @@ static bool malachite_opencl_memory(void *ptr)
     void *aligned = (void *)((uintptr_t)ptr & ~(uintptr_t)(page - 1));
     NSUInteger sysMem = (off + length + page - 1) & ~(NSUInteger)(page - 1);
 
-    // 0x80-byte args, zeroed because the super designated init reads garbage otherwise. [0x00..0x67] is
-    // IOAccelNewResourceData, filled from our params; [0x68..0x7f] is the driver-private tail (plain-buffer kind,
-    // length, non-shared flag), which the base new_resource path doesn't read.
+    // zeroed, or the base init reads garbage; [0x68..0x7f] is our tail: kind, length, non-shared flag
     uint8_t args[0x80];
     memset(args, 0, sizeof(args));
     *(uint32_t *)(args + 0x68) = 1;
     *(uint64_t *)(args + 0x70) = (uint64_t)length;
     *(uint32_t *)(args + 0x78) = (options & 0xF0) ? 1 : 0;
-    // private storage, which only the GPU reads or writes, lives in VRAM (the base wants system memory for every
-    // buffer, as a discrete GPU's driver keeps to page VRAM out to)
+    // the base wants system memory behind every buffer to page VRAM out to; private storage needs none
     bool vid = !ptr && (options & MTLResourceStorageModeMask) == MTLResourceStorageModePrivate;
 
     self = [super initWithDevice:device
@@ -592,12 +539,8 @@ static bool malachite_opencl_memory(void *ptr)
         return nil;
     _page_off = off;
     __atomic_add_fetch(&malachite_allocated, length, __ATOMIC_RELAXED);
-    // every Managed buffer up to a quarter of VRAM gets its copy: only the ranges the CPU changes are copied across, and
-    // one the GPU writes gains outright (Feature Matching's 300 MB cube took 2.4 ms a pass written over the bus). A small
-    // one too: Path Tracer's 4-byte ray counters took 2M atomics a bounce over the bus. OpenCL's buffers read from
-    // system memory ran its kernels 10-100 times slower.
-    // A no-copy one only for OpenCL, which says what it changed. WindowServer wraps the memory apps draw their layers
-    // into and never calls didModifyRange: its copy kept the first picture, and fields showed old text while typing.
+    // Even small ones: GPU writes and atomics over the bus cost far more than copying, and OpenCL kernels ran 10-100x
+    // slower. No-copy ones only for OpenCL: WindowServer never calls didModifyRange: on layer memory, so text went stale.
     if ((options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged && length &&
         (!ptr || opengl_renderer) && length <= malachite_vram() / 4) {
         _mirror = [[MalachiteBuffer alloc] initWithDevice:device
@@ -626,8 +569,7 @@ static bool malachite_opencl_memory(void *ptr)
     return [super gpuAddress] + _page_off;
 }
 
-// a pointer that wasn't on a page answers with itself, not its page: OpenCL copies a buffer's data in when contents
-// isn't its own pointer, and from the page's start that went over the caller's stack
+// OpenCL copies data in when contents isn't its own pointer, and from the page's start that overran the caller's stack
 - (void *)contents
 {
     uint8_t *c = (uint8_t *)[super contents];
@@ -640,7 +582,6 @@ static bool malachite_opencl_memory(void *ptr)
     [super didModifyRange:range];
 }
 
-// A pitch-linear 2D texture viewing this buffer's memory, so its GPU address is ours plus the offset.
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset
                    bytesPerRow:(NSUInteger)bytesPerRow
 {
@@ -648,12 +589,12 @@ static bool malachite_opencl_memory(void *ptr)
         [[MalachiteTexture alloc] initWithBuffer:self descriptor:descriptor offset:offset bytesPerRow:bytesPerRow];
     if (t) {
         t->_backing = self;
-        t->_owned = self;  // a texture over a buffer keeps it, as Metal's do: the app may drop the buffer first
+        t->_owned = self;  // as Metal's do, the app may drop the buffer first
         t->_offset = offset;
         t->_pitch = (uint32_t)bytesPerRow;
         t->_type = descriptor.textureType;
         t->_usage = descriptor.usage;
-        t->_width = descriptor.width;  // the base keeps 16 bits of it, a texture buffer's can be millions
+        t->_width = descriptor.width;  // the base keeps 16 bits, a texture buffer's can be millions
     }
     return malachite_swizzled(t, descriptor.swizzle);  // CoreAnimation reads its one-channel surfaces through one
 }
