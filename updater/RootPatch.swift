@@ -14,7 +14,7 @@ private let oclpMarker = "/System/Library/CoreServices/OpenCore-Legacy-Patcher.p
 
 // on=0: turned off with --remove-root-patch. sealed=1: macOS's sealed snapshot was booted when the copy first went on,
 // so going back to it loses nothing. patched: the booted snapshot when the last patch was made, which tells a patch
-// waiting for a restart from one a macOS update took away
+// waiting for a restart from one a macOS update took away. made: the snapshots bless made for the patches, by UUID
 func rootPatchState() -> [String: String] {
     parseFields((try? String(contentsOfFile: rootPatchFile, encoding: .utf8)) ?? "")
 }
@@ -37,6 +37,61 @@ func rootVolume() -> RootVolume? {
           let suffix = id.range(of: "s[0-9]+$", options: .regularExpression) else { return nil }
     return RootVolume(device: String(id[..<suffix.lowerBound]), snapshot: info["APFSSnapshotUUID"] as? String ?? "",
                       sealed: info["Sealed"] as? String == "Yes")
+}
+
+// name by UUID, of the volume's snapshots
+private func snapshots(_ device: String) -> [String: String] {
+    let out = capture("/usr/sbin/diskutil", ["apfs", "listSnapshots", "-plist", device], timeout: 60)
+    let info = try? PropertyListSerialization.propertyList(from: out.data, format: nil) as? [String: Any]
+    var names: [String: String] = [:]
+    for s in info?["Snapshots"] as? [[String: Any]] ?? [] {
+        if let uuid = s["SnapshotUUID"] as? String, let name = s["SnapshotName"] as? String {
+            names[uuid] = name
+        }
+    }
+    return names
+}
+
+// bless with a new snapshot to boot from; returns the UUIDs of the snapshots that made
+private func blessSnapshot(_ root: RootVolume, mnt: String, steps: Steps) throws -> [String] {
+    let before = snapshots(root.device)
+    try steps.must(bless, ["--mount", mnt, "--bootefi", "--create-snapshot"])
+    // the booted snapshot is always listed: an empty list failed, and every snapshot would pass for ours
+    guard !before.isEmpty else { return [] }
+    return snapshots(root.device).keys.filter { before[$0] == nil }.sorted()
+}
+
+// each patch leaves the snapshot before it behind: deletes those of ours that are neither booted nor to be booted next,
+// never macOS's sealed one; returns the ones still there
+private func dropOldSnapshots(_ root: RootVolume, made: [String], keep: Set<String>, steps: Steps, say: Say) -> [String] {
+    let names = snapshots(root.device)
+    guard !names.isEmpty else { return made }
+    var kept: [String] = []
+    var dropped = 0
+    for uuid in made {
+        guard let name = names[uuid] else { continue }
+        if keep.contains(uuid) || !name.hasPrefix("com.apple.bless.") {
+            kept.append(uuid)
+            continue
+        }
+        let out = steps.tool("/usr/sbin/diskutil", ["apfs", "deleteSnapshot", root.device, "-uuid", uuid])
+        if out.status == 0 {
+            dropped += 1
+        } else {
+            kept.append(uuid)
+            say("  ! Old system snapshot \(name) not deleted, it keeps using disk space until it is: "
+                + out.text.trimmingCharacters(in: .whitespacesAndNewlines))
+            say("    The next root patch tries again")
+        }
+    }
+    if dropped > 0 {
+        say("  \(dropped) old system snapshot\(dropped == 1 ? "" : "s") deleted")
+    }
+    return kept
+}
+
+private func madeList(_ state: [String: String]) -> [String] {
+    (state["made"] ?? "").split(separator: ",").map(String.init)
 }
 
 private func sameBundle(_ a: String, _ b: String) -> Bool {
@@ -83,11 +138,14 @@ func patchRoot(steps: Steps, say: Say) throws -> Bool {
             try steps.put(gpuBundle, dst)
             try steps.must("/bin/chmod", ["-R", "u=rwX,go=rX", dst])
         }
-        try steps.must(bless, ["--mount", mnt, "--bootefi", "--create-snapshot"])
+        let new = try blessSnapshot(root, mnt: mnt, steps: steps)
+        let made = dropOldSnapshots(root, made: madeList(state) + new, keep: Set(new + [root.snapshot]), steps: steps,
+                                    say: say)
         // the seal is ours to have broken if the booted snapshot has our copy, or our patch of it waits for a restart
         let ours = exists(systemBundle) || state["patched"] == root.snapshot
         let sealed = root.sealed || (ours && state["sealed"] == "1")
-        try steps.write("on=1\nsealed=\(sealed ? 1 : 0)\npatched=\(root.snapshot)\n", to: rootPatchFile)
+        try steps.write("on=1\nsealed=\(sealed ? 1 : 0)\npatched=\(root.snapshot)\nmade=\(made.joined(separator: ","))\n",
+                        to: rootPatchFile)
         say("  Metal driver on the system volume, for browsers (new snapshot, takes effect at the next restart)")
         changed = true
     }
@@ -104,6 +162,7 @@ func unpatchRoot(steps: Steps, say: Say) throws -> Bool {
         return false
     }
     var changed = false
+    var made = madeList(state)
     try onSystemVolume(root, steps: steps) { mnt in
         let dst = "\(mnt)\(systemBundle)"
         guard steps.dry || exists(dst) || exists(systemBundle) else {
@@ -113,16 +172,18 @@ func unpatchRoot(steps: Steps, say: Say) throws -> Bool {
         try steps.remove(dst)
         try steps.remove("\(dst).new")
         let alone = state["sealed"] == "1" && !exists("\(mnt)\(oclpMarker)")
+        var new: [String] = []
         if alone, steps.tool(bless, ["--mount", mnt, "--bootefi", "--last-sealed-snapshot"]).status == 0 {
             say("System volume back on macOS's sealed snapshot")
         } else {
-            try steps.must(bless, ["--mount", mnt, "--bootefi", "--create-snapshot"])
+            new = try blessSnapshot(root, mnt: mnt, steps: steps)
             say("Metal driver removed from the system volume (new snapshot, other patches kept)")
         }
+        made = dropOldSnapshots(root, made: made + new, keep: Set(new + [root.snapshot]), steps: steps, say: say)
         changed = true
     }
     if exists(supportDir) {
-        try steps.write("on=0\nsealed=\(state["sealed"] ?? "0")\n", to: rootPatchFile)
+        try steps.write("on=0\nsealed=\(state["sealed"] ?? "0")\nmade=\(made.joined(separator: ","))\n", to: rootPatchFile)
     }
     return changed
 }
