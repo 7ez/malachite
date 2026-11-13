@@ -209,8 +209,7 @@ static int malachite_format(MTLPixelFormat f)
     case MTLPixelFormatR16Float: return TEX_R16_FLOAT;
     case MTLPixelFormatRG16Float: return TEX_RG16_FLOAT;
     case MTLPixelFormatRGBA16Float: return TEX_RGBA16_FLOAT;
-    // CoreAnimation's extended-range video and wide-colour layers, in the nearest layouts the GPU has (their values
-    // come out approximate, where an unsupported format was a nil texture and an abort)
+    // CoreAnimation's extended-range and wide-colour layers, approximated, as a nil texture aborted
     case MTLPixelFormatBGRA10_XR: case MTLPixelFormatBGRA10_XR_sRGB: return TEX_RGBA16_FLOAT;
     case MTLPixelFormatBGR10_XR: case MTLPixelFormatBGR10_XR_sRGB: return TEX_BGR10A2_UNORM;
     case MTLPixelFormatR8Unorm_sRGB: return TEX_R8_UNORM;
@@ -540,7 +539,7 @@ static bool malachite_opencl_memory(void *ptr)
     _page_off = off;
     __atomic_add_fetch(&malachite_allocated, length, __ATOMIC_RELAXED);
     // Even small ones: GPU writes and atomics over the bus cost far more than copying, and OpenCL kernels ran 10-100x
-    // slower. No-copy ones only for OpenCL: WindowServer never calls didModifyRange: on layer memory, so text went stale.
+    // slower. No-copy ones only for OpenCL: WindowServer never calls didModifyRange: on layers, so text went stale.
     if ((options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged && length &&
         (!ptr || opengl_renderer) && length <= malachite_vram() / 4) {
         _mirror = [[MalachiteBuffer alloc] initWithDevice:device
@@ -2125,7 +2124,7 @@ static int malachite_fill_texture_header(uint32_t out[8], id texture, id cb)
     return 0;
 }
 
-// The constant data lies after the code. A size past capacity (a draw's 20 buffers) isn't written; the caller refuses it.
+// Constant data lies after the code. A size past capacity (a draw's 20 buffers) isn't written; the caller refuses it.
 static uint32_t malachite_fill_params(const struct nvk_header *h, const uint64_t buffers[31], uint64_t code,
                                   uint8_t *params, uint32_t capacity)
 {
@@ -2283,7 +2282,7 @@ static struct samp_desc malachite_const_sampler(uint64_t bits)
     return s;
 }
 
-// The texture unit wants DEPTH_COMPARE set only for compares, never being Metal's default; a slot used both ways keeps it.
+// The texture unit wants DEPTH_COMPARE only for compares, never being Metal's default; a slot used both ways keeps it.
 static struct samp_desc malachite_compare_as_used(const struct nvk_header *h, unsigned slot, struct samp_desc s)
 {
     if (h->compare_samplers >> slot & 1) {
@@ -4686,7 +4685,7 @@ static bool malachite_resolves(MTLStoreAction action)
         MalachiteTexture *t = (MalachiteTexture *)_textures[slot];
         if (![t isKindOfClass:[MalachiteTexture class]] || !t->_backing)
             continue;
-        // image levels stay in GOB layout; the tools untile them
+        // image levels are saved as the GOBs they are
         for (uint32_t level = 0; t->_image && level < t->_levels && level < 6; level++) {
             struct malachite_sub s;
             if (!malachite_sub(t, level, 0, 0, &s) || !s.rows || (uint64_t)s.pitch * s.rows > 64u << 20)
@@ -5243,7 +5242,7 @@ static bool malachite_run_room(MalachiteCommandBuffer *cb)
 }
 
 // A draw sampling its own target (CoreAnimation's backdrop) reads a copy, or a quad's second triangle samples its
-// first, a streak along the diagonal. Refraction reads any distance away, so later copies cover what draws touched since.
+// first, a streak along the diagonal. Refraction reads anywhere, so later copies cover what draws touched since.
 - (void)attachment:(unsigned)n copy:(unsigned int *)header of:(const struct nvgpu_draw &)d
 {
     struct nvgpu_target ct = malachite_target(d, n);
