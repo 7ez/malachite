@@ -2990,6 +2990,85 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
     }];
 }
 
+// An OpenCL image's channel order << 16 | channel data type, as cl.h numbers them, from the texture its renderer made
+// for it (the orders a one- or four-channel format doesn't say, from its swizzle); 0 for none
+static uint32_t malachite_cl_format(__unsafe_unretained id texture)
+{
+    enum { R = 0x10b0, A, RG, RA, RGB, RGBA, BGRA, ARGB, INTENSITY, LUMINANCE, RGBX = 0x10bc, DEPTH,
+           SRGBX = 0x10c0, SRGBA, SBGRA, ABGR };
+    enum { SNORM8 = 0x10d0, SNORM16, UNORM8, UNORM16, UNORM565, UNORM555, UNORM101010, SINT8, SINT16, SINT32, UINT8,
+           UINT16, UINT32, HALF, FLOAT };
+    if (![texture conformsToProtocol:@protocol(MTLTexture)])
+        return 0;
+    uint32_t type, order;
+    switch ([(id<MTLTexture>)texture pixelFormat]) {
+    case MTLPixelFormatA8Unorm: return A << 16 | UNORM8;
+    case MTLPixelFormatR8Unorm: type = UNORM8, order = R; break;
+    case MTLPixelFormatR8Snorm: type = SNORM8, order = R; break;
+    case MTLPixelFormatR8Uint: type = UINT8, order = R; break;
+    case MTLPixelFormatR8Sint: type = SINT8, order = R; break;
+    case MTLPixelFormatR16Unorm: type = UNORM16, order = R; break;
+    case MTLPixelFormatR16Snorm: type = SNORM16, order = R; break;
+    case MTLPixelFormatR16Uint: type = UINT16, order = R; break;
+    case MTLPixelFormatR16Sint: type = SINT16, order = R; break;
+    case MTLPixelFormatR16Float: type = HALF, order = R; break;
+    case MTLPixelFormatR32Uint: type = UINT32, order = R; break;
+    case MTLPixelFormatR32Sint: type = SINT32, order = R; break;
+    case MTLPixelFormatR32Float: type = FLOAT, order = R; break;
+    case MTLPixelFormatRG8Unorm: type = UNORM8, order = RG; break;
+    case MTLPixelFormatRG8Snorm: type = SNORM8, order = RG; break;
+    case MTLPixelFormatRG8Uint: type = UINT8, order = RG; break;
+    case MTLPixelFormatRG8Sint: type = SINT8, order = RG; break;
+    case MTLPixelFormatRG16Unorm: type = UNORM16, order = RG; break;
+    case MTLPixelFormatRG16Snorm: type = SNORM16, order = RG; break;
+    case MTLPixelFormatRG16Uint: type = UINT16, order = RG; break;
+    case MTLPixelFormatRG16Sint: type = SINT16, order = RG; break;
+    case MTLPixelFormatRG16Float: type = HALF, order = RG; break;
+    case MTLPixelFormatRG32Uint: type = UINT32, order = RG; break;
+    case MTLPixelFormatRG32Sint: type = SINT32, order = RG; break;
+    case MTLPixelFormatRG32Float: type = FLOAT, order = RG; break;
+    case MTLPixelFormatRGBA8Unorm: type = UNORM8, order = RGBA; break;
+    case MTLPixelFormatRGBA8Unorm_sRGB: type = UNORM8, order = SRGBA; break;
+    case MTLPixelFormatRGBA8Snorm: type = SNORM8, order = RGBA; break;
+    case MTLPixelFormatRGBA8Uint: type = UINT8, order = RGBA; break;
+    case MTLPixelFormatRGBA8Sint: type = SINT8, order = RGBA; break;
+    case MTLPixelFormatBGRA8Unorm: return BGRA << 16 | UNORM8;
+    case MTLPixelFormatBGRA8Unorm_sRGB: return SBGRA << 16 | UNORM8;
+    case MTLPixelFormatRGBA16Unorm: type = UNORM16, order = RGBA; break;
+    case MTLPixelFormatRGBA16Snorm: type = SNORM16, order = RGBA; break;
+    case MTLPixelFormatRGBA16Uint: type = UINT16, order = RGBA; break;
+    case MTLPixelFormatRGBA16Sint: type = SINT16, order = RGBA; break;
+    case MTLPixelFormatRGBA16Float: type = HALF, order = RGBA; break;
+    case MTLPixelFormatRGBA32Uint: type = UINT32, order = RGBA; break;
+    case MTLPixelFormatRGBA32Sint: type = SINT32, order = RGBA; break;
+    case MTLPixelFormatRGBA32Float: type = FLOAT, order = RGBA; break;
+    case MTLPixelFormatB5G6R5Unorm: return RGB << 16 | UNORM565;
+    case MTLPixelFormatBGR5A1Unorm: return RGB << 16 | UNORM555;
+    case MTLPixelFormatBGR10A2Unorm:
+    case MTLPixelFormatRGB10A2Unorm: return RGB << 16 | UNORM101010;
+    case MTLPixelFormatDepth16Unorm: return DEPTH << 16 | UNORM16;
+    case MTLPixelFormatDepth32Float: return DEPTH << 16 | FLOAT;
+    default: return 0;
+    }
+    if (![texture isKindOfClass:[MalachiteTexture class]] || !((MalachiteTexture *)texture)->_swizzled)
+        return order << 16 | type;
+    const uint8_t *s = ((MalachiteTexture *)texture)->_swizzle;
+    enum { Z = MTLTextureSwizzleZero, O = MTLTextureSwizzleOne, SR = MTLTextureSwizzleRed,
+           SG = MTLTextureSwizzleGreen, SB = MTLTextureSwizzleBlue, SA = MTLTextureSwizzleAlpha };
+#define SWIZZLE(x, y, z, w) (s[0] == (x) && s[1] == (y) && s[2] == (z) && s[3] == (w))
+    if (order == R)
+        order = SWIZZLE(SR, SR, SR, SR) ? INTENSITY : SWIZZLE(SR, SR, SR, O) ? LUMINANCE : SWIZZLE(Z, Z, Z, SR) ? A : R;
+    else if (order == RG && SWIZZLE(SR, Z, Z, SG))
+        order = RA;
+    else if (order == RGBA)
+        order = SWIZZLE(SR, SG, SB, O) ? RGBX : SWIZZLE(SG, SB, SA, SR) ? ARGB : SWIZZLE(SA, SB, SG, SR) ? ABGR
+              : SWIZZLE(SB, SG, SR, SA) ? BGRA : RGBA;
+    else if (order == SRGBA && SWIZZLE(SR, SG, SB, O))
+        order = SRGBX;
+#undef SWIZZLE
+    return order << 16 | type;
+}
+
 // The address each [[buffer(n)]] param gets: the bound buffers', or for an OpenCL kernel the ones 3 further on.
 // AppleMetalOpenGLRenderer binds buffer i at 3 + i (GLDQueueRec::executeKernel: setBuffer:offset:atIndex: for a
 // buffer, setBytes:length:atIndex: for one passed by value, counting buffers alone), where the AIR names it i.
@@ -3010,6 +3089,15 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
                 out[a->index] = _buffers[0];
             else
                 malachite_upload(_cb, none, sizeof(none), &out[a->index]);
+            continue;
+        }
+        if (a->kind == NVK_ARG_BUFFER && a->index == AIRC_CL_FORMATS) {
+            uint32_t formats[MALACHITE_BINDINGS];
+            NSUInteger n = 1;
+            for (NSUInteger t = 0; t < MALACHITE_BINDINGS; t++)
+                if ((formats[t] = malachite_cl_format(_textures[t])))
+                    n = t + 1;
+            malachite_upload(_cb, formats, 4 * n, &out[a->index]);
             continue;
         }
         if (a->kind != NVK_ARG_BUFFER || a->index + MALACHITE_CL_FIRST >= 31)
@@ -6770,10 +6858,11 @@ struct malachite_compiled {
 };
 
 // the arguments of a compiled function that resources bind to
-// the compiler's hidden argument for an OpenCL kernel's global work offset, which no one binds by its index
-static bool malachite_hidden_offsets(const struct nvk_arg *a, const char *name)
+// the compiler's hidden arguments for an OpenCL kernel's global work offset and image formats, which no one binds
+// by their index
+static bool malachite_hidden_arg(const struct nvk_arg *a, const char *name)
 {
-    return a->kind == NVK_ARG_BUFFER && a->index == AIRC_CL_OFFSETS && !name[0];
+    return a->kind == NVK_ARG_BUFFER && (a->index == AIRC_CL_OFFSETS || a->index == AIRC_CL_FORMATS) && !name[0];
 }
 
 static NSArray<MalachiteArgument *> *malachite_arguments(const struct malachite_compiled *k)
@@ -6784,7 +6873,7 @@ static NSArray<MalachiteArgument *> *malachite_arguments(const struct malachite_
         // threadgroup memory too: OpenCL takes an argument's index from its place in this list, and a __local one
         // left out moved every one after it
         if ((kind != NVK_ARG_BUFFER && kind != NVK_ARG_TEXTURE && kind != NVK_ARG_SAMPLER && kind != NVK_ARG_THREADGROUP) ||
-            malachite_hidden_offsets(&k->h.args[i], k->arg_names[i].name))
+            malachite_hidden_arg(&k->h.args[i], k->arg_names[i].name))
             continue;
         MalachiteArgument *a = [MalachiteArgument new];
         a.name = @(k->arg_names[i].name);
@@ -6842,7 +6931,7 @@ static NSArray<MalachiteArgument *> *malachite_cl_program_arguments(const struct
         const struct nvk_arg *a = &k->h.args[i];
         if ((a->kind != NVK_ARG_BUFFER && a->kind != NVK_ARG_THREADGROUP && a->kind != NVK_ARG_TEXTURE &&
              a->kind != NVK_ARG_SAMPLER) ||
-            malachite_hidden_offsets(a, k->arg_names[i].name))
+            malachite_hidden_arg(a, k->arg_names[i].name))
             continue;
         MalachiteArgument *arg = [MalachiteArgument new];
         arg.name = @(k->arg_names[i].name);

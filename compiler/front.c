@@ -190,6 +190,7 @@ static unsigned g_data_cap;
 // an OpenCL kernel's global work offset and work_dim, as read so far, and the param their buffer is at (0 for none)
 static struct ir_val *g_cl_offsets[4];
 static unsigned g_cl_offsets_param;
+static unsigned g_cl_formats_param;  // and the one its images' formats are at
 
 // threadgroup variables, laid out one after another (16-byte aligned) from shared address 0
 static struct {
@@ -4525,6 +4526,20 @@ static void call(LLVMValueRef in)
         s->aux = (int)n;
         return;
     }
+    if (!strncmp(name, "air.get_channel_order_", 22) || !strncmp(name, "air.get_channel_data_type_", 26)) {
+        struct ptr p = ptr_of(LLVMGetOperand(in, 0));
+        if (p.space != SP_TEXTURE || p.base || p.param)
+            airc_fail("%s of a texture picked at run time", name);
+        if (!g_cl_formats_param)
+            g_cl_formats_param = hidden_arg(NVK_ARG_BUFFER, AIRC_CL_FORMATS, &g_param_end);
+        struct ir_val *w = ir_add(g_cur, IR_LDG, IR_I32, 1);
+        w->src[0] = cbuf(IR_I64, g_cl_formats_param);
+        w->imm = 4 * p.slot;
+        w->aux = 4;
+        set(in, 0, name[16] == 'o' ? op2(IR_SHR, IR_I32, w, konst(IR_I32, 16))
+                                   : op2(IR_AND, IR_I32, w, konst(IR_I32, 0xffff)));
+        return;
+    }
     if (!strncmp(name, "air.get_", 8) && (strstr(name, "_texture_") || strstr(name, "_depth_"))) {
         // TXQ's dimensions are width, height, depth (an array's layers; a 1D array's are its height) and levels
         int levels = !strncmp(name, "air.get_num_mip_levels", 22);
@@ -7666,6 +7681,7 @@ void airc_front(void *module, void **linked, const char *const *linked_names, un
     g_data_param = 0;
     memset(g_cl_offsets, 0, sizeof(g_cl_offsets));
     g_cl_offsets_param = 0;
+    g_cl_formats_param = 0;
 
     LLVMValueRef arglist;
     g_entry_fn = stage_function(&arglist);

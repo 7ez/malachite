@@ -69,6 +69,9 @@ struct airc_stage_in {
 // the buffer index of an OpenCL kernel's hidden argument for its global work offset and work_dim (OpenCL's renderer
 // binds them at 0, the kernel's own buffers from 3), only in a kernel that reads either
 #define AIRC_CL_OFFSETS 30
+// and of one for its images' formats, a word per texture slot: the channel order << 16 | the channel data type, as
+// OpenCL's enums, only in a kernel that asks
+#define AIRC_CL_FORMATS 29
 
 // another module whose functions the shader may call: a pipeline's linked (visible) functions
 #define AIRC_MAX_LINKED 256
