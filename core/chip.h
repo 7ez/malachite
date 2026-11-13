@@ -17,3 +17,7 @@ struct chip {
 
 // the chipset's entry, NULL for one outside every family
 const struct chip *chip_find(uint32_t chipset);
+// "GA104", NULL for a chipset without a known name
+const char *chip_name(uint32_t chipset);
+// the product's name by PCI device ID, NULL when it isn't listed; the chip comes from PMC_BOOT_0, not this
+const char *chip_product(uint16_t device);

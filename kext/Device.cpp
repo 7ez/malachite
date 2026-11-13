@@ -1691,6 +1691,10 @@ bool Gpu::start(IOService *provider)
     uint32_t boot0 = rd32(&gpu, NV_PMC_BOOT_0), chipset = NV_CHIPSET(boot0);
     log_msg("Malachite: BAR0 %llu MB, PMC_BOOT_0 0x%08x chipset 0x%x\n", bar0->getLength() >> 20, boot0, chipset);
     gpu.chip = chip_find(chipset);
+    uint16_t device = pci_device_id(&gpu);
+    const char *name = chip_name(chipset), *product = chip_product(device);
+    log_msg("Malachite: %s (%s), 10de:%04x %s\n", name ? name : "unknown chip", gpu.chip ? gpu.chip->family : "no family",
+            device, product ? product : "(not a listed product)");
     if (!gpu.chip || gpu.chip->missing) {
         log_msg("Malachite: chipset 0x%x not supported%s%s\n", chipset, gpu.chip ? ", needs " : "",
                 gpu.chip ? gpu.chip->missing : "");
@@ -1703,7 +1707,6 @@ bool Gpu::start(IOService *provider)
         plat.pci->setProperty("VRAM,totalMB", mb, 32);
         plat.pci->setProperty("VRAM,totalsize", mb << 20, 64);
     }
-    log_msg("Malachite: %s\n", gpu.chip->family);
     // what Accelerator and the Metal plugin tell apps: the VRAM's size (in MB from the FB controller, readable before
     // GSP-RM is up), and once it is, the GPU's name
     setProperty("MalachiteVRAMBytes", (unsigned long long)rd32(&gpu, 0x1183a4) << 20, 64);
