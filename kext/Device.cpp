@@ -937,7 +937,7 @@ class Gpu : public IOService
     IOReturn gpu_stats(struct nvgpu_stats *out);
 
     static const uint32_t TEX_HEADER_POOL = 0x400, TEX_SAMPLER_POOL = 0x800;  // offsets in kctx.compute_cbuf
-    IOReturn drain(gpu_ctx *c);
+    IOReturn drain(gpu_ctx *c, int ms = 2000);
     IOReturn sync_ctx(uintptr_t handle);
     int clear_vram(uint64_t vram, uint64_t size);
     IOReturn read_indirect(gpu_ctx *c, uint64_t va, uint32_t *words, unsigned n);
@@ -1121,6 +1121,7 @@ class Gpu : public IOService
     void drop_deferred(gpu_ctx *c);
     IOReturn gpu_copy(gpu_ctx *c, uint64_t src, uint64_t dst, uint64_t size);
     IOReturn gpu_copy2d(gpu_ctx *c, const struct nvgpu_copy2d *cp);
+    IOReturn copy_after_draws(gpu_ctx *c, uint64_t src, uint64_t dst, uint64_t size);
     IOReturn gpu_fill(gpu_ctx *c, uint64_t dst, uint64_t size, uint32_t pattern);
     IOReturn gpu_dispatch(gpu_ctx *c, const struct nvgpu_dispatch *d);
     IOReturn gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const void *queue, const char **reject);
@@ -2558,6 +2559,22 @@ IOReturn Gpu::gpu_copy2d(gpu_ctx *c, const struct nvgpu_copy2d *cp)
     chan_copy_surface_queue(&c->copy_ch, &s, &d, cp->bytes, cp->lines, cp->remap, c->compute_semva, c->compute_seq);
     memset(c->pass_targets, 0, sizeof(c->pass_targets));  // the next draw may sample what it wrote
     return kIOReturnSuccess;
+}
+
+// A command buffer's buffer copy, queued behind its draws like a 2D one: drained first instead, the lock was held
+// for the whole of the work before it. A context with no graphics channel has no draws to wait for.
+IOReturn Gpu::copy_after_draws(gpu_ctx *c, uint64_t src, uint64_t dst, uint64_t size)
+{
+    if (c == &kctx || !c->compute_ready || size > UINT32_MAX) {
+        drain(c);
+        return gpu_copy(c, src, dst, size);
+    }
+    struct nvgpu_copy2d cp = {};
+    cp.src = src;
+    cp.dst = dst;
+    cp.src_pitch = cp.dst_pitch = cp.bytes = (uint32_t)size;
+    cp.lines = 1;
+    return gpu_copy2d(c, &cp);
 }
 
 // room for `bytes` of methods in the copy channel's pushbuffer: going on into its other half waits for the copies
@@ -4132,7 +4149,7 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const void *queue
     return kIOReturnSuccess;
 }
 
-IOReturn Gpu::drain(gpu_ctx *c)
+IOReturn Gpu::drain(gpu_ctx *c, int ms)
 {
     memset(c->pass_targets, 0, sizeof(c->pass_targets));  // a copy, a dispatch or the CPU may write memory next
     kick_draws(c);
@@ -4141,10 +4158,10 @@ IOReturn Gpu::drain(gpu_ctx *c)
     uint64_t t0 = time_us();
     if ((int32_t)(*c->compute_sem - c->draw_pending) < 0)
         stats[ST_DRAIN_WAITS]++;
-    // up to 2 s, but on a fault only until GSP-RM's word of it, which has the channel made anew and the work lost
+    // up to ms, but on a fault only until GSP-RM's word of it, which has the channel made anew and the work lost
     // run again
     int r = -1;
-    for (int t = 0; t < 200 && r; t++) {
+    for (int t = 0; t < ms / 10 && r; t++) {
         r = render_wait(c->compute_sem, c->draw_pending, 10);
         if (r && gsp) {
             gsp_poll(gsp);
@@ -4163,7 +4180,9 @@ IOReturn Gpu::drain(gpu_ctx *c)
 }
 
 // An app's frame finishing: the wait is the length of its GPU work, and held under the lock it would stop everyone
-// else's, WindowServer's composite with them. drain takes over for the last of it, and for a fault.
+// else's, WindowServer's composite with them, and the submissions that bring a switched-out channel back. So the
+// lock is only taken to look, a fault is mended as drain would, and drain finishes up once the work is done or 2 s
+// have gone. A long wait sleeps rather than spins.
 IOReturn Gpu::sync_ctx(uintptr_t handle)
 {
     uint64_t t0 = time_us();
@@ -4177,16 +4196,22 @@ IOReturn Gpu::sync_ctx(uintptr_t handle)
         if (!ended)
             l2_sysmem(c, false);
         kick_draws(c);
+        if (gsp && (gsp_pending(gsp) || c->compute_faulted || c->copy_faulted)) {
+            gsp_poll(gsp);
+            if (c->compute_faulted || c->copy_faulted)
+                recover(c);
+        }
+        uint64_t waited = time_us() - t0;
         if (!c->draw_pending || !c->compute_sem || (int32_t)(*c->compute_sem - c->draw_pending) >= 0 ||
-            c->compute_faulted || c->copy_faulted || time_us() - t0 > 10000) {
+            waited > 2000000) {
             stats[ST_SYNC]++;
-            IOReturn r = settle(drain(c));
+            IOReturn r = settle(drain(c, 10));
             stats[ST_SYNC_US] += time_us() - t0;
             give();
             return r;
         }
         give();
-        delay_us(20);
+        delay_us(waited < 10000 ? 20 : 1000);
     }
 }
 
@@ -4362,8 +4387,8 @@ IOReturn Gpu::callPlatformFunction(const OSSymbol *name, bool wait, void *p1, vo
         return r;
     }
     if (name->isEqualTo(NVGPU_FN_COPY))
-        WITH_CTX(p4, (stats[ST_COPY]++, drain(c),
-                      gpu_copy(c, (uint64_t)(uintptr_t)p1, (uint64_t)(uintptr_t)p2, (uint64_t)(uintptr_t)p3)));
+        WITH_CTX(p4, (stats[ST_COPY]++,
+                      copy_after_draws(c, (uint64_t)(uintptr_t)p1, (uint64_t)(uintptr_t)p2, (uint64_t)(uintptr_t)p3)));
     if (name->isEqualTo(NVGPU_FN_UPLOAD))
         WITH_CTX(p4, (stats[ST_COPY]++, memset(c->pass_targets, 0, sizeof(c->pass_targets)),
                       gpu_copy(c, (uint64_t)(uintptr_t)p1, (uint64_t)(uintptr_t)p2, (uint64_t)(uintptr_t)p3)));
