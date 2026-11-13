@@ -1,6 +1,5 @@
-// Placing BAR1 where macOS left it unassigned. A resizable BAR1 of over 1 GB is one macOS gives up on, so the driver
-// finds a free, size-aligned range in the 64-bit window above the GPU and writes the BAR itself. The window is the
-// upstream bridge's prefetchable one, or the host bridge's ACPI memory ranges when the GPU sits on the root bus.
+// macOS leaves a resizable BAR1 over 1 GB unassigned, so we place it in a free, size-aligned range of the upstream
+// bridge's prefetchable window, or of the host bridge's ACPI ranges on the root bus.
 #include <IOKit/IOLib.h>
 #include <IOKit/pci/IOPCIDevice.h>
 
@@ -37,7 +36,7 @@ struct ranges {
     }
 };
 
-// AppleACPIPlatform's dump of a host bridge's _CRS: one of these per resource, 0 = memory, 1 = I/O, 2 = bus numbers
+// AppleACPIPlatform's dump of a host bridge's _CRS, per resource; type 0 memory, 1 I/O, 2 bus numbers
 struct acpi_space {
     uint64_t type, unknown[2], min, max, translation, length, tail[3];
 };
@@ -67,7 +66,7 @@ void set_bridge_window(IOPCIDevice *b, uint64_t lo, uint64_t hi)
     b->configWrite16(BRIDGE_PREF_LIMIT, (uint16_t)((hi >> 16) & 0xfff0) | 1);
 }
 
-// what a bridge (or the host bridge) forwards above 4 GB, where a 64-bit BAR can go
+// what a bridge forwards above 4 GB
 void windows_of(IORegistryEntry *e, ranges *out)
 {
     if (IOPCIDevice *b = OSDynamicCast(IOPCIDevice, e)) {
@@ -84,7 +83,7 @@ void windows_of(IORegistryEntry *e, ranges *out)
     }
 }
 
-// every range another device owns, from the BARs macOS assigned and the windows of bridges that aren't above the GPU
+// assigned BARs and the windows of bridges not above the GPU
 void collect_used(IOPCIDevice *gpu, IOPCIDevice *const *ancestors, int nancestors, ranges *used)
 {
     OSDictionary *match = IOService::serviceMatching("IOPCIDevice");
@@ -111,8 +110,7 @@ void collect_used(IOPCIDevice *gpu, IOPCIDevice *const *ancestors, int nancestor
     OSSafeReleaseNULL(match);
 }
 
-// Whether another device needs w. The GPU's BAR3 is in the window macOS sized for it, but nothing here reaches it from
-// the CPU, so the window may move out from under it.
+// The GPU's own BAR3 doesn't count: nothing here reaches it from the CPU, so the window may move under it.
 bool others_in(const ranges &used, range w)
 {
     for (int i = 0; i < used.n; i++) {
@@ -122,8 +120,7 @@ bool others_in(const ranges &used, range w)
     return false;
 }
 
-// the highest free size-aligned slot: firmware fills a window from the bottom, so the top is where it has put the
-// fewest devices macOS doesn't know about
+// the highest slot, as firmware fills windows from the bottom with devices macOS may not know of
 bool pick(const ranges &windows, const ranges &used, uint64_t size, uint64_t *base)
 {
     for (int i = windows.n - 1; i >= 0; i--) {
@@ -148,10 +145,10 @@ bool pick(const ranges &windows, const ranges &used, uint64_t size, uint64_t *ba
     return false;
 }
 
-// BAR1's control register in the Resizable BAR capability and its sizes, bit n for 1 MB << n; 0 without one
+// *sizes: bit n for 1 MB << n; 0 without the capability
 uint32_t rebar_ctrl(IOPCIDevice *pci, uint32_t *sizes)
 {
-    // extendedFindPCICapability finds nothing here, the list being there all the same
+    // extendedFindPCICapability misses it
     uint32_t cap = 0x100, header = pci->extendedConfigRead32(cap);
     for (int i = 0; cap && (header & 0xffff) != PCI_REBAR_CAPABILITY && i < 64; i++) {
         cap = header >> 20;
@@ -172,7 +169,7 @@ uint32_t rebar_ctrl(IOPCIDevice *pci, uint32_t *sizes)
 
 }  // namespace
 
-// BAR1's size by writing ones with decode off, 0 when it isn't a 64-bit memory BAR
+// sized with decode off; 0 if not a 64-bit memory BAR
 static uint64_t bar1_size_of(IOPCIDevice *pci)
 {
     uint32_t lo = pci->configRead32(BAR1_LO), hi = pci->configRead32(BAR1_HI);
@@ -230,7 +227,7 @@ bool pci_place_bar1(IOPCIDevice *pci, uint64_t *base, uint64_t *size)
         }
         if ((bridge->configRead16(BRIDGE_PREF_BASE) & 0xf) != 1 || !above || (had_window && others_in(used, old)))
             return false;
-        // the bridge's window is absent or too small, and no other device lives in it: move it into free space above
+        // window absent or too small, and nothing else in it: move it
         windows_of(above, &windows);
         if (!pick(windows, used, want, base))
             return false;
@@ -249,8 +246,7 @@ bool pci_place_bar1(IOPCIDevice *pci, uint64_t *base, uint64_t *size)
     } else {
         placed = place(*size);
         uint32_t sizes = 0, ctrl = placed ? 0 : rebar_ctrl(pci, &sizes);
-        // A smaller BAR1 beats no screens at all: without them WindowServer composites in software, which macOS 26
-        // asserts in, again at each start and then at each boot
+        // a smaller BAR1 beats no screens, where WindowServer composites in software and macOS 26 asserts every boot
         for (int n = 62 - __builtin_clzll(*size >> 20); ctrl && !placed && 1ull << (n + 20) >= BAR1_NEEDED; n--) {
             if (!(sizes >> n & 1) || !place(1ull << (n + 20)))
                 continue;

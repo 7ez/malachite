@@ -1,11 +1,11 @@
-// Interface between the kext's GPU service and its user space: NVK's NVRM backend (nvrm_xnu.c) and malachitectl
+// The GPU service's user client ABI, for nvrm_xnu.c and malachitectl
 #pragma once
 
 // what nvrm_xnu.c calls
 enum {
     MALACHITE_SEL_ESCAPE = 1,      // scalar: escape number; struct in and out: its parameters
-    MALACHITE_SEL_BIND_FD = 3,     // scalar: the file number user space gave this connection, -2 to unbind
-    MALACHITE_SEL_WAIT_EVENT = 6,  // scalars: count seen, timeout in us; out: count now (graphics nonstall interrupts)
+    MALACHITE_SEL_BIND_FD = 3,     // scalar: user space's fd for this connection, -2 to unbind
+    MALACHITE_SEL_WAIT_EVENT = 6,  // scalars: nonstall interrupts seen, timeout in us; out: count now
 };
 
 // bring-up, malachitectl
@@ -13,52 +13,48 @@ enum {
     MALACHITE_LOAD_FIRMWARE = 100,  // scalars: firmware index, user address, length
     MALACHITE_GSP_START,
     MALACHITE_GSP_STOP,
-    MALACHITE_DISP_PROBE,  // what is connected, into the kernel log
-    MALACHITE_DISP_SHOW,   // a test pattern on the first connected display
-    MALACHITE_DISP_READ,      // scalars: user address, length; gets struct malachite_shot, then what the head shows
-    MALACHITE_PM_CYCLE,       // what system sleep does to the GPU, suspend then resume, without sleeping
-    // scalars: Annex-B stream (AV1: OBU stream, VP9 and VP8: IVF file) address and length, output address and length,
-    // most pictures to decode, the codec (0 H.264, 1 H.265, 2 AV1, 3 VP9, 4 VP8); the output gets struct
-    // malachite_frames, then the pictures that fit, in decoding order
+    MALACHITE_DISP_PROBE,  // connected displays, to the kernel log
+    MALACHITE_DISP_SHOW,   // test pattern on the first connected display
+    MALACHITE_DISP_READ,      // scalars: user address, length; gets struct malachite_shot, then the head's pixels
+    MALACHITE_PM_CYCLE,       // suspend and resume the GPU as system sleep would, without sleeping
+    // scalars: stream address and length (Annex-B; AV1 OBUs; VP9/VP8 IVF), output address and length, most pictures,
+    // codec (0 H.264, 1 H.265, 2 AV1, 3 VP9, 4 VP8); output gets struct malachite_frames, then pictures in decoding order
     MALACHITE_VIDEO_DECODE,
     MALACHITE_END
 };
 
-// in front of the pixels MALACHITE_DISP_READ copies out: B8G8R8A8 rows of pitch bytes
+// before MALACHITE_DISP_READ's B8G8R8A8 rows of pitch bytes
 struct malachite_shot {
     uint32_t width, height, pitch, reserved;
 };
 
-// IOServiceOpen type for H.264 decoding (VideoUserClient): open to any process, each client a GPU context of its
-// own that goes with it
+// IOServiceOpen type for VideoUserClient: open to any process, a GPU context per client
 #define MALACHITE_VIDEO_CLIENT 1
-// IOServiceOpen type for display settings (DisplayUserClient): open to the user at the console
+// IOServiceOpen type for DisplayUserClient: console user only
 #define MALACHITE_DISPLAY_CLIENT 2
 
 enum {
-    MALACHITE_DISPLAY_SET_SCALED,  // scalars: the width and height of each extra resolution, the list now
+    MALACHITE_DISPLAY_SET_SCALED,  // scalars: width, height of each extra resolution; replaces the list
 };
 
 enum {
-    // scalars: width and height in macroblocks (H.265 and VP9: of the pictures to a multiple of 64 luma samples, AV1:
-    // 128), surfaces, bitstream bytes, the codec (0 H.264, 1 H.265, 2 AV1, 3 VP9, 4 VP8), bytes a sample (1, or 2 for
-    // 10-bit); again for a stream of another size. Width 0 makes the GPU context and NVDEC channel alone.
+    // scalars: width and height in macroblocks (H.265, VP9: pictures rounded to 64 luma samples; AV1: 128), surfaces,
+    // bitstream bytes, codec (0 H.264, 1 H.265, 2 AV1, 3 VP9, 4 VP8), bytes a sample (1, or 2 for 10-bit). Again on a
+    // size change; width 0 opens only the GPU context and NVDEC channel.
     NVVIDEO_OPEN,
-    // once the picture's setup page and slices are written through the mappings; scalars: its surface, its index in
-    // decoding order, the error concealment index. Back when NVDEC is done, its status in the setup page.
+    // after writing the setup page and slices; scalars: surface, decode index, error concealment index. Returns when
+    // NVDEC is done, status in the setup page.
     NVVIDEO_DECODE,
 };
 
-// IOConnectMapMemory64 types on a video client after NVVIDEO_OPEN: the setup page (core/nvdec.h), the bitstream,
-// then the surfaces (core/nvdec.h's nvdec_surface layout), read-only
+// IOConnectMapMemory64 types after NVVIDEO_OPEN; surfaces are read-only, laid out as core/nvdec.h's nvdec_surface
 enum { NVVIDEO_MAP_SETUP, NVVIDEO_MAP_BITS, NVVIDEO_MAP_SURFACE };
 
 struct malachite_frames {
     uint32_t count, reserved[3];
 };
 
-// in front of each picture's NV12 (P010 with two bytes a sample): width * height samples of luma, then
-// width * height / 2 of interleaved chroma
+// before each picture's NV12 (P010 at two bytes a sample)
 struct malachite_frame {
     uint32_t index, idr_count;  // decoding order; display order is by idr_count, then poc
     int32_t poc;

@@ -1,4 +1,4 @@
-// The driver core's platform on macOS: IOKit DMA memory, BAR0 through IOMemoryMap, firmware handed in by malachitectl
+// The core's platform layer on IOKit
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <IOKit/pci/IOPCIDevice.h>
@@ -65,7 +65,7 @@ void dma_free(struct gpu *g, struct dma *d)
     memset(d, 0, sizeof(*d));
 }
 
-// IOFree needs the size back, so it rides in front of the block
+// IOFree needs the size, kept in front of the block
 void *mem_alloc(size_t size)
 {
     size_t *p = (size_t *)IOMalloc(size + 16);
@@ -99,11 +99,10 @@ uint64_t time_us(void)
     return ns / 1000;
 }
 
-// the last 256 KB of what log_msg wrote, for root through the kern.malachite_log sysctl: macOS keeps few of a boot's
-// kernel messages (the unified log drops most of the driver's, the kernel's buffer wraps), and a machine with no
-// serial port has nothing else to show where a bring-up stopped
+// kern.malachite_log: the unified log drops most kernel messages and the kernel buffer wraps, so without a serial
+// port this is the only record of where bring-up stopped
 static char log_ring[256 * 1024];
-static uint64_t log_end;  // bytes ever written: a writer reserves its span, so concurrent lines don't overlap
+static uint64_t log_end;  // bytes ever written; writers reserve their span so lines don't overlap
 
 void log_msg(const char *fmt, ...)
 {
@@ -126,8 +125,8 @@ static int log_sysctl(struct sysctl_oid *, void *, int, struct sysctl_req *req)
     if (!kauth_cred_issuser(kauth_cred_get()))
         return EPERM;
     uint64_t end = log_end, size = sizeof(log_ring), start = end > size ? end - size : 0;
-    // the reader sized its buffer by an earlier call and the log may have grown since: it gets the newest bytes that fit,
-    // not an ENOMEM (which sysctl -b shows as nothing at all)
+    // the log may have grown since the reader sized its buffer: the newest bytes that fit, as sysctl -b shows ENOMEM
+    // as nothing
     if (req->oldptr && end - start > req->oldlen - req->oldidx)
         start = end - (req->oldlen - req->oldidx);
     size_t first = (size_t)(start % size), len = (size_t)(end - start);
@@ -192,7 +191,7 @@ uint64_t bar_size(struct gpu *g, int bar)
     return mem ? mem->getLength() : 0;
 }
 
-// a page, not the whole BAR: a resizable BAR1 is as big as VRAM, gigabytes of kernel address space
+// a page only: a resizable BAR1 is as big as VRAM
 volatile uint8_t *bar1_cpu(struct gpu *g, uint64_t off)
 {
     OSSafeReleaseNULL(g->plat->bar1);
@@ -210,7 +209,7 @@ uint16_t pci_device_id(struct gpu *g)
     return g->plat->pci->configRead16(kIOPCIConfigDeviceID);
 }
 
-// escapes run on the calling thread, so the current task's address space is the one the pointers are in
+// escapes run on the caller's thread, so the current task's address space is the right one
 int copy_from_user(void *task, void *dst, uint64_t src, size_t n)
 {
     return copyin((user_addr_t)src, dst, n) ? -1 : 0;
