@@ -3,7 +3,6 @@
 #include <string.h>
 #include "ir.h"
 
-// chunks of a bump allocator, freed together by ir_reset
 static struct chunk {
     struct chunk *next;
     unsigned used;
@@ -67,7 +66,7 @@ struct ir_val *ir_add(struct ir_block *b, enum ir_op op, enum ir_type type, unsi
     v->id = g_next_id++;
     v->vreg = -1;
     struct ir_val *at = b->last && is_terminator(b->last->op) && !is_terminator(op) ? b->last : NULL;
-    if (op == IR_PHI)  // phis lead the block, in no order that matters: the front, which costs nothing
+    if (op == IR_PHI)  // phi order doesn't matter, and the front is cheapest
         at = b->first;
     if (at) {
         v->next = at;

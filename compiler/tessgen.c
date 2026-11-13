@@ -1,14 +1,11 @@
-// The stages of a tessellated draw before the post-tessellation vertex function, built as IR rather than compiled
-// from AIR. A draw has a vertex a patch: the vertex stage hands the patch's draw position and instance on, and the
-// tessellation init stage, a thread a control point, fetches the control points and the per-patch data from the
-// vertex buffers as the vertex descriptor lays them out (converting each format as the vertex fetch unit would),
-// and the patch's tessellation factors from the factor buffer. A kernel's stage input is fetched the same way.
+// Metal tessellation has no AIR for these stages: a vertex a patch, then a thread a control point fetching through
+// the vertex descriptor as the vertex fetch unit would. Kernel stage input reuses that fetch.
 #include <string.h>
 #include "airc_int.h"
 #include "../core/sph.h"
 #include "sass86.h"
 
-// MTLVertexStepFunction's values
+// MTLVertexStepFunction
 enum { STEP_CONSTANT, STEP_PER_VERTEX, STEP_PER_INSTANCE, STEP_PER_PATCH, STEP_PER_PATCH_CONTROL_POINT };
 
 static struct ir_block *g_b;
@@ -84,7 +81,6 @@ static struct ir_val *ldg(struct ir_val *at, int64_t off, int bytes)
     return v;
 }
 
-// an attribute of the vertex whose handle is vtx, or of the shader's own
 static struct ir_val *ald(struct ir_val *vtx, unsigned at)
 {
     struct ir_val *v = ir_add(g_b, IR_ALD, IR_I32, vtx ? 1 : 0);
@@ -94,7 +90,6 @@ static struct ir_val *ald(struct ir_val *vtx, unsigned at)
     return v;
 }
 
-// n values to the outputs at `at`: of the control point vtx, or the shader's own (flags IR_ATTR_PATCH: the patch's)
 static void ast(struct ir_val *vtx, unsigned at, int flags, struct ir_val **v, unsigned n)
 {
     struct ir_val *s = ir_add(g_b, IR_AST, IR_VOID, n + (vtx != NULL));
@@ -105,7 +100,7 @@ static void ast(struct ir_val *vtx, unsigned at, int flags, struct ir_val **v, u
     s->aux = (int)n | flags;
 }
 
-// n / d for a constant d, exactly, by a multiply (Granlund and Montgomery's round-up method)
+// Granlund and Montgomery's round-up method
 struct ir_val *airc_udiv(struct ir_block *b, struct ir_val *n, uint32_t d)
 {
     g_b = b;
@@ -118,8 +113,6 @@ struct ir_val *airc_udiv(struct ir_block *b, struct ir_val *n, uint32_t d)
     return op(IR_SHR, IR_I32, q, k32(l - 1));
 }
 
-// the element of a's buffer a control point reads: by the control point's index, the patch id, or the instance (its
-// base plus a step every rate instances)
 static struct ir_val *element(const struct airc_tess_attr *a, struct ir_val *cp, struct ir_val *pid,
                               struct ir_val *instance, struct ir_val *base)
 {
@@ -144,8 +137,8 @@ void airc_fetch(struct ir_block *b, const struct airc_tess_attr *a, unsigned loc
     } widths[] = {
         { 0x01, 4, 32 }, { 0x02, 3, 32 }, { 0x04, 2, 32 }, { 0x12, 1, 32 }, { 0x03, 4, 16 }, { 0x05, 3, 16 },
         { 0x0f, 2, 16 }, { 0x1b, 1, 16 }, { 0x0a, 4, 8 },  { 0x13, 3, 8 },  { 0x18, 2, 8 },  { 0x1d, 1, 8 },
-        { 0x30, 4, 10 },  // A2B10G10R10, its last component 2 bits
-        { 0x31, 3, 11 },  // B10G11R11, its last 10
+        { 0x30, 4, 10 },  // A2B10G10R10, the last component 2 bits
+        { 0x31, 3, 11 },  // B10G11R11, the last 10
     };
     enum { SNORM = 1, UNORM = 2, SINT = 3, UINT = 4, FLOAT = 7 };
     unsigned code = a->format >> 21 & 0x3f, type = a->format >> 27 & 7, n = 0, bits = 0;
@@ -170,7 +163,7 @@ void airc_fetch(struct ir_block *b, const struct airc_tess_attr *a, unsigned loc
         unsigned first = code == 0x30 ? 10 * c : bits * c;
         unsigned size = (code == 0x30 && c == 3) ? 2 : (code == 0x31 && c == 2) ? 10 : bits, sh = first % 32;
         struct ir_val *x = word[first / 32];
-        if (size < 32 && is_signed) {  // the field to the top, then back down arithmetically
+        if (size < 32 && is_signed) {
             x = op(IR_SAR, IR_I32, op(IR_SHL, IR_I32, x, k32(32 - sh - size)), k32(32 - size));
         } else if (size < 32) {
             if (sh)
@@ -188,7 +181,7 @@ void airc_fetch(struct ir_block *b, const struct airc_tess_attr *a, unsigned loc
                    kf(-1.0f));
         v[c] = x;
     }
-    if (a->format >> 31) {  // BGRA
+    if (a->format >> 31) {
         struct ir_val *r = v[0];
         v[0] = v[2];
         v[2] = r;
@@ -202,8 +195,7 @@ static void fetch(const struct airc_tess_attr *a, unsigned loc, struct ir_val *i
     airc_fetch(g_b, a, loc, cbuf(IR_I64, AIRC_TESS_BUFFER(a->buffer)), idx, v);
 }
 
-// generic 0: the patch's draw position (vertex ids count from the first vertex drawn), its instance from 0 and the
-// base instance
+// vertex ids count from the first vertex drawn
 static void vertex(const void *arg, struct ir_func *f, struct airc_info *info)
 {
     (void)arg;
@@ -213,7 +205,7 @@ static void vertex(const void *arg, struct ir_func *f, struct airc_info *info)
     info->sysvals = SPH_VERTEX_ID | SPH_INSTANCE_ID;
     struct ir_val *zero = kf(0.0f), *position[4] = { zero, zero, zero, zero };
     struct ir_val *ids[4] = { ald(NULL, 0x2fc), ald(NULL, 0x2f8), cbuf(IR_I32, NVK_BASE_INSTANCE), k32(0) };
-    ast(NULL, 0x70, 0, position, 4);  // as its header says it does
+    ast(NULL, 0x70, 0, position, 4);  // the header says it writes one
     ast(NULL, 0x80, 0, ids, 4);
     ir_add(g_b, IR_EXIT, IR_VOID, 0);
 }
@@ -233,8 +225,6 @@ static void tess_init(const void *arg, struct ir_func *f, struct airc_info *info
     info->patch_outputs = npatch + (npatch < NVK_MAX_PATCH_INPUTS);
     info->patch_points = d->points;
 
-    // the patch's vertex, where the patch's vertices start in the input map: bytes 0 and 2 of INVOCATION_INFO
-    // multiplied
     struct ir_val *map = s2r(SR_INVOCATION_INFO);
     struct ir_val *start = op(IR_MUL, IR_I32, op(IR_AND, IR_I32, map, k32(0xff)),
                               op(IR_AND, IR_I32, op(IR_SHR, IR_I32, map, k32(16)), k32(0xff)));
@@ -242,8 +232,7 @@ static void tess_init(const void *arg, struct ir_func *f, struct airc_info *info
     struct ir_val *pos = ald(vtx, 0x80), *instance = ald(vtx, 0x84), *base = ald(vtx, 0x88);
     struct ir_val *iid = op(IR_ADD, IR_I32, instance, base), *point = s2r(SR_INVOCATION_ID);
 
-    // the patch id: the patch index buffer's at the draw position, or the position (the load then reads the factor
-    // buffer, which a draw always has)
+    // without a patch index buffer the load reads the factor buffer, which a draw always has
     struct ir_val *factors = cbuf(IR_I64, AIRC_TESS_FACTORS);
     struct ir_val *indexed = cmp(IR_NE, op(IR_OR, IR_I32, cbuf(IR_I32, AIRC_TESS_PATCH_INDEX),
                                           cbuf(IR_I32, AIRC_TESS_PATCH_INDEX + 4)), k32(0));
@@ -269,8 +258,7 @@ static void tess_init(const void *arg, struct ir_func *f, struct airc_info *info
         ast(NULL, NVK_PATCH_IDS(d->patch_inputs), IR_ATTR_PATCH, ids, 2);
     }
 
-    // the factors, halves: the edges' then the inside's, 8 bytes a patch for triangles and 12 for quads; scaled,
-    // clamped to the maximum (a NaN, which culls the patch, kept) and rounded up to a power of two for pow2
+    // halves, edges then inside; the clamp keeps a NaN, which culls the patch
     unsigned edges = d->domain ? 4 : 3, insides = d->domain ? 2 : 1;
     struct ir_val *fa = factors, *level[6], *word = NULL;
     if (d->factor_step & 1)

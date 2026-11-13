@@ -1,4 +1,3 @@
-// airc: AIR -> IR -> SASS.
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -15,7 +14,7 @@
 
 #define MAX_SPILL_ROUNDS 16
 
-// the optimised IR of a stage before it is compiled, for irsim
+// for irsim
 void (*airc_ir_hook)(struct ir_func *f, const struct airc_info *info);
 
 unsigned airc_samples = 1;
@@ -39,7 +38,6 @@ int airc_pass_off(const char *name)
     return g_passes_off || getenv(name);
 }
 
-// the bitcode inside Apple's wrapper, if it has one, as a module; 0, or -1 with the reason in g_error
 static int parse(const void *air, size_t len, LLVMMemoryBufferRef *mb, LLVMModuleRef *mod)
 {
     const unsigned char *bc = air;
@@ -63,7 +61,6 @@ static int parse(const void *air, size_t len, LLVMMemoryBufferRef *mb, LLVMModul
     return 0;
 }
 
-// a stage's IR, optimised and compiled, into k; with remat, values far from their uses made again there
 static void finish(struct ir_func *f, struct airc_info *info, int print_ir, int remat, struct airc_kernel *k)
 {
     airc_opt(f);
@@ -111,9 +108,8 @@ static void finish(struct ir_func *f, struct airc_info *info, int print_ir, int 
     snprintf(k->name, sizeof(k->name), "shader");
 }
 
-// One compile of the module's stage into k. A shader its subroutines don't compile for (a resource passed in a way
-// they can't take, too many registers live across a call) compiles again with every call inlined, and one that
-// runs out of registers with some of its values kept in memory.
+// Subroutines can fail on a resource passed in a way they can't take or too many registers live across a call,
+// so that retries with every call inlined.
 static int compile_once(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct airc_source *linked, unsigned nlinked,
                          const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
                          const struct airc_constant *fc, unsigned nfc, int print_ir, int remat, struct airc_kernel *k)
@@ -143,8 +139,7 @@ static int compile_once(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct air
     return ret;
 }
 
-// A shader the optional passes can't get through compiles without them: a pipeline that fails takes WindowServer down.
-// AIRC_NOFALLBACK=1 leaves it failed, so a test sees a pass that breaks it.
+// A failed pipeline takes WindowServer down, so retry without optional passes; AIRC_NOFALLBACK lets tests see it fail.
 static int compile_stage(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct airc_source *linked, unsigned nlinked,
                          const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
                          const struct airc_constant *fc, unsigned nfc, int print_ir, int remat, struct airc_kernel *k)
@@ -158,15 +153,14 @@ static int compile_stage(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct ai
     return ret;
 }
 
-// warps an SM runs of a kernel with this many registers a thread (GA10x: 4 partitions of 16384, 48 warps at most)
+// GA10x has 4 partitions of 16384 registers and 48 warps at most
 static unsigned warps(unsigned regs)
 {
     unsigned w = 4 * (16384 / (regs * 32));
     return w < 48 ? w : 48;
 }
 
-// The stage compiled into k, and again without the passes that can cost it warps, keeping what runs the most.
-// airc_batched says whether the one kept has fetches moved.
+// retries without the passes that can cost warps and keeps whichever runs the most
 static int compile_best(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct airc_source *linked, unsigned nlinked,
                         const struct airc_varyings *vertex, const struct airc_stage_in *stage_in,
                         const struct airc_constant *fc, unsigned nfc, int print_ir, struct airc_kernel *k)
@@ -177,9 +171,8 @@ static int compile_best(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct air
     airc_no_texvec = airc_texvec_shared = 0;
     int ret = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, 0, k);
     int batched = airc_batched;
-    // an unrolled loop's copies hold more values at once: compiled again with its loops as they were, that is kept
-    // if the unrolled one runs fewer than 7/8 of its warps. A dispatch of a few thousand threads has a handful of
-    // warps on each SM whatever the registers, and gains from each warp having more loads in flight.
+    // Unrolling holds more values at once but keeps more loads in flight, which small dispatches gain from, so the
+    // rolled version only wins at 8/7 the warps.
     if (!ret && airc_unrolled) {
         struct airc_kernel *r = calloc(1, sizeof(*r));
         char *error = g_error;
@@ -199,8 +192,7 @@ static int compile_best(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct air
         }
         free(r);
     }
-    // a shader that needs many registers runs few warps at a time, which leaves memory waits unhidden: compiled
-    // again with values made where they are read, it is kept if that runs more warps (or as many in less code)
+    // few warps leave memory waits unhidden, so try remat
     if (ret || k->h.reg_count > 40) {
         struct airc_kernel *r = calloc(1, sizeof(*r));
         char *error = g_error;
@@ -220,8 +212,7 @@ static int compile_best(LLVMModuleRef mod, LLVMModuleRef *lmod, const struct air
         }
         free(r);
     }
-    // texture ops sharing operand registers hold them longer, which can cost a register granule: compiled again
-    // with copies, both with and without remat, and kept if that runs more warps (40 registers or fewer run all 48)
+    // shared texture operands live longer and can cost a register granule; 40 registers or fewer run all 48 warps
     for (int again_remat = 0; again_remat < 2 && !ret && airc_texvec_shared && k->h.reg_count > 40; again_remat++) {
         struct airc_kernel *r = calloc(1, sizeof(*r));
         char *error = g_error;
@@ -279,8 +270,7 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
         }
     airc_samples = samples;
     int ret = compile_best(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, k);
-    // fetches started together hold their results longer, which can cost a register granule: all compiled again
-    // with them as they come, which is kept if that runs more warps
+    // batched fetches hold their results longer and can cost a register granule too
     if (!ret && airc_batched && k->h.reg_count > 40) {
         struct airc_kernel *r = calloc(1, sizeof(*r));
         airc_batch = 0;
