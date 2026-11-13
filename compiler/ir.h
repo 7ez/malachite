@@ -108,6 +108,10 @@ enum ir_cond { IR_EQ, IR_NE, IR_LT, IR_LE, IR_GT, IR_GE };
 // IR_FADD's aux: the sum clamped to [0, 1], a NaN as 0 (FADD.SAT)
 #define IR_FADD_SAT 1
 
+// An i32 IR_ADD's or IR_SUB's aux, from LLVM's flags: the result doesn't wrap round as unsigned, or as signed
+#define IR_NUW 1
+#define IR_NSW 2
+
 // IR_ATOM's aux: SASS_ATOM_* op, SASS_ATOM_* type << 4, shared memory
 #define IR_ATOMA(op, type, shared) ((op) | (type) << 4 | (shared) << 8)
 #define IR_ATOMA_OP(a) ((a) & 15)

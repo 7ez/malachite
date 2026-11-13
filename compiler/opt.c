@@ -111,6 +111,7 @@ static int int_cmp(int aux, int32_t a, int32_t b)
 static void make_const(struct ir_val *v, int64_t imm)
 {
     v->op = IR_CONST;
+    v->aux = 0;
     v->imm = imm;
     v->nsrc = 0;
 }
@@ -141,11 +142,13 @@ static int reassociate(struct ir_val *v)
         s->src[1] = y->src[0];
         v->src[0] = s;
         v->src[1] = y->src[1];
+        v->aux = 0;
         return 1;
     }
     if (y->op != IR_CONST || (x->op != v->op && x->op != IR_ADD) || x->type != IR_I32 || x->src[1]->op != IR_CONST)
         return 0;
     uint32_t c1 = (uint32_t)x->src[1]->imm, c2 = (uint32_t)y->imm;
+    v->aux = 0;
     if (x->op == v->op) {  // (a + c1) + c2, (a * c1) * c2
         v->src[0] = x->src[0];
         v->src[1] = new_const(v, v->op == IR_ADD ? c1 + c2 : c1 * c2);
@@ -851,10 +854,16 @@ static int cse_pure(const struct ir_val *v, int loads_pure)
     }
 }
 
+// an add's or subtract's wrap flags don't make it another value: the one kept carries the flags both have
+static int cse_aux(const struct ir_val *v)
+{
+    return v->op == IR_ADD || v->op == IR_SUB ? 0 : v->aux;
+}
+
 static unsigned cse_hash(const struct ir_val *v)
 {
-    uint64_t h = (uint64_t)v->op * 0x9e3779b97f4a7c15ull ^ (uint64_t)v->type << 8 ^ (uint64_t)(unsigned)v->aux << 16 ^
-                 (uint64_t)v->imm * 0xff51afd7ed558ccdull;
+    uint64_t h = (uint64_t)v->op * 0x9e3779b97f4a7c15ull ^ (uint64_t)v->type << 8 ^
+                 (uint64_t)(unsigned)cse_aux(v) << 16 ^ (uint64_t)v->imm * 0xff51afd7ed558ccdull;
     for (unsigned i = 0; i < v->nsrc; i++)
         h = (h ^ (uint64_t)(v->src[i] ? v->src[i]->id : -1)) * 0xc4ceb9fe1a85ec53ull;
     return (unsigned)(h >> 32);
@@ -862,7 +871,7 @@ static unsigned cse_hash(const struct ir_val *v)
 
 static int cse_equal(const struct ir_val *a, const struct ir_val *b)
 {
-    if (a->op != b->op || a->type != b->type || a->aux != b->aux || a->imm != b->imm || a->nsrc != b->nsrc)
+    if (a->op != b->op || a->type != b->type || cse_aux(a) != cse_aux(b) || a->imm != b->imm || a->nsrc != b->nsrc)
         return 0;
     for (unsigned i = 0; i < a->nsrc; i++)
         if (a->src[i] != b->src[i])
@@ -978,6 +987,8 @@ static int cse(struct ir_func *f)
                 }
             }
             if (same) {
+                if (same->op == IR_ADD || same->op == IR_SUB)
+                    same->aux &= v->aux;
                 replace_all(f, v, same);
                 changed = 1;
             } else {
@@ -1449,6 +1460,42 @@ static const struct ir_val *stepped(const struct ir_val *x, uint32_t *step)
     return x->src[0];
 }
 
+// a global address only loads and stores of its own block read (an offset from another address is one only they
+// take)
+static int only_accessed(const struct ir_func *f, const struct ir_val *a)
+{
+    for (struct ir_block *c = f->entry; c; c = c->next)
+        for (struct ir_val *u = c->first; u; u = u->next)
+            for (unsigned i = 0; i < u->nsrc; i++)
+                if (u->src[i] == a && (c != a->block || i || (u->op != IR_LDG && u->op != IR_STG)))
+                    return 0;
+    return 1;
+}
+
+// The elements loop b's phi j moves on by a trip, when it's stepped by a constant that LLVM says doesn't wrap round
+// as an address extends it (signed when ext): each unrolled copy's element is then the first copy's that many times
+// on. 0 when it isn't. A sum of such a phi and a value from outside the loop, not wrapping round either, moves on
+// with it.
+static int64_t flat_step(const struct ir_val *j, const struct ir_block *b, int ext)
+{
+    int flag = ext ? IR_NSW : IR_NUW;
+    if (j->block == b && (j->op == IR_ADD || j->op == IR_SUB) && (j->aux & flag)) {
+        const struct ir_val *x = j->src[0], *y = j->src[1];
+        int side = j->op == IR_ADD && (x->block != b || x->op == IR_CONST);
+        if (j->src[!side]->block == b && j->src[!side]->op != IR_CONST)
+            return 0;
+        return flat_step(side ? y : x, b, ext);
+    }
+    if (j->op != IR_PHI || j->block != b)
+        return 0;
+    const struct ir_val *x = phi_from(j, b);
+    uint32_t s;
+    if (stepped(x, &s) != j || !(x->aux & flag))
+        return 0;
+    int64_t c = ext ? (int32_t)x->src[1]->imm : (uint32_t)x->src[1]->imm;
+    return x->op == IR_ADD ? c : -c;
+}
+
 // how many times loop b, entered from pre, runs; 0 if that isn't known or is more than UNROLL_TRIPS
 static int trip_count(const struct ir_block *b, const struct ir_block *pre)
 {
@@ -1720,11 +1767,13 @@ static int unroll_partial(struct ir_func *f)
                 struct ir_val *v = body[i], *c;
                 // the counter runs from its start to the bound without wrapping round, as unsigned or signed as
                 // its compare: an element it indexes, extended the same way, is the first copy's a few on
-                if (it && v->op == IR_ADDR && v->src[1] == k && !in_loop(v->src[0], b) && !v->aux == !sign &&
-                    cond != IR_NE) {
+                int64_t d = 0;
+                if (it && v->op == IR_ADDR && !in_loop(v->src[0], b) && only_accessed(f, v))
+                    d = v->src[1] == k && !v->aux == !sign && cond != IR_NE ? step : flat_step(v->src[1], b, v->aux);
+                if (d) {
                     c = ir_add(bu, IR_ADDI, IR_I64, 1);
                     c->src[0] = copy0[v->id];
-                    c->imm = (int64_t)it * step * v->imm;
+                    c->imm = (int64_t)it * d * v->imm;
                     map[v->id] = c;
                     continue;
                 }

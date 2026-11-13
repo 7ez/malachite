@@ -186,6 +186,8 @@ LLVMValueRef LLVMGetBasicBlockTerminator(LLVMBasicBlockRef bb);
 
 LLVMOpcode LLVMGetInstructionOpcode(LLVMValueRef v);
 LLVMBool LLVMCanContract(LLVMValueRef v);  // a floating-point instruction with the contract or fast flag
+LLVMBool LLVMGetNUW(LLVMValueRef v);
+LLVMBool LLVMGetNSW(LLVMValueRef v);
 int LLVMGetNumOperands(LLVMValueRef v);
 LLVMValueRef LLVMGetOperand(LLVMValueRef v, unsigned i);
 LLVMIntPredicate LLVMGetICmpPredicate(LLVMValueRef v);

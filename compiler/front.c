@@ -5790,7 +5790,12 @@ static void binary(LLVMValueRef in, LLVMOpcode op, unsigned n)
                 continue;
             }
         }
-        set(in, l, op2(ir, t, a, b));
+        struct ir_val *v = op2(ir, t, a, b);
+        LLVMTypeRef lt = lane_type(LLVMTypeOf(in), l);
+        if ((op == LLVMAdd || op == LLVMSub) && LLVMGetTypeKind(lt) == LLVMIntegerTypeKind &&
+            LLVMGetIntTypeWidth(lt) == 32)
+            v->aux = (LLVMGetNUW(in) ? IR_NUW : 0) | (LLVMGetNSW(in) ? IR_NSW : 0);
+        set(in, l, v);
     }
 }
 

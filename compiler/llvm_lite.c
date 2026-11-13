@@ -63,6 +63,7 @@ struct ll_value {
     unsigned init;             // a global variable's initializer: value id + 1, or 0 for none
     const struct attr_list *attrs;  // a function's attributes, NULL for none
     unsigned char contract;    // a floating-point operation's contract or fast flag
+    unsigned char wrap;        // an integer operation's flags: 1 nuw, 2 nsw
 };
 
 // The attributes airc asks about (ATTR_*, a bit each) of a function (index ~0), its result (0) or its
@@ -1104,6 +1105,8 @@ static void parse_instruction(struct ll_module *m, struct body *f, const struct 
         v->ops[1] = b2;
         if (fp && more(&o))
             v->contract = (op(&o) & 0x21) != 0;  // fast-math flags: unsafe algebra (fast) and contract
+        else if (more(&o))
+            v->wrap = op(&o) & 3;
         return;
     }
     case 3: {  // CAST [op pair, dest type, opcode, flags?]
@@ -2039,6 +2042,16 @@ LLVMValueRef LLVMGetBasicBlockTerminator(LLVMBasicBlockRef bb)
 LLVMBool LLVMCanContract(LLVMValueRef v)
 {
     return v->kind == V_INST && v->contract;
+}
+
+LLVMBool LLVMGetNUW(LLVMValueRef v)
+{
+    return v->wrap & 1;
+}
+
+LLVMBool LLVMGetNSW(LLVMValueRef v)
+{
+    return v->wrap >> 1 & 1;
 }
 
 LLVMOpcode LLVMGetInstructionOpcode(LLVMValueRef v)
