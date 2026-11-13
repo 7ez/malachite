@@ -1,7 +1,4 @@
-// airc's front end: an AIR module (LLVM bitcode) -> scalar SSA IR. Vectors, structs and arrays held in values
-// become one IR value per lane; calls to the module's own functions are inlined; the function constants the
-// static initialiser copies around are followed to their specialised values; pointers stay symbolic (a base
-// value and a constant offset) until a load or store uses them.
+// AIR to scalar SSA IR, one value per lane, calls inlined; pointers stay base plus constant offset until accessed
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,15 +26,15 @@ struct ptr {
     enum space space;
     struct ir_val *base;  // IR_I64 for global, IR_I32 (or NULL for 0) for shared and local
     int64_t off;
-    unsigned slot;  // texture / sampler pool slot; for private memory, which alloca; for local, where it ends
-    // private memory indexed by a variable: base is the index into count elements stride bytes apart
+    unsigned slot;  // pool slot; for private memory the alloca, for local where it ends
+    // private memory indexed by a variable has base as the index into count elements stride bytes apart
     unsigned stride, count;
-    unsigned bytes;  // private memory: the size of the alloca or constant table it's in, 0 when not known
-    struct sub_param *param;  // a subroutine's texture or sampler parameter: base is its handle
-    LLVMValueRef table;  // a constant table's global, whether in variables (private) or in memory (global)
+    unsigned bytes;  // private memory's alloca or table size, 0 if unknown
+    struct sub_param *param;  // a subroutine's texture or sampler parameter, base is its handle
+    LLVMValueRef table;
 };
 
-// value, pointer and block maps, keyed by LLVM object and the inlined instance (scope) it belongs to
+// keyed by LLVM object and inlined instance (scope)
 struct entry {
     const void *key;
     unsigned lane, scope;
@@ -45,19 +42,18 @@ struct entry {
     union {
         struct ir_val *v;
         struct ptr p;
-        struct ir_block *blocks[2];  // head (where the LLVM block starts), tail (where it ends)
-        LLVMBasicBlockRef bb;        // for an IR block that branches on to an LLVM block's successors: that block
-        LLVMValueRef c;              // g_known's constant
+        struct ir_block *blocks[2];  // head, tail
+        LLVMBasicBlockRef bb;        // the LLVM block whose successors an IR block branches to
+        LLVMValueRef c;
     };
 };
 
 #define HASH_BITS 18
 static struct entry *g_vals[1 << HASH_BITS], *g_ptrs[1 << HASH_BITS], *g_blocks[1 << HASH_BITS],
     *g_origins[1 << HASH_BITS];
-// the high words of 64-bit integers where they're known (a value itself keeps the low one): loads, extensions,
-// and shifts and bitwise operations of those
+// known high words of 64-bit integers; a value keeps only the low one
 static struct entry *g_highs[1 << HASH_BITS];
-// loads that read a constant (note_known), and lane 1, the allocas they read from
+// loads that read a constant, and in lane 1 the allocas they read from
 static struct entry *g_known[1 << HASH_BITS];
 
 static unsigned hash(const void *key, unsigned lane, unsigned scope)
@@ -94,10 +90,7 @@ static int is_alloca(LLVMValueRef v)
     return LLVMIsAInstruction(v) && LLVMGetInstructionOpcode(v) == LLVMAlloca;
 }
 
-// Code built without optimisation (Apple's GL compiler's) keeps even a constant array index in an alloca, stores it
-// and loads it straight back. A load from an integer alloca that's only ever loaded from and stored to reads what was
-// last stored to it in the block, when that was a constant: g_known keeps the load's constant, so the index counts as
-// one and the array can stay in registers.
+// Apple's unoptimised GL code passes constant array indices through allocas; tracking them keeps arrays in registers
 static void note_known(LLVMValueRef fn)
 {
     for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb))
@@ -140,7 +133,6 @@ static void note_known(LLVMValueRef fn)
     }
 }
 
-// v as a constant integer: one, or a load g_known knows the value of. NULL when it's neither.
 static LLVMValueRef const_int(LLVMValueRef v)
 {
     if (LLVMIsAConstantInt(v))
@@ -153,32 +145,29 @@ static struct ir_func *g_f;
 static struct airc_info *g_info;
 static LLVMModuleRef g_module;
 static LLVMValueRef g_entry_fn;
-static LLVMModuleRef *g_linked;  // the pipeline's linked functions' modules
-static const struct airc_varyings *g_vertex;  // the vertex function's outputs a fragment function's inputs match
+static LLVMModuleRef *g_linked;
+static const struct airc_varyings *g_vertex;  // the vertex outputs a fragment function's inputs match
 static unsigned g_nlinked;
-static const char *const *g_linked_names;  // the names callers know each by, NULL where it's its own
-static struct ir_block *g_prologue;  // the entry block: arguments, builtins and constants are made here
+static const char *const *g_linked_names;  // the names callers use, NULL where it's its own
+static struct ir_block *g_prologue;
 static struct ir_block *g_cur;
 static unsigned g_scope, g_next_scope, g_depth;
 static const struct airc_constant *g_fc;
 static unsigned g_nfc;
-static struct ir_val *g_rcp_w[2];  // 1/w at the pixel's centre, and at its centroid (in a pass of a sample, the sample)
-static unsigned g_nallocas;  // private memory: allocas seen (each a slot)
-// a post-tessellation vertex function's control points: the function it gets one from, the location of each member
-// of what that returns, and where the patch's vertices start in the input map
+static struct ir_val *g_rcp_w[2];  // 1/w at the centre, and at the centroid (or sample, per sample)
+static unsigned g_nallocas;
+// a post-tessellation vertex function's control point getter, its members' locations, the patch's input map start
 static LLVMValueRef g_point_fn;
 static uint8_t g_point_loc[32];
 static unsigned g_npoint_loc;
 static struct ir_val *g_point_map;
-// a kernel's stage input: how its attributes are laid out, the params its region's address and each buffer it
-// reads are at (0 for none), and the region's words as read so far
+// a kernel's stage input; params are 0 when absent
 static const struct airc_stage_in *g_stage_in;
 static unsigned g_region_off, g_stage_in_buffer[31];
 static struct ir_val *g_region[6];
-static unsigned g_param_end;  // past the last param of const bank 0 given out
+static unsigned g_param_end;
 
-// constant tables read from memory: each one's address, made in the prologue, and where the bytes of them all are
-// (airc_info.data, the param at g_data_param pointing at them); the buffer is kept from one compile to the next
+// constant tables in memory, their bytes in airc_info.data; the buffer is reused across compiles
 static struct table {
     LLVMValueRef g;
     struct ir_val *base;
@@ -187,12 +176,12 @@ static struct table {
 static unsigned g_data_param;
 static unsigned char *g_data;
 static unsigned g_data_cap;
-// an OpenCL kernel's global work offset and work_dim, as read so far, and the param their buffer is at (0 for none)
+// an OpenCL kernel's global work offset and work_dim, and their param (0 for none)
 static struct ir_val *g_cl_offsets[4];
 static unsigned g_cl_offsets_param;
-static unsigned g_cl_formats_param;  // and the one its images' formats are at
+static unsigned g_cl_formats_param;
 
-// threadgroup variables, laid out one after another (16-byte aligned) from shared address 0
+// threadgroup variables, 16-byte aligned from shared address 0
 static struct {
     LLVMValueRef g;
     unsigned off;
@@ -261,10 +250,10 @@ static enum ir_type ir_type_of(LLVMTypeRef t)
         return IR_F32;
     case LLVMHalfTypeKind:
         return IR_F16;
-    case LLVMBFloatTypeKind:  // its bits, as a 16-bit integer's: only conversions and moves are done on it
+    case LLVMBFloatTypeKind:  // only ever converted or moved, so kept as integer bits
         return IR_I32;
     case LLVMIntegerTypeKind:
-        // wider integers are index arithmetic in practice; they keep their low 32 bits
+        // wider integers are index arithmetic in practice and keep their low 32 bits
         return LLVMGetIntTypeWidth(t) == 1 ? IR_PRED : IR_I32;
     default:
         airc_fail("unsupported value type %d", LLVMGetTypeKind(t));
@@ -288,8 +277,7 @@ static unsigned scalar_bytes(LLVMTypeRef t)
     }
 }
 
-// Size and alignment of a type in memory, laid out the way Metal lays out its vectors, structs and arrays
-// (a 3-lane vector takes a 4-lane slot).
+// Metal's layout, where a 3-lane vector takes a 4-lane slot
 static unsigned layout(LLVMTypeRef t, unsigned *align)
 {
     unsigned a = 1, size;
@@ -322,7 +310,6 @@ static unsigned layout(LLVMTypeRef t, unsigned *align)
     return size;
 }
 
-// byte offset of field k of struct type t
 static unsigned field_offset(LLVMTypeRef t, unsigned k)
 {
     unsigned a, off = 0;
@@ -335,7 +322,6 @@ static unsigned field_offset(LLVMTypeRef t, unsigned k)
     return off;
 }
 
-// byte offset of flat lane `lane` within a value of type t in memory
 static unsigned lane_offset(LLVMTypeRef t, unsigned lane)
 {
     unsigned a;
@@ -364,7 +350,7 @@ static unsigned lane_offset(LLVMTypeRef t, unsigned lane)
     }
 }
 
-// IEEE half bits of f, rounded to nearest even
+// rounded to nearest even
 static uint32_t half_bits(float f)
 {
     uint32_t x;
@@ -429,11 +415,10 @@ static void set(LLVMValueRef key, unsigned lane, struct ir_val *v)
     insert(g_vals, key, lane, g_scope)->v = v;
 }
 
-// lane `lane` of a constant (vector, struct or array constants hold their lanes flattened)
 static struct ir_val *const_lane(LLVMValueRef c, unsigned lane)
 {
     LLVMTypeRef t = LLVMTypeOf(c);
-    // a splat (LLVM's vector-typed ConstantInt/ConstantFP) has the same value in every lane
+    // a vector-typed ConstantInt or ConstantFP is a splat
     if ((LLVMIsAConstantInt(c) || LLVMIsAConstantFP(c)) && LLVMGetTypeKind(t) == LLVMVectorTypeKind)
         t = LLVMGetElementType(t);
     if (LLVMIsAConstantInt(c)) {
@@ -466,7 +451,6 @@ static struct ir_val *const_lane(LLVMValueRef c, unsigned lane)
         }
         airc_fail("constant lane out of range");
     }
-    // undef, poison, zeroinitializer of a scalar
     return konst(ir_type_of(t), 0);
 }
 
@@ -477,7 +461,7 @@ static struct ir_val *get(LLVMValueRef v, unsigned lane)
     struct entry *e = find(g_vals, v, lane, g_scope);
     if (e)
         return e->v;
-    // parameters are mapped up front, so anything else that isn't an instruction is a constant
+    // parameters are mapped up front, so a non-instruction is a constant
     if (!LLVMIsAInstruction(v) && !LLVMIsAFunction(v)) {
         struct ir_val *c = const_lane(v, lane);
         set(v, lane, c);
@@ -493,7 +477,6 @@ static int is_i64(LLVMTypeRef t)
     return LLVMGetTypeKind(t) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(t) == 64;
 }
 
-// the high word of lane `lane` of a constant 64-bit integer (a vector's lanes are flattened like const_lane's)
 static struct ir_val *const_high(LLVMValueRef c, unsigned lane)
 {
     LLVMTypeRef t = LLVMTypeOf(c);
@@ -509,7 +492,7 @@ static struct ir_val *const_high(LLVMValueRef c, unsigned lane)
     return NULL;
 }
 
-// lane `lane` of a 64-bit integer value's high word, or NULL when it isn't known
+// NULL when not known
 static struct ir_val *high_word(LLVMValueRef v, unsigned lane)
 {
     if (nlanes(LLVMTypeOf(v)) == 1)
@@ -525,7 +508,7 @@ static void set_high(LLVMValueRef v, unsigned lane, struct ir_val *hi)
     insert(g_highs, v, lane, g_scope)->v = hi;
 }
 
-// high_word where a missing one reads as 0, for the places that only move words about
+// for places that only move words about
 static struct ir_val *high_or_zero(LLVMValueRef v, unsigned lane)
 {
     struct ir_val *hi = high_word(v, lane);
@@ -548,8 +531,7 @@ static unsigned shared_offset(LLVMValueRef g)
     return off;
 }
 
-// a constexpr sampler: a constant global holding Metal's packed sampler state, alone or as a struct's first
-// member; slots from the top of the pool
+// Metal's packed sampler state, alone or as a struct's first member; slots from the top of the pool
 static unsigned const_sampler(LLVMValueRef g)
 {
     LLVMValueRef init = LLVMGetInitializer(g);
@@ -578,7 +560,7 @@ static struct ir_val *index_value(LLVMValueRef idx, int *is_signed)
     if (LLVMIsAInstruction(idx)) {
         LLVMOpcode op = LLVMGetInstructionOpcode(idx);
         if (op == LLVMZExt || op == LLVMSExt) {
-            // a narrower integer's bits above its own are junk (a truncation keeps them)
+            // a narrower integer's upper bits are junk, as truncation keeps them
             LLVMValueRef x = LLVMGetOperand(idx, 0);
             *is_signed = op == LLVMSExt;
             return int_extend(get(x, 0), 8 * scalar_bytes(LLVMTypeOf(x)), *is_signed);
@@ -589,7 +571,7 @@ static struct ir_val *index_value(LLVMValueRef idx, int *is_signed)
 
 static struct ptr in_memory(struct ptr p);
 
-// count: how many elements the index picks from, 0 if unknown
+// count is the number of elements the index picks from, 0 if unknown
 static struct ptr add_index(struct ptr p, LLVMValueRef idx, unsigned scale, unsigned count)
 {
     LLVMValueRef c = const_int(idx);
@@ -602,7 +584,7 @@ static struct ptr add_index(struct ptr p, LLVMValueRef idx, unsigned scale, unsi
     if (p.space == SP_GLOBAL) {
         if (p.table && !count && scale && p.bytes > p.off)
             count = (unsigned)(p.bytes - p.off) / scale;
-        if (p.table && count) {  // a read past the kernel's data faults the channel: past a table's end, its last
+        if (p.table && count) {  // a read past the kernel's data faults the channel, so clamp to the last
             i = op2(IR_MIN, IR_I32, i, konst(IR_I32, count - 1));
             i->aux = 0;
         }
@@ -611,17 +593,17 @@ static struct ptr add_index(struct ptr p, LLVMValueRef idx, unsigned scale, unsi
         a->aux = is_signed;
         p.base = a;
     } else if (p.space == SP_SHARED || p.space == SP_LOCAL) {
-        if (p.space == SP_LOCAL && count) {  // past the array's end faults, where Metal leaves it undefined: the last
+        if (p.space == SP_LOCAL && count) {  // past the end faults, where Metal leaves it undefined
             i = op2(IR_MIN, IR_I32, i, konst(IR_I32, count - 1));
-            i->aux = 0;  // unsigned: a negative index is past the end too
+            i->aux = 0;  // unsigned, so a negative index clamps too
         }
         struct ir_val *s = scale == 1 ? i : op2(IR_MUL, IR_I32, i, konst(IR_I32, scale));
         p.base = p.base ? op2(IR_ADD, IR_I32, p.base, s) : s;
     } else if (p.space == SP_PRIVATE) {
-        if (!count && p.bytes > p.off && scale)  // a pointer stepping through it: the elements from here on
+        if (!count && p.bytes > p.off && scale)  // a pointer stepping through it
             count = (unsigned)(p.bytes - p.off) / scale;
         if (p.base && count && p.stride == count * scale && p.count * count <= 128) {
-            // an array of arrays picked twice: one index into all the elements, row by row
+            // an array of arrays indexed twice becomes one flat index
             p.base = op2(IR_ADD, IR_I32, op2(IR_MUL, IR_I32, p.base, konst(IR_I32, count)), i);
             p.stride = scale;
             p.count *= count;
@@ -634,10 +616,10 @@ static struct ptr add_index(struct ptr p, LLVMValueRef idx, unsigned scale, unsi
         p.base = i;
         p.stride = scale;
         p.count = count;
-    } else if (!p.base && !p.param && scale == 8) {  // an array of textures or samplers: the element
+    } else if (!p.base && !p.param && scale == 8) {  // an array of textures or samplers
         unsigned n = count ? count : p.count;
         p.base = i;
-        if (n) {  // an index past the end is undefined in Metal; here it stays on the last
+        if (n) {  // undefined in Metal past the end; clamp to the last
             p.base = op2(IR_MIN, IR_I32, i, konst(IR_I32, n - 1));
             p.base->aux = 0;
         }
@@ -670,10 +652,8 @@ static struct ptr gep(LLVMValueRef g)
     return p;
 }
 
-// Private memory goes to the thread's local memory (LDL/STL) rather than registers when it's indexed by a variable
-// (a SEL over every element at each access otherwise) or read in other pieces than it was written in (MPS moves its
-// reduction state through it as bytes, then reads it as words): through calls too, as they're inlined. Fields of
-// different sizes side by side are fine (MPS's array structs hold a pointer, a 64-bit count and a 32-bit rank).
+// Private memory goes to local memory when indexed by a variable (else a SEL over every element per access) or read
+// in other pieces than written, as MPS does with its reduction state. Mixed-size fields side by side are fine.
 static LLVMValueRef ptr_root(LLVMValueRef v)
 {
     while (LLVMIsAInstruction(v) && (LLVMGetInstructionOpcode(v) == LLVMGetElementPtr ||
@@ -683,7 +663,7 @@ static LLVMValueRef ptr_root(LLVMValueRef v)
     return v;
 }
 
-// v's byte offset from ptr_root(v); one with a variable index counts as 0, as scan_uses takes it as dynamic anyway
+// a variable index counts as 0, as scan_uses takes it as dynamic anyway
 static int64_t root_offset(LLVMValueRef v)
 {
     int64_t off = 0;
@@ -712,8 +692,7 @@ static int64_t root_offset(LLVMValueRef v)
     return off;
 }
 
-// The pieces of private memory accessed, each as the variable it is: a lane, or a word of a 64-bit integer, which
-// values keep as two
+// a lane, or a word of a 64-bit integer, which values keep as two
 struct piece {
     int64_t off;
     unsigned bytes;
@@ -722,9 +701,9 @@ struct piece {
 struct pieces {
     struct piece *p;
     unsigned n, cap;
-    unsigned sizes;  // of the lanes, a bit each
+    unsigned sizes;  // lane sizes, a bit each
     int dynamic;     // indexed by a variable, or moved as bytes by a memcpy
-    int escapes;     // its address goes where the scan doesn't follow it
+    int escapes;
 };
 
 static void add_pieces(struct pieces *s, LLVMTypeRef t, int64_t off)
@@ -750,7 +729,6 @@ static void add_pieces(struct pieces *s, LLVMTypeRef t, int64_t off)
     }
 }
 
-// two pieces that overlap without being the same variable
 static int pieces_clash(const struct pieces *s)
 {
     for (unsigned i = 0; i < s->n; i++)
@@ -767,8 +745,7 @@ static int rooted_at(LLVMValueRef v, LLVMValueRef root)
     return is_ptr(LLVMTypeOf(v)) && ptr_root(v) == root;
 }
 
-// whether alloca b is only loaded from and stored to in fn, at constant offsets: every load of what it holds is in
-// sight then
+// only loaded and stored at constant offsets, so every load of what it holds is in sight
 static int stays_put(LLVMValueRef fn, LLVMValueRef b)
 {
     for (LLVMBasicBlockRef bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb))
@@ -793,8 +770,7 @@ static int stays_put(LLVMValueRef fn, LLVMValueRef b)
 
 static void scan_uses(LLVMValueRef fn, LLVMValueRef root, int64_t base, struct pieces *s, unsigned depth);
 
-// A pointer at bytes into the alloca, stored into fn's memory at y (MPS's visible functions spill the struct pointer
-// they're given to the stack): what's done through each load of it back. 0 when not every load can be seen.
+// MPS's visible functions spill their struct pointer to the stack; 0 when not every load back can be seen
 static int follow_spill(LLVMValueRef fn, LLVMValueRef y, int64_t at, struct pieces *s, unsigned depth)
 {
     LLVMValueRef b = ptr_root(y);
@@ -810,14 +786,11 @@ static int follow_spill(LLVMValueRef fn, LLVMValueRef y, int64_t at, struct piec
             if (o == off && is_ptr(LLVMTypeOf(in)))
                 scan_uses(fn, in, at, s, depth + 1);
             else if (o < off + 8 && off < o + layout(LLVMTypeOf(in), &a))
-                return 0;  // the pointer read as something else
+                return 0;
         }
     return 1;
 }
 
-// what fn does through pointers rooted at root, which is base bytes into the alloca: the pieces it loads and stores,
-// whether it indexes them by a variable, and whether the address goes somewhere else (stored where its loads can't
-// all be seen, returned, passed to an intrinsic or a call too deep)
 static void scan_uses(LLVMValueRef fn, LLVMValueRef root, int64_t base, struct pieces *s, unsigned depth)
 {
     if (depth > 8) {
@@ -839,7 +812,7 @@ static void scan_uses(LLVMValueRef fn, LLVMValueRef root, int64_t base, struct p
                 for (int i = 1; i < LLVMGetNumOperands(in); i++)
                     if (!const_int(LLVMGetOperand(in, i)))
                         s->dynamic = 1;
-            } else if (op == LLVMPHI && is_ptr(LLVMTypeOf(in))) {  // a pointer walking it, picked when it runs
+            } else if (op == LLVMPHI && is_ptr(LLVMTypeOf(in))) {
                 for (unsigned i = 0; i < LLVMCountIncoming(in); i++)
                     if (ptr_root(LLVMGetIncomingValue(in, i)) == root)
                         s->dynamic = 1;
@@ -847,15 +820,14 @@ static void scan_uses(LLVMValueRef fn, LLVMValueRef root, int64_t base, struct p
                 if (ptr_root(LLVMGetOperand(in, 1)) == root || ptr_root(LLVMGetOperand(in, 2)) == root)
                     s->dynamic = 1;
             } else if (op == LLVMPtrToInt && ptr_root(LLVMGetOperand(in, 0)) == root) {
-                s->dynamic = 1;  // its address as a number, which only memory has
+                s->dynamic = 1;  // only memory has an address
             } else if (op == LLVMCall) {
                 LLVMValueRef callee = LLVMGetCalledValue(in);
                 const char *name = callee ? LLVMGetValueName(callee) : NULL;
                 if (callee && !LLVMGetFirstBasicBlock(callee) && name && strncmp(name, "air.", 4) &&
                     strncmp(name, "llvm.", 5))
                     callee = linked_function(name);
-                // a memcpy or memset moves bytes whatever the lanes around it are, which only memory keeps; so does
-                // a vload or vstore (a vload_half of an int array reads it as halves)
+                // memcpy, memset and vload/vstore move bytes regardless of lanes, which only memory keeps
                 if (name && !strncmp(name, "llvm.mem", 8) &&
                     (ptr_root(LLVMGetOperand(in, 0)) == root || ptr_root(LLVMGetOperand(in, 1)) == root))
                     s->dynamic = 1;
@@ -896,7 +868,7 @@ static int alloca_is_local(LLVMValueRef alloca, LLVMValueRef fn)
         scan_uses(fn, alloca, 0, &s, 0);
         c = ir_alloc(sizeof(*c));
         c->alloca = alloca;
-        // what's done through an escaped address isn't seen: different sizes anywhere might overlap there
+        // accesses through an escaped address aren't seen, so mixed sizes might overlap there
         c->local = s.dynamic || pieces_clash(&s) || (s.escapes && (s.sizes & (s.sizes - 1)));        c->next = g_local_choices;
         g_local_choices = c;
         free(s.p);
@@ -904,7 +876,7 @@ static int alloca_is_local(LLVMValueRef alloca, LLVMValueRef fn)
     return c->local;
 }
 
-static LLVMValueRef g_body_fn;  // the function whose body is being converted (an inlined one's while it is)
+static LLVMValueRef g_body_fn;  // the inlined function while its body is converted
 static void const_table(struct ptr p, LLVMValueRef init);
 
 static struct ptr ptr_of(LLVMValueRef v)
@@ -923,8 +895,7 @@ static struct ptr ptr_of(LLVMValueRef v)
             p.space = SP_SAMPLER;
             p.slot = const_sampler(v);
         } else if (as == 2 && LLVMGetInitializer(v)) {
-            // a constant table: variables that hold it from the start, or for a bigger one than their offsets reach
-            // (private_var), memory. One the static initialiser writes (a function constant's) stays in variables.
+            // a constant table, in memory once too big for private_var; one the static initialiser writes stays put
             unsigned a;
             p.space = SP_PRIVATE;
             p.slot = ++g_nallocas;
@@ -949,7 +920,7 @@ static struct ptr ptr_of(LLVMValueRef v)
             airc_fail("unsupported constant pointer expression %d", op);
     } else if (LLVMIsAInstruction(v) && LLVMGetInstructionOpcode(v) == LLVMAlloca && LLVMGetAllocatedType(v) &&
                alloca_is_local(v, g_body_fn)) {
-        unsigned a, bytes = layout(LLVMGetAllocatedType(v), &a);  // a fresh area for each inlined instance
+        unsigned a, bytes = layout(LLVMGetAllocatedType(v), &a);  // fresh for each inlined instance
         a = a < 4 ? 4 : a;
         p.space = SP_LOCAL;
         p.off = (g_info->local_size + a - 1) & ~(a - 1);
@@ -958,14 +929,14 @@ static struct ptr ptr_of(LLVMValueRef v)
     } else if (LLVMIsAInstruction(v) && LLVMGetInstructionOpcode(v) == LLVMAlloca) {
         unsigned a;
         p.space = SP_PRIVATE;
-        p.slot = ++g_nallocas;  // a fresh one for each inlined instance (pointers are keyed by scope)
+        p.slot = ++g_nallocas;  // fresh for each inlined instance, as pointers are keyed by scope
         p.bytes = LLVMGetAllocatedType(v) ? layout(LLVMGetAllocatedType(v), &a) : 0;
     } else if (LLVMIsAInstruction(v) && LLVMGetInstructionOpcode(v) == LLVMGetElementPtr) {
         p = gep(v);
     } else if (LLVMIsAInstruction(v) && (LLVMGetInstructionOpcode(v) == LLVMBitCast ||
                                          LLVMGetInstructionOpcode(v) == LLVMAddrSpaceCast)) {
         p = ptr_of(LLVMGetOperand(v, 0));
-    } else if (!LLVMIsAInstruction(v) && !LLVMIsAFunction(v)) {  // null (or undefined): address 0, handle 0
+    } else if (!LLVMIsAInstruction(v) && !LLVMIsAFunction(v)) {  // null or undefined
         p.space = SP_GLOBAL;
         p.base = konst(IR_I64, 0);
     } else {
@@ -975,8 +946,7 @@ static struct ptr ptr_of(LLVMValueRef v)
     return p;
 }
 
-// A pointer held in an aggregate (CoreImage passes its samplers around as structs of a texture, a sampler and a
-// constant pointer): lane `lane` of v, kept beside the value lanes
+// CoreImage passes samplers as structs of a texture, a sampler and a constant pointer
 static int lane_is_ptr(LLVMTypeRef t, unsigned lane)
 {
     return LLVMGetTypeKind(lane_type(t, lane)) == LLVMPointerTypeKind;
@@ -994,7 +964,6 @@ static struct ptr ptr_lane(LLVMValueRef v, unsigned lane)
     airc_fail("a pointer in an aggregate that isn't built in the function");
 }
 
-// lane dl of dst is lane sl of src, a value or a pointer
 static void copy_lane(LLVMValueRef dst, unsigned dl, LLVMValueRef src, unsigned sl)
 {
     if (lane_is_ptr(LLVMTypeOf(src), sl))
@@ -1006,10 +975,7 @@ static void copy_lane(LLVMValueRef dst, unsigned dl, LLVMValueRef src, unsigned 
     }
 }
 
-// A local access's variable part (NULL for none), kept inside its alloca for an access ending end bytes past p.off:
-// past the thread's local size faults the warp (Out Of Range Address), where a register array read garbage, and
-// code the compiler runs on both sides of a branch may compute any index. The size covers whatever the access can
-// reach, as one reading past its alloca's end would (undefined, but no fault).
+// Past the local size faults the warp, and code run on both sides of a branch may compute any index, so clamp.
 static struct ir_val *local_base(struct ptr p, unsigned end)
 {
     int64_t room = (int64_t)p.slot - p.off - end, reach = p.off + end + (p.base && room > 0 ? room : 0);
@@ -1018,23 +984,21 @@ static struct ir_val *local_base(struct ptr p, unsigned end)
     if (!p.base)
         return NULL;
     struct ir_val *m = op2(IR_MIN, IR_I32, p.base, konst(IR_I32, room > 0 ? room : 0));
-    m->aux = 0;  // unsigned: below the start is past the end too
+    m->aux = 0;  // unsigned, so below the start clamps too
     return m;
 }
 
-// base + off for a global pointer, as an address: whole megabytes of the offset through IMAD.WIDE's 32-bit index,
-// so any offset fits
+// whole megabytes go through IMAD.WIDE's 32-bit index, so any offset fits
 static struct ir_val *add_offset(struct ir_val *base, int64_t off)
 {
     int big = off < INT32_MIN || off > INT32_MAX;
     struct ir_val *a = op2(IR_ADDR, IR_I64, base, konst(IR_I32, big ? off >> 20 : off));
     a->imm = big ? 1 << 20 : 1;
-    a->aux = 1;  // signed
+    a->aux = 1;
     return big && (off & 0xfffff) ? add_offset(a, off & 0xfffff) : a;
 }
 
-// a global pointer whose offset a memory op's signed 24-bit immediate holds, with room for the lanes after it;
-// the rest goes into the base
+// keeps the offset within a memory op's signed 24-bit immediate, with room for the lanes after it
 static struct ptr fit_offset(struct ptr p)
 {
     if (p.space != SP_GLOBAL || (p.off >= -(1 << 23) && p.off < (1 << 23) - 256))
@@ -1046,8 +1010,7 @@ static struct ptr fit_offset(struct ptr p)
 
 static struct ir_val *handle_of_ptr(struct ptr p, enum space space);
 
-// a pointer as one value, for a phi or select of pointers: a global one's 64-bit address, a shared one's offset, a
-// texture's or sampler's handle
+// for a phi or select of pointers
 static struct ir_val *ptr_value(struct ptr p)
 {
     p = in_memory(p);
@@ -1067,9 +1030,7 @@ static enum space ptr_space(LLVMTypeRef t)
     return LLVMGetPointerAddressSpace(t) == 3 ? SP_SHARED : SP_GLOBAL;
 }
 
-// A phi of pointers, before the values it picks from are all made (a loop's step comes after it): in local memory
-// when one it starts from is an alloca there, and kept inside the furthest of those. An alloca's address space is
-// the one device memory has, so that alone can't tell.
+// Decided before a loop's step exists; an alloca has device memory's address space, so that alone can't tell.
 static struct ptr phi_ptr(LLVMValueRef phi)
 {
     struct ptr q = { .space = ptr_space(LLVMTypeOf(phi)) };
@@ -1088,16 +1049,14 @@ static struct ptr phi_ptr(LLVMValueRef phi)
     return q;
 }
 
-// A global the static initialiser writes (from a function constant's specialised value) and the shader then
-// only reads: its lanes, once written.
+// a global the static initialiser writes from a function constant and the shader only reads
 static struct ir_val *global_state(LLVMValueRef g, unsigned lane)
 {
     struct entry *e = find(g_vals, g, lane, 0);
     return e ? e->v : NULL;
 }
 
-// the specialised value of the function constant behind an initialiser global (named
-// <name>.MTL_FC_INIT_<n>_<type>), 1 if it has one; else its index and name for the error
+// globals named <name>.MTL_FC_INIT_<n>_<type>; on failure index and name are for the error
 static int fc_bits(LLVMValueRef g, uint32_t *bits, int *index, const char **name, unsigned *len)
 {
     unsigned n = LLVMGetNamedMetadataNumOperands(g_module, "air.function_constants");
@@ -1144,9 +1103,7 @@ static struct ir_val *function_constant(LLVMValueRef g, LLVMTypeRef t)
 
 static LLVMValueRef static_init(LLVMValueRef after);
 
-// The value of a predicate a [[function_constant(x)]] output names: what the static initialiser stores into its
-// global, worked out at compile time, since an output that exists only when it's true has to be settled before
-// the code is made.
+// a [[function_constant(x)]] output's predicate, settled at compile time since it decides whether the output exists
 static unsigned long long fc_eval(LLVMValueRef v)
 {
     uint32_t bits;
@@ -1264,8 +1221,7 @@ static struct ir_val *attr(enum ir_op op, unsigned addr)
     return v;
 }
 
-// a tessellation stage's attribute at addr in b: of the vertex whose handle is vtx, or (IR_ATTR_* flags) the patch's
-// or the stage's own output
+// of the vertex whose handle is vtx, or by flags the patch's or the stage's own output
 static struct ir_val *tess_attr(struct ir_block *b, struct ir_val *vtx, unsigned addr, int flags)
 {
     struct ir_val *v = ir_add(b, IR_ALD, IR_F32, vtx ? 1 : 0);
@@ -1276,8 +1232,7 @@ static struct ir_val *tess_attr(struct ir_block *b, struct ir_val *vtx, unsigned
     return v;
 }
 
-// the patch id (word 0) or instance id (word 1) the tessellation init stage leaves after the patch's attributes;
-// with all of them there's no room, and they read 0
+// left by the tessellation init stage after the patch's attributes; with all of them used there's no room, so 0
 static struct ir_val *patch_id_word(unsigned word)
 {
     if (__builtin_popcount(g_info->patch_inputs) == NVK_MAX_PATCH_INPUTS)
@@ -1294,8 +1249,6 @@ static struct ir_val *flat_tid(void)
     return ir_op2(g_prologue, IR_ADD, IR_I32, ir_op2(g_prologue, IR_MUL, IR_I32, zy, cbuf(IR_I32, 0)), s2r(SR_TID_X));
 }
 
-// a thread's place in the dispatch along axis l, for the builtin kinds that are one: where it is in the grid
-// (origin + ctaid * ntid + tid, ntid from c[0x0][4 * l]) or its threadgroup, and the sizes
 static struct ir_val *thread_value(enum nvk_arg_kind kind, unsigned l)
 {
     switch (kind) {
@@ -1325,7 +1278,7 @@ static struct ir_val *udivmod(struct ir_val *n, struct ir_val *d, int rem);
 // MTLStepFunction's values for a kernel's stage input
 enum { STEP_CONSTANT = 0, STEP_X = 5, STEP_Y, STEP_X_INDEXED, STEP_Y_INDEXED };
 
-// word i of the stage-in region: its origin's x, y and z, then its size's
+// origin x, y, z, then size
 static struct ir_val *stage_in_region(unsigned i)
 {
     if (!g_region[i]) {
@@ -1338,9 +1291,7 @@ static struct ir_val *stage_in_region(unsigned i)
     return g_region[i];
 }
 
-// The element of a's buffer the stage input reads at stage-in grid position (x, y), a step every rate positions:
-// the position along the step function's axis past the region's origin, or the index buffer's at that position
-// past the origin (which makes the origin a base vertex, as Metal's tessellation kernels have it)
+// indexed steps add the origin after the index lookup, making it a base vertex as Metal's tessellation kernels expect
 static struct ir_val *stage_in_element(const struct airc_tess_attr *a, unsigned loc, struct ir_val *x,
                                        struct ir_val *y)
 {
@@ -1363,8 +1314,7 @@ static struct ir_val *stage_in_element(const struct airc_tess_attr *a, unsigned 
     return op2(IR_ADD, IR_I32, pos, stage_in_region(axis));
 }
 
-// attribute loc of the stage input at stage-in grid position (x, y); one the descriptor leaves out reads zeros, as
-// a vertex function's does
+// one the descriptor leaves out reads zeros, as a vertex function's does
 static void stage_in_attr(unsigned loc, struct ir_val *x, struct ir_val *y, struct ir_val *v[4])
 {
     const struct airc_tess_attr *a = g_stage_in ? &g_stage_in->attrs[loc] : NULL;
@@ -1375,15 +1325,13 @@ static void stage_in_attr(unsigned loc, struct ir_val *x, struct ir_val *y, stru
     airc_fetch(g_cur, a, loc, cbuf(IR_I64, g_stage_in_buffer[a->buffer]), stage_in_element(a, loc, x, y), v);
 }
 
-// a fetched component as a lane of type t holds it, a half still as a float: its bits as a float's or an integer's
+// a half stays a float here
 static struct ir_val *stage_in_lane(struct ir_val *v, LLVMTypeRef t)
 {
     enum ir_type want = ir_type_of(t) == IR_I32 ? IR_I32 : IR_F32;
     return v->type == want ? v : op2(IR_OR, want, v, konst(want, 0));
 }
 
-// The entry function's arguments: builtins become values made in the prologue, buffers pointers whose base
-// the dispatcher puts in const bank 0, textures and samplers pool slots.
 static void entry_args(void)
 {
     for (unsigned i = 0; i < LLVMCountParams(g_entry_fn); i++) {  // the stage input's hidden ones follow
@@ -1392,7 +1340,7 @@ static void entry_args(void)
         unsigned n = nlanes(LLVMTypeOf(p));
         struct ptr ptr = { 0 };
         struct ir_val *texel = NULL, *uv[2] = { NULL, NULL }, *fetched[4];
-        if (a->kind == NVK_ARG_RENDER_TARGET) {  // fetch the attachment at the pixel's integer position
+        if (a->kind == NVK_ARG_RENDER_TARGET) {
             struct ir_val *xy[2];
             for (int c = 0; c < 2; c++) {
                 struct ir_val *pos = attr(IR_IPA, 0x70 + 4 * c);
@@ -1414,7 +1362,7 @@ static void entry_args(void)
                 ptr.space = SP_GLOBAL;
                 ptr.base = cbuf(IR_I64, a->cbuf_off);
                 break;
-            case NVK_ARG_THREADGROUP:  // after the static threadgroup variables, where the dispatcher put it
+            case NVK_ARG_THREADGROUP:  // the dispatcher puts it after the static threadgroup variables
                 ptr.space = SP_SHARED;
                 ptr.base = cbuf(IR_I32, a->cbuf_off);
                 break;
@@ -1444,7 +1392,7 @@ static void entry_args(void)
             case NVK_ARG_SIMD_SIZE:
                 v = konst(IR_I32, 32);
                 break;
-            case NVK_ARG_SIMD_GROUPS:  // ntid.x * ntid.y * ntid.z in whole SIMD groups of 32, or quads
+            case NVK_ARG_SIMD_GROUPS:
             case NVK_ARG_QUAD_GROUPS: {
                 unsigned shift = a->kind == NVK_ARG_SIMD_GROUPS ? 5 : 2;
                 struct ir_val *n = ir_op2(g_prologue, IR_MUL, IR_I32,
@@ -1461,9 +1409,8 @@ static void entry_args(void)
                 v = ir_op2(g_prologue, IR_AND, IR_I32, flat_tid(), konst(IR_I32, 3));
                 break;
             case NVK_ARG_DISPATCH_TG_SIZE: {
-                // ntid is short in the part of a non-uniform dispatch with the edge's threadgroups, which starts
-                // past whole ones: their size is its origin over its threadgroup origin. A grid smaller than one
-                // threadgroup leaves no trace of the size asked for, and gets ntid.
+                // ntid is short in a non-uniform dispatch's edge part, so recover the size from its origins; a grid
+                // smaller than one threadgroup leaves no trace of it and gets ntid
                 struct ir_val *groups = cbuf(IR_I32, NVK_CB_GROUP_ORIGIN + 4 * l);
                 struct ir_val *edge = ir_op2(g_prologue, IR_CMP, IR_PRED, groups, konst(IR_I32, 0));
                 edge->aux = IR_NE;
@@ -1490,7 +1437,7 @@ static void entry_args(void)
                 v = cbuf(IR_I32, NVK_BASE_INSTANCE);
                 break;
             case NVK_ARG_VERTEX_INPUT:
-                if (g_info->stage == NVK_COMPUTE) {  // a kernel's [[stage_in]], fetched at the thread's position
+                if (g_info->stage == NVK_COMPUTE) {
                     if (!l)
                         stage_in_attr(a->index, thread_value(NVK_ARG_TID, 0), thread_value(NVK_ARG_TID, 1), fetched);
                     v = stage_in_lane(fetched[l], lane_type(LLVMTypeOf(p), l));
@@ -1503,7 +1450,7 @@ static void entry_args(void)
             case NVK_ARG_STAGE_IN_SIZE:
                 v = stage_in_region(3 * (a->kind == NVK_ARG_STAGE_IN_SIZE) + l);
                 break;
-            case NVK_ARG_CONTROL_POINTS: {  // bytes 0 and 2 of INVOCATION_INFO multiplied
+            case NVK_ARG_CONTROL_POINTS: {
                 if (g_info->stage == NVK_COMPUTE)  // a kernel's are its stage input, fetched where they're read
                     break;
                 struct ir_val *info = s2r(SR_INVOCATION_INFO);
@@ -1520,7 +1467,7 @@ static void entry_args(void)
             case NVK_ARG_PATCH_ID:
                 v = patch_id_word(0);
                 break;
-            case NVK_ARG_POSITION_IN_PATCH:  // u and v, outputs of the stage indexed by lane; a triangle's w 1 - u - v
+            case NVK_ARG_POSITION_IN_PATCH:  // u and v are stage outputs indexed by lane
                 if (l < 2)
                     v = uv[l] = tess_attr(g_prologue, s2r(SR_LANEID), 0x2f0 + 4 * l, IR_ATTR_OUTPUT);
                 else
@@ -1535,7 +1482,7 @@ static void entry_args(void)
                 v = attr(IR_IPA, 0x2e0 + 4 * l);
                 g_info->ps_sysvals |= SPH_PS_POINT_COORD;
                 break;
-            case NVK_ARG_FRONT_FACING: {  // a[0x3fc] read flat (NAK's NAK_ATTR_FRONT_FACE): non-zero for the front
+            case NVK_ARG_FRONT_FACING: {  // NAK's NAK_ATTR_FRONT_FACE, read flat
                 struct ir_val *f = attr(IR_IPA, 0x3fc);
                 f->type = IR_I32;
                 f->aux = 1;
@@ -1550,8 +1497,7 @@ static void entry_args(void)
                 break;
             case NVK_ARG_VARYING: {
                 v = attr(IR_IPA, 0x80 + 16 * a->index + 4 * l);
-                // read as is: IPA.PASS evaluates the plane as floats, which flushes an integer's small values,
-                // denormal as floats, to 0
+                // not IPA.PASS, which evaluates as floats and flushes small integers, denormal as floats, to 0
                 int at = (g_info->centroid | g_info->at_sample) >> a->index & 1;
                 v->aux = g_info->interp[a->index] == SPH_FLAT ? SASS_IPA_FLAT : at ? SASS_IPA_CENTROID : 0;
                 if (g_info->interp[a->index] == SPH_PERSPECTIVE) {  // SM70+ leaves the divide by w to the shader
@@ -1569,14 +1515,14 @@ static void entry_args(void)
             case NVK_ARG_SAMPLE_ID:
                 v = s2r(SR_PIXLD(SASS_PIXLD_MY_INDEX));
                 break;
-            case NVK_ARG_LAYER:  // what the vertex function wrote, read flat
+            case NVK_ARG_LAYER:
             case NVK_ARG_VIEWPORT:
                 v = attr(IR_IPA, a->kind == NVK_ARG_LAYER ? 0x64 : 0x68);
                 v->type = IR_I32;
                 v->aux = SASS_IPA_FLAT;
                 g_info->ps_sysvals |= a->kind == NVK_ARG_LAYER ? SPH_PS_LAYER : SPH_PS_VIEWPORT;
                 break;
-            case NVK_ARG_SAMPLE_MASK:  // the pixel's coverage; run once a sample, only the sample's
+            case NVK_ARG_SAMPLE_MASK:  // per-sample runs see only their own sample
                 v = s2r(SR_PIXLD(SASS_PIXLD_COVMASK));
                 if (g_info->flags & NVK_FLAG_PER_SAMPLE)
                     v = ir_op2(g_prologue, IR_AND, IR_I32, v,
@@ -1598,7 +1544,6 @@ static void entry_args(void)
     }
 }
 
-// intrinsic names look like air.<base>.<type>, air.fast_<base>.<type> or llvm.<base>.<type>
 static int is_fn(const char *name, const char *base)
 {
     static const char *const prefixes[] = { "air.", "air.fast_", "air.native_", "llvm." };
@@ -1618,7 +1563,7 @@ static struct ir_val *mufu_op(int op, struct ir_val *x)
     return v;
 }
 
-// float math on halves runs in float: widen, compute, narrow
+// float maths on halves runs in float
 static struct ir_val *widen(struct ir_val *x)
 {
     return x->type == IR_F16 ? op1(IR_H2F, IR_F32, x) : x;
@@ -1648,9 +1593,7 @@ static struct ir_val *clampf(struct ir_val *x, struct ir_val *lo, struct ir_val 
     return op2(IR_FMIN, IR_F32, op2(IR_FMAX, IR_F32, x, lo), hi);
 }
 
-// Apple's results are the reference. precise:: (and the default with fast maths off) is within an ulp or two with
-// C's special cases, and flushes denormals like the arithmetic does except where a tiny x gives x back. fast::, the
-// default and so nearly every shader, takes cheap MUFU forms instead (cheap_math), ulps out next to Apple's.
+// Apple's results are the reference; precise:: stays within an ulp or two of them, fast:: takes cheap MUFU forms.
 
 #define PIO2_HI 1.57079637f
 #define PIO2_LO -4.37113883e-8f
@@ -1707,7 +1650,7 @@ static struct ir_val *negf(struct ir_val *x)
     return op1(IR_FNEG, IR_F32, x);
 }
 
-// MUFU flushes denormals in and out: where the arithmetic keeps them, scale them into the normal range around it
+// MUFU flushes denormals, so scale them into the normal range where the arithmetic keeps them
 static struct ir_val *mufu(int op, struct ir_val *x)
 {
     if (!g_info->denorms || op == MUFU_SIN || op == MUFU_COS)
@@ -1753,7 +1696,7 @@ static struct ir_val *poly(struct ir_val *x, const float *k, unsigned n)
     return p;
 }
 
-// a / b: the reciprocal's product, then a Newton step, which only a zero or infinite b turns into NaN
+// the Newton step is NaN only for a zero or infinite b
 static struct ir_val *divf(struct ir_val *a, struct ir_val *b)
 {
     struct ir_val *r = mufu(MUFU_RCP, b), *q = mulf(a, r);
@@ -1761,8 +1704,7 @@ static struct ir_val *divf(struct ir_val *a, struct ir_val *b)
     return sel(isnan_ir(e), q, e);
 }
 
-// 1 / b correctly rounded but for the odd tie: MUFU.RCP's reciprocal, then a Newton step, which only a zero or
-// infinite b turns into NaN
+// correctly rounded but for the odd tie
 static struct ir_val *rcp_exact(struct ir_val *b)
 {
     struct ir_val *r = mufu(MUFU_RCP, b);
@@ -1770,7 +1712,7 @@ static struct ir_val *rcp_exact(struct ir_val *b)
     return sel(isnan_ir(e), r, e);
 }
 
-// precise: a Newton step on the exact remainder, where there's one (not at 0 or inf)
+// precise adds a Newton step on the exact remainder, which 0 and inf don't have
 static struct ir_val *sqrtf_ir(struct ir_val *x, int precise)
 {
     struct ir_val *s = mufu(MUFU_SQRT, x);
@@ -1780,9 +1722,7 @@ static struct ir_val *sqrtf_ir(struct ir_val *x, int precise)
     return sel(isnan_ir(e), s, e);
 }
 
-// 2^(hi + lo), lo small next to hi: 2^n exactly times 2^f for f = hi - n + lo, n clamped to the normal range so
-// that what's past it overflows or underflows MUFU.EX2 instead, and 2^f from a polynomial on [-1/2, 1/2] (an ulp,
-// where MUFU.EX2 is off by two)
+// 2^(hi + lo); the polynomial on [-1/2, 1/2] is within an ulp, where MUFU.EX2 is off by two
 static struct ir_val *exp2_split(struct ir_val *hi, struct ir_val *lo)
 {
     static const float k[] = { 0.000154035122f, 0.00133907353f, 0.00961823761f, 0.0555035733f, 0.240226492f,
@@ -1799,7 +1739,7 @@ static struct ir_val *exp2_split(struct ir_val *hi, struct ir_val *lo)
     return mulf(p, scale);
 }
 
-// e^x, x log2(e) carried in two parts: its rounding alone would cost tens of ulps near the ends of the range
+// x log2(e) in two parts, as its rounding alone costs tens of ulps near the ends of the range
 static struct ir_val *exp_precise(struct ir_val *x, float k_hi, float k_lo, float bias)
 {
     struct ir_val *hi = mulf(x, fconst(k_hi));
@@ -1807,8 +1747,7 @@ static struct ir_val *exp_precise(struct ir_val *x, float k_hi, float k_lo, floa
     return exp2_split(bias ? subf(hi, fconst(bias)) : hi, lo);
 }
 
-// log(x) times k_near near 1, times k_far / ln 2 elsewhere: MUFU.LG2's error is absolute, so within 1/16 of 1 it's
-// log(1 + u) = u - u^2/2 + u^3 P(u) instead
+// MUFU.LG2's error is absolute, so near 1 a polynomial in x - 1 takes over
 static struct ir_val *log_ir(struct ir_val *x, float k_near, float k_far)
 {
     static const float k[] = { -0.167180747f, 0.200546488f, -0.249999687f, 0.333333105f };
@@ -1827,8 +1766,7 @@ struct quadrant {
     struct ir_val *r, *q;
 };
 
-// |x| = m 2^(e - 150): x 2/pi mod 4 is m times the 96 bits of 2/pi from bit e - 151 on, in 32-bit limbs (Payne and
-// Hanek); two bits of quadrant, then a 64-bit fraction, rounded to the nearest quadrant, times pi/2
+// x 2/pi mod 4 from the mantissa times 96 bits of 2/pi, in 32-bit limbs
 static struct quadrant payne_hanek(struct ir_val *x)
 {
     static const uint32_t k_2_pi[] = {
@@ -1836,7 +1774,7 @@ static struct quadrant payne_hanek(struct ir_val *x)
     };
     struct ir_val *bits = fbits(IR_AND, x, 0x7fffffff);
     struct ir_val *m = ibin(IR_OR, ibin(IR_AND, bits, ik(0x7fffff)), ik(0x800000));
-    struct ir_val *at = ibin(IR_SUB, ibin(IR_SHR, bits, ik(23)), ik(120));  // the bit in k_2_pi, its 0 word first
+    struct ir_val *at = ibin(IR_SUB, ibin(IR_SHR, bits, ik(23)), ik(120));  // counts k_2_pi's 0 word
     struct ir_val *w = ibin(IR_SHR, at, ik(5)), *sh = ibin(IR_AND, at, ik(31)), *back = ibin(IR_SUB, ik(31), sh);
     struct ir_val *t[4], *win[3];
     for (unsigned i = 0; i < 4; i++) {
@@ -1846,15 +1784,14 @@ static struct quadrant payne_hanek(struct ir_val *x)
     }
     for (unsigned i = 0; i < 3; i++)  // never a shift by 32
         win[i] = ibin(IR_OR, ibin(IR_SHL, t[i], sh), ibin(IR_SHR, ibin(IR_SHR, t[i + 1], ik(1)), back));
-    // m * win: bits 30 to 95 matter, the quadrant at 94 and 95
+    // bits 30 to 95 of m * win matter, the quadrant at 94 and 95
     struct ir_val *r0 = ibin(IR_MUL, m, win[2]), *l1 = ibin(IR_MUL, m, win[1]), *l0 = ibin(IR_MUL, m, win[0]);
     struct ir_val *r1 = ibin(IR_ADD, ibin(IR_MULHI, m, win[2]), l1);
     struct ir_val *r2 = ibin(IR_ADD, ibin(IR_ADD, ibin(IR_MULHI, m, win[1]), l0), sel(icmp(IR_LT, r1, l1), ik(1), ik(0)));
     struct ir_val *q = ibin(IR_SHR, r2, ik(30));
     struct ir_val *hi = ibin(IR_OR, ibin(IR_SHL, r2, ik(2)), ibin(IR_SHR, r1, ik(30)));
     struct ir_val *lo = ibin(IR_OR, ibin(IR_SHL, r1, ik(2)), ibin(IR_SHR, r0, ik(30)));
-    // half a quadrant or more rounds up to the next one and leaves the fraction negative: its magnitude by one's
-    // complement, 2^-64 out
+    // rounding up leaves the fraction negative; one's complement is 2^-64 out
     struct ir_val *neg = ibin(IR_SAR, hi, ik(31));
     q = ibin(IR_SUB, q, neg);
     hi = ibin(IR_XOR, hi, neg);
@@ -1868,26 +1805,18 @@ static struct quadrant payne_hanek(struct ir_val *x)
     return k;
 }
 
-// how far a sin, cos or tan is exact: precise ones everywhere; Apple's fast ones to about 2^20 revolutions (sin and
-// cos, which give 0 past it, M4: right at 6.16e6, 0 at 7.39e6) and tan to 2^24 (past it, mostly NaN) with the
-// three-part reduction alone; half's inputs never need more
+// Apple's fast sin and cos are exact to about 2^20 revolutions and 0 past it, tan to 2^24 and mostly NaN past it
 enum { TRIG_PRECISE, TRIG_HALF, TRIG_FAST };
 
-// x - q pi/2 with pi/2 in three parts, exact while q pi/2's first part is (|x| to 2^25); precise, |x| past 105615,
-// where the three parts' error starts to show, goes to Payne-Hanek in the lanes that need it. x 2/pi rounds, so
-// past 2^17 or so q can be a quadrant out and r outside [-pi/4, pi/4], where the polynomials aren't good: fast
-// takes a second, short reduction of r, which is cheaper than a more exact q
-// x rounded to the nearest integer, as FRND would, and *bits with that integer's low bits in its own: adding 1.5 *
-// 2^23 leaves no fraction while |x| is under 2^22, and taking it off again is exact. Two FADDs instead of FRND and
-// F2I, which both go through the quarter-rate conversion unit
+// for |x| under 2^22; two FADDs instead of FRND and F2I, which both use the quarter-rate conversion unit
 static struct ir_val *round_small(struct ir_val *x, struct ir_val **bits)
 {
     *bits = addf(x, fconst(12582912.0f));
     return subf(*bits, fconst(12582912.0f));
 }
 
-// small: |x 2/pi| stays under 2^22 wherever the result is used (sin and cos give 0 past it, and half never gets
-// there), so q is the low bits of round_small's
+// The three-part reduction errs past 105615, so precise goes to Payne-Hanek there. Past 2^17 q can be a quadrant out,
+// so fast reduces r again, cheaper than a more exact q. small is for |x 2/pi| under 2^22 wherever it's used.
 static struct quadrant reduce_pio2(struct ir_val *x, int mode, int small)
 {
     struct ir_val *q, *qf;
@@ -1944,13 +1873,12 @@ static struct ir_val *is_odd(struct ir_val *q)
     return icmp(IR_NE, ibin(IR_AND, q, ik(1)), ik(0));
 }
 
-// the sign bit where (q + add) mod 4 is 2 or 3
 static struct ir_val *quadrant_sign(struct ir_val *q, unsigned add)
 {
     return ibin(IR_SHL, ibin(IR_AND, add ? ibin(IR_ADD, q, ik(add)) : q, ik(2)), ik(30));
 }
 
-// sin x and cos x from Cephes' polynomials on [-pi/4, pi/4]
+// Cephes' polynomials
 static void sincos_ir(struct ir_val *x, struct ir_val **sin_out, struct ir_val **cos_out, int mode)
 {
     static const float k_sin[] = { -1.9515295891e-4f, 8.3321608736e-3f, -1.6666654611e-1f };
@@ -1986,8 +1914,7 @@ static struct ir_val *tan_ir(struct ir_val *x, int mode)
     return sel(fcmp(FCMP_OLT, absf(x), fconst(0x1p-12f)), x, t);
 }
 
-// sin(pi x) and cos(pi x): x - q/2 is exact, so there's no reduction error; past 2^24 x is an even integer. cospi
-// is never -0, as Apple's isn't (so tanpi(0.5) is +inf).
+// x - q/2 is exact, so no reduction error; cospi is never -0, as Apple's isn't, so tanpi(0.5) is +inf
 static void sincospi_ir(struct ir_val *x, struct ir_val **sin_out, struct ir_val **cos_out)
 {
     static const float k_sin[] = { -0.588681519f, 2.54985952f, -5.16771269f };
@@ -1995,7 +1922,7 @@ static void sincospi_ir(struct ir_val *x, struct ir_val **sin_out, struct ir_val
     struct ir_val *qf = op1(IR_FRND, IR_F32, addf(x, x));
     qf->aux = SASS_RND_NEAREST;
     struct ir_val *big = fcmp(FCMP_OGE, absf(x), fconst(0x1p24f));
-    struct ir_val *r = sel(big, mulf(x, fconst(0)), madf(qf, fconst(-0.5f), x));  // x * 0: NaN for inf
+    struct ir_val *r = sel(big, mulf(x, fconst(0)), madf(qf, fconst(-0.5f), x));  // x * 0 keeps inf's NaN
     struct ir_val *q = op1(IR_F2I, IR_I32, qf);
     q->aux = 1;
     q = sel(big, ik(0), q);
@@ -2008,8 +1935,7 @@ static void sincospi_ir(struct ir_val *x, struct ir_val **sin_out, struct ir_val
         *cos_out = addf(op2(IR_XOR, IR_F32, sel(is_odd(q), sr, cr), quadrant_sign(q, 1)), fconst(0));
 }
 
-// for |x| over a half (pi/2 - asin |x|) / 2, otherwise asin |x|: asin t = t + t z P(z), z = t^2, with
-// t = sqrt((1 - |x|) / 2) for the first (Cephes' asinf)
+// Cephes' asinf; for |x| over a half it gives (pi/2 - asin |x|) / 2
 static struct ir_val *asin_core(struct ir_val *ax, struct ir_val *big)
 {
     static const float k[] = { 4.2163199048e-2f, 2.4181311049e-2f, 4.5470025998e-2f, 7.4953002686e-2f,
@@ -2019,7 +1945,6 @@ static struct ir_val *asin_core(struct ir_val *ax, struct ir_val *big)
     return madf(mulf(t, z), poly(z, k, 5), t);
 }
 
-// atan z for z in [0, 1]
 static struct ir_val *atan01(struct ir_val *z)
 {
     static const float k[] = { 0.00392521592f, -0.0202347394f, 0.0492059328f, -0.080300495f,
@@ -2035,13 +1960,12 @@ static struct ir_val *atan_ir(struct ir_val *x)
     return xorsign(sel(inv, subf(fconst(PIO2_HI), subf(a, fconst(PIO2_LO))), a), x);
 }
 
-// x / pi, 1/pi in two parts
 static struct ir_val *over_pi(struct ir_val *x)
 {
     return madf(x, fconst(INV_PI_HI), mulf(x, fconst(INV_PI_LO)));
 }
 
-// asin x / pi or acos x / pi as asin and acos are built, in turns of pi so that their halves and wholes are exact
+// in turns of pi so halves and wholes are exact
 static struct ir_val *asinpi_acospi(struct ir_val *x, int acos)
 {
     struct ir_val *ax = absf(x), *big = fcmp(FCMP_OGT, ax, fconst(0.5f));
@@ -2059,11 +1983,10 @@ static struct ir_val *atanpi_ir(struct ir_val *x)
     return xorsign(sel(inv, subf(fconst(0.5f), a), a), x);
 }
 
-// pi: atan2pi, the result in turns of pi
+// pi for atan2pi
 static struct ir_val *atan2_ir(struct ir_val *y, struct ir_val *x, int pi)
 {
-    // atan of the smaller magnitude over the larger, put in its octant; with that ratio 0 for two zeros and 1 for
-    // two infinities, the moves give C's atan2(+-0, +-0) and atan2(+-inf, +-inf) as well
+    // a ratio of 0 for two zeros and 1 for two infinities gives C's atan2 for those too
     struct ir_val *ax = absf(x), *ay = absf(y);
     struct ir_val *hi = op2(IR_FMAX, IR_F32, ax, ay), *lo = op2(IR_FMIN, IR_F32, ax, ay);
     struct ir_val *s = sel(fcmp(FCMP_OGT, hi, fconst(0x1p64f)), fconst(0x1p-64f), fconst(1));  // or 1 / hi flushes
@@ -2071,7 +1994,7 @@ static struct ir_val *atan2_ir(struct ir_val *y, struct ir_val *x, int pi)
     z = sel(fcmp(FCMP_OEQ, hi, fconst(0)), fconst(0), sel(fcmp(FCMP_OEQ, lo, finf(0)), fconst(1), z));
     struct ir_val *a = atan01(z), *half, *whole;
     if (pi) {
-        a = op2(IR_FMIN, IR_F32, over_pi(a), fconst(0.25f));  // atan01(1) rounds up, a quarter exactly is wanted
+        a = op2(IR_FMIN, IR_F32, over_pi(a), fconst(0.25f));  // atan01(1) rounds up
         half = subf(fconst(0.5f), a);
     } else {
         half = subf(fconst(PIO2_HI), subf(a, fconst(PIO2_LO)));
@@ -2082,8 +2005,7 @@ static struct ir_val *atan2_ir(struct ir_val *y, struct ir_val *x, int pi)
     return sel(fcmp(FCMP_UNO, x, y), addf(x, y), xorsign(a, y));
 }
 
-// log2 x in two parts, x normal and positive: x = m 2^e with m in [sqrt(1/2), sqrt(2)), and
-// log m = u + u^3/12 + u^5/80 + ... for u = 2f / (2 + f), f = m - 1, with u's remainder (exact) as its low part
+// x normal and positive; the series in u = 2f / (2 + f) with u's exact remainder as the low part
 static void log2_split(struct ir_val *xb, struct ir_val **hi, struct ir_val **lo)
 {
     static const float k[] = { 1.0f / 53248, 1.0f / 11264, 1.0f / 2304, 1.0f / 448, 1.0f / 80, 1.0f / 12 };
@@ -2093,10 +2015,10 @@ static void log2_split(struct ir_val *xb, struct ir_val **hi, struct ir_val **lo
     struct ir_val *f = subf(ibin(IR_SUB, xb, ke), fconst(1));
     struct ir_val *r = mufu(MUFU_RCP, addf(f, fconst(2)));
     struct ir_val *u = mulf(addf(f, f), r);
-    // 2f - u (2 + f) = 2 (f - u) - u f, and f - u, about f^2 / 2, is exact
+    // 2f - u (2 + f) = 2 (f - u) - u f, where f - u is exact
     struct ir_val *ul = mulf(madf(negf(u), f, mulf(subf(f, u), fconst(2))), r);
     struct ir_val *u2 = mulf(u, u);
-    // the series is in u + ul: its terms past u, taken in u, put right by their slope u^2/4 times ul
+    // terms past u are taken in u and corrected by their slope u^2/4 times ul
     struct ir_val *tail = madf(mulf(u, u2), poly(u2, k, 6), madf(ul, mulf(u2, fconst(0.25f)), ul));
     struct ir_val *p = mulf(u, fconst(LOG2E_HI));
     struct ir_val *pl = madf(u, fconst(LOG2E_LO), madf(tail, fconst(LOG2E_HI), madf(u, fconst(LOG2E_HI), negf(p))));
@@ -2104,9 +2026,7 @@ static void log2_split(struct ir_val *xb, struct ir_val **hi, struct ir_val **lo
     *lo = addf(addf(subf(e, *hi), p), pl);
 }
 
-// pow (C's special cases) or powr (x < 0 is NaN, as are 0^0, inf^0 and 1^inf, which exp2(y log2 x) gives anyway).
-// precise carries log2 x and y log2 x in two parts; half maths, with its 2^-11 ulp, does without (and gets the
-// special cases all the same). 0, inf, NaN, x < 0 and denormals (MUFU flushes them) take MUFU.LG2's log2.
+// powr's special cases fall out of exp2(y log2 x); precise carries the logs in two parts, which half's ulp doesn't need
 static struct ir_val *pow_ir(struct ir_val *x, struct ir_val *y, int powr, int precise)
 {
     struct ir_val *xb = powr ? x : fbits(IR_AND, x, 0x7fffffff);
@@ -2133,7 +2053,7 @@ static struct ir_val *pow_ir(struct ir_val *x, struct ir_val *y, int powr, int p
     r = op2(IR_XOR, IR_F32, r, sel(odd, fbits(IR_AND, x, 0x80000000u), ik(0)));
     struct ir_val *neg = op2(IR_PAND, IR_PRED, fcmp(FCMP_OLT, x, fconst(0)), fcmp(FCMP_OGT, x, finf(1)));
     r = sel(op2(IR_PAND, IR_PRED, neg, op1(IR_PNOT, IR_PRED, is_int)), konst(IR_F32, FLT_NAN), r);
-    if (!precise)  // Apple's gives x itself for a y of 1, where exp2(log2) would be a few ulps out
+    if (!precise)  // Apple's gives x for y 1, where exp2(log2) is a few ulps out
         r = sel(fcmp(FCMP_OEQ, y, fconst(1)), x, r);
     struct ir_val *one = op2(IR_POR, IR_PRED, fcmp(FCMP_OLT, ay, fconst(0x1p-126f)), fcmp(FCMP_OEQ, x, fconst(1)));
     one = op2(IR_POR, IR_PRED, one,
@@ -2141,8 +2061,7 @@ static struct ir_val *pow_ir(struct ir_val *x, struct ir_val *y, int powr, int p
     return sel(one, fconst(1), r);
 }
 
-// pown x^n or rootn x^(1/n): log2_split's log2 |x| times n (over n) in two parts, and the sign of x for an odd n;
-// as in pow_ir, 0, inf, NaN and denormals take MUFU.LG2's log2, which gives their special cases
+// as in pow_ir, 0, inf, NaN and denormals take MUFU.LG2, which gives their special cases
 static struct ir_val *pown_ir(struct ir_val *x, struct ir_val *n, int root)
 {
     struct ir_val *xb = fbits(IR_AND, x, 0x7fffffff), *hi, *lo;
@@ -2155,7 +2074,7 @@ static struct ir_val *pown_ir(struct ir_val *x, struct ir_val *n, int root)
     if (root) {  // the quotient's remainder is exact; past 2^24 n's rounding doesn't matter
         th = divf(hi, nf);
         tl = mulf(addf(madf(negf(th), nf, hi), lo), mufu(MUFU_RCP, nf));
-    } else {  // n's rounding past 2^24, exact as an int, times log2 |x| into the low part (out by one at 2^31)
+    } else {  // n's rounding past 2^24 goes into the low part, out by one at 2^31
         struct ir_val *ni = op1(IR_F2I, IR_I32, nf);
         ni->aux = 1;
         struct ir_val *nl = op1(IR_I2F, IR_F32, ibin(IR_SUB, n, ni));
@@ -2172,9 +2091,7 @@ static struct ir_val *pown_ir(struct ir_val *x, struct ir_val *n, int root)
     return sel(op2(IR_POR, IR_PRED, zero, even_neg), konst(IR_F32, FLT_NAN), r);
 }
 
-// r - q d for q = trunc(r / d), r / d below 2^23: exact, with q put right where the quotient rounded across an
-// integer. A tiny d has both scaled up by 2^64, or a q one too big's remainder would flush, and a huge one
-// divides scaled down, or 1 / d would.
+// exact for r / d below 2^23; a tiny or huge d is scaled so the remainder or 1 / d doesn't flush
 static struct ir_val *rem_step(struct ir_val *r, struct ir_val *d)
 {
     struct ir_val *small = fcmp(FCMP_OLT, d, fconst(0x1p-100f));
@@ -2189,8 +2106,7 @@ static struct ir_val *rem_step(struct ir_val *r, struct ir_val *d)
     return mulf(v, sel(small, fconst(0x1p-64f), fconst(1)));
 }
 
-// fmod exactly, as precise maths wants it: while |x| is past 2^22 |y|, |x| mod |y| 2^k takes q's top bits (in a
-// loop: there can be 11 such steps), then |y| itself
+// loops on |y| 2^k while |x| is past 2^22 |y|, up to 11 steps
 static struct ir_val *fmod_precise(struct ir_val *x, struct ir_val *y)
 {
     struct ir_val *ax = absf(x), *ay = absf(y);
@@ -2200,13 +2116,12 @@ static struct ir_val *fmod_precise(struct ir_val *x, struct ir_val *y)
     ir_edge(from, head);
     g_cur = head;
     struct ir_val *r = ir_add(head, IR_PHI, IR_F32, 2);
-    // the way out first: block order then puts the body ahead of it, so the loop gets a convergence region
+    // exit edge first so block order puts the body ahead of it and the loop gets a convergence region
     struct ir_val *far = op2(IR_PAND, IR_PRED, ok, fcmp(FCMP_OGT, r, mulf(ay, fconst(0x1p22f))));
     ir_add(head, IR_CBR, IR_VOID, 1)->src[0] = op1(IR_PNOT, IR_PRED, far);
     ir_edge(head, done);
     ir_edge(head, body);
     g_cur = body;
-    // |y| 2^k, k the exponent difference less 22, by adding to its exponent field
     struct ir_val *k = ibin(IR_SUB, ibin(IR_AND, r, ik(0x7f800000)), ibin(IR_AND, ay, ik(0x7f800000)));
     struct ir_val *step = rem_step(r, ibin(IR_ADD, ay, ibin(IR_SUB, k, ik(22 << 23))));
     ir_add(g_cur, IR_BR, IR_VOID, 0);
@@ -2218,7 +2133,7 @@ static struct ir_val *fmod_precise(struct ir_val *x, struct ir_val *y)
     return sel(ok, v, konst(IR_F32, FLT_NAN));  // y 0 or NaN, x inf or NaN
 }
 
-// ldexp in two steps, so that x 2^n can be normal when 2^n isn't
+// two steps, so x 2^n can be normal when 2^n isn't
 static struct ir_val *ldexp_ir(struct ir_val *x, struct ir_val *n)
 {
     n = iminmax(IR_MAX, iminmax(IR_MIN, n, ik(300), 1), ik((uint32_t)-300), 1);
@@ -2231,12 +2146,12 @@ static struct ir_val *ldexp_ir(struct ir_val *x, struct ir_val *n)
     return x;
 }
 
-// the next float (or half) after x towards y, on the bits: Apple's steps through denormals
+// on the bits, as Apple's steps through denormals
 static struct ir_val *nextafter_ir(struct ir_val *x, struct ir_val *y, enum ir_type t)
 {
     uint32_t sign = t == IR_F16 ? 0x8000 : 0x80000000u, inf = t == IR_F16 ? 0x7c00 : 0x7f800000;
     struct ir_val *v[2] = { x, y }, *o[2], *nan = NULL;
-    for (unsigned i = 0; i < 2; i++) {  // to integers in the floats' order, both zeros 0
+    for (unsigned i = 0; i < 2; i++) {  // integers in the floats' order, both zeros 0
         struct ir_val *mag = ibin(IR_AND, v[i], ik(sign - 1));
         o[i] = sel(icmp(IR_NE, ibin(IR_AND, v[i], ik(sign)), ik(0)), ibin(IR_SUB, ik(0), mag), mag);
         struct ir_val *is_nan = icmp(IR_GT, mag, ik(inf));
@@ -2250,8 +2165,7 @@ static struct ir_val *nextafter_ir(struct ir_val *x, struct ir_val *y, enum ir_t
     return op2(IR_OR, t, s, konst(t, 0));
 }
 
-// e^x - 1 = 2^k (e^r - 1) + 2^k - 1, x = k ln 2 + r, |r| <= ln 2 / 2, e^r - 1 = r + r^2/2 + r^3 P(r); taken as
-// 2 (2^(k-1) (e^r - 1) + 2^(k-1) - 1/2) so that 2^(k-1) is finite and the sum exact up to k = 128
+// 2 (2^(k-1) (e^r - 1) + 2^(k-1) - 1/2) keeps 2^(k-1) finite and the sum exact up to k = 128
 static struct ir_val *expm1_ir(struct ir_val *x)
 {
     static const float k[] = { 0.00019823933f, 0.0013933758f, 0.00833342131f, 0.0416664779f, 0.166666657f };
@@ -2268,8 +2182,7 @@ static struct ir_val *expm1_ir(struct ir_val *x)
     return sel(fcmp(FCMP_OLT, absf(x), fconst(0x1p-25f)), x, v);  // keeps -0
 }
 
-// log(1 + x): log2_split's log of u = 1 + x in two parts times ln 2 in two parts, u's rounding put back as
-// (x - (u - 1)) / u. u isn't normal for x -1 (-inf) or below it (NaN), inf or NaN, where MUFU.LG2 is right.
+// u = 1 + x's rounding is put back as (x - (u - 1)) / u; MUFU.LG2 is right where u isn't normal
 static struct ir_val *log1p_ir(struct ir_val *x)
 {
     struct ir_val *u = addf(x, fconst(1)), *hi, *lo;
@@ -2283,8 +2196,7 @@ static struct ir_val *log1p_ir(struct ir_val *x)
     return sel(fcmp(FCMP_OLT, absf(x), fconst(0x1p-25f)), x, v);  // keeps -0
 }
 
-// erfc |x| = e^(-x^2) (1 + p(q)) / (1 + 2|x|), q = (|x| - 2) / (|x| + 2), to 10.05 (past it, below the least
-// denormal); x^2's rounding comes back as a factor 1 + its error
+// e^(-x^2) (1 + p(q)) / (1 + 2|x|), q = (|x| - 2) / (|x| + 2); past 10.05 it's below the least denormal
 static struct ir_val *erfc_abs(struct ir_val *a)
 {
     static const float k[] = { 2.59099579e-05f, -0.000365826301f, -0.00125354168f, 0.00127438351f, 0.00863884017f,
@@ -2298,7 +2210,7 @@ static struct ir_val *erfc_abs(struct ir_val *a)
     return sel(fcmp(FCMP_OGT, a, fconst(10.0546875f)), fconst(0), v);
 }
 
-// erf: x P(x^2) below 1, 1 - erfc |x| from there, where erfc is under a sixth
+// 1 - erfc |x| from 1, where erfc is under a sixth
 static struct ir_val *erf_ir(struct ir_val *x)
 {
     static const float k[] = { 7.85386146e-05f, -0.000801019371f, 0.00518832775f, -0.0268538129f,
@@ -2308,9 +2220,7 @@ static struct ir_val *erf_ir(struct ir_val *x)
     return sel(fcmp(FCMP_OLT, ax, fconst(1)), mulf(x, poly(mulf(x, x), k, 7)), big);
 }
 
-// tgamma: |x| = m + t, t in [0, 1): Gamma(1 + t) (t + 1)...(t + m - 1) from 1, Gamma(1 + t) / x below it, and for
-// x < 0 pi / (sin(pi x) Gamma(1 + |x|)), with Gamma(1 + |x|) = Gamma(1 + t) (t + 1)...(t + m). The product (each
-// t + k exact) runs in a loop in two parts, from 2^-64 past 30 so that it doesn't overflow before the result does.
+// The product (t + 1)...(t + m) runs in two parts from 2^-64 past 30, so it doesn't overflow before the result.
 static struct ir_val *tgamma_ir(struct ir_val *x)
 {
     static const float k[] = { 0.0168256592f, -0.107834607f, 0.320049524f, -0.598353565f, 0.824188471f, -0.93257612f,
@@ -2353,9 +2263,7 @@ static struct ir_val *tgamma_ir(struct ir_val *x)
     return sel(fcmp(FCMP_OEQ, x, finf(0)), x, r);
 }
 
-// lgamma: lgamma(1 + t) = t (t - 1) R(t), t in [0, 1) the fraction of |x|, so that the zeros at 1 and 2 keep their
-// relative accuracy; less log |x| below 1, plus log((t + 1)...(t + m - 1)) up to 8, Stirling's series from there;
-// for x < 0, log(pi / |sin(pi x)|) - log |x| - lgamma |x|
+// t (t - 1) R(t) keeps the zeros at 1 and 2 accurate; Stirling's series from 8
 static struct ir_val *lgamma_ir(struct ir_val *x)
 {
     static const float k[] = { -0.0015264434f, 0.00931734778f, -0.0266472865f, 0.0493969135f, -0.0709296688f,
@@ -2386,7 +2294,7 @@ static struct ir_val *lgamma_ir(struct ir_val *x)
     return sel(pole, finf(0), l);
 }
 
-// remainder exactly: fmod by 2|y|, then |y| off once or twice to the nearest multiple, a tie to the even one
+// fmod by 2|y| keeps it exact; a tie goes to the even multiple
 static struct ir_val *remainder_ir(struct ir_val *x, struct ir_val *y)
 {
     struct ir_val *ay = absf(y), *r = absf(fmod_precise(x, addf(ay, ay)));
@@ -2396,8 +2304,7 @@ static struct ir_val *remainder_ir(struct ir_val *x, struct ir_val *y)
     return xorsign(sel(over, subf(r, ay), r), x);
 }
 
-// cbrt from MUFU's 2^(log2 |x| / 3) and a Newton step on the exact x - y^3 (y^2 in two parts), a tiny x scaled
-// by 2^75 so that the step doesn't flush
+// a Newton step on the exact x - y^3; a tiny x is scaled by 2^75 so the step doesn't flush
 static struct ir_val *cbrt_ir(struct ir_val *x)
 {
     struct ir_val *ax = absf(x), *tiny = fcmp(FCMP_OLT, ax, fconst(0x1p-100f));
@@ -2410,7 +2317,7 @@ static struct ir_val *cbrt_ir(struct ir_val *x)
     return xorsign(r, x);
 }
 
-// hypot: the larger magnitude times sqrt(1 + r^2), r the smaller over it; inf even with a NaN
+// inf even with a NaN
 static struct ir_val *hypot_ir(struct ir_val *x, struct ir_val *y)
 {
     struct ir_val *ax = absf(x), *ay = absf(y);
@@ -2423,7 +2330,6 @@ static struct ir_val *hypot_ir(struct ir_val *x, struct ir_val *y)
     return sel(fcmp(FCMP_OEQ, hi, finf(0)), finf(0), h);
 }
 
-// logb from the exponent field, or for a denormal its top bit's place
 static struct ir_val *logb_ir(struct ir_val *x)
 {
     struct ir_val *bits = fbits(IR_AND, x, 0x7fffffff);
@@ -2435,8 +2341,7 @@ static struct ir_val *logb_ir(struct ir_val *x)
     return sel(icmp(IR_GE, bits, ik(0x7f800000)), mulf(x, x), r);
 }
 
-// sinh, cosh, tanh: Cephes' polynomials for a small |x|, x itself for a tiny one, and e^|x| / 2 so that sinh and
-// cosh reach 89.4
+// e^|x| / 2 so sinh and cosh reach 89.4
 static struct ir_val *hyperbolic(const char *name, struct ir_val *x)
 {
     static const float k_sinh[] = { 2.03721912945e-4f, 8.33028376239e-3f, 1.66667160211e-1f };
@@ -2458,7 +2363,6 @@ static struct ir_val *hyperbolic(const char *name, struct ir_val *x)
     return sel(fcmp(FCMP_OLT, ax, fconst(0x1p-12f)), x, r);
 }
 
-// asinh, acosh, atanh: Cephes' polynomials for a small |x|, log(2|x|) for a big one
 static struct ir_val *inverse_hyperbolic(const char *name, struct ir_val *x)
 {
     static const float k_asinh[] = { 2.0122003309e-2f, -4.2699340972e-2f, 7.4847586088e-2f, -1.6666288134e-1f };
@@ -2487,14 +2391,13 @@ static struct ir_val *inverse_hyperbolic(const char *name, struct ir_val *x)
     return sel(fcmp(FCMP_OLT, ax, fconst(0x1p-12f)), x, r);
 }
 
-// MUFU.SIN's error is absolute, tens of ulps next to Apple's answers (which are as exact as the precise ones, to
-// where its fast sin and cos give 0, as they do for inf and NaN), so these reduce and take polynomials
+// MUFU.SIN's absolute error is tens of ulps next to Apple's, which are as exact as precise up to where they give 0
 static void cheap_sincos(struct ir_val *x, int fast, struct ir_val **sin_out, struct ir_val **cos_out)
 {
     sincos_ir(x, sin_out, cos_out, fast ? TRIG_FAST : TRIG_HALF);
 }
 
-// atan with a short polynomial on [0, 1] (a few ulps)
+// a few ulps
 static struct ir_val *cheap_atan(struct ir_val *x)
 {
     static const float k[] = { -0.0134809297f, 0.0574785769f, -0.121240333f, 0.195636481f, -0.332994699f,
@@ -2505,11 +2408,10 @@ static struct ir_val *cheap_atan(struct ir_val *x)
     return xorsign(sel(inv, subf(fconst(PIO2_HI), a), a), x);
 }
 
-// fast:: (the default, so nearly every shader) and half maths, whose ulp is 2^-11: MUFU and short polynomials,
-// a few instructions each, ulps out next to Apple's, keeping the edges a compare and select buy; NULL for the rest
+// fast:: (nearly every shader) and half maths; NULL where Apple's fast form is as exact as precise
 static struct ir_val *cheap_math(const char *name, struct ir_val *a, struct ir_val *b, int fast)
 {
-    // acos x = sqrt(1 - x) P(x) on [0, 1] (1e-6 out), P(0) pi/2 so that asin 0 is 0
+    // acos x = sqrt(1 - x) P(x), P(0) pi/2 so asin 0 is 0
     static const float k_acos[] = { -0.00506330794f, 0.0209922828f, -0.0462528504f, 0.0882927552f, -0.214560702f,
                                     PIO2_HI };
     struct ir_val *s, *c;
@@ -2534,7 +2436,7 @@ static struct ir_val *cheap_math(const char *name, struct ir_val *a, struct ir_v
     if (is_fn(name, "atan2")) {
         if (!fast)
             return NULL;
-        // atan(y / x), turned by pi into the left half-plane, as Apple's: fast atan2(0, 0) is NaN
+        // as Apple's, fast atan2(0, 0) is NaN
         struct ir_val *t = atan_ir(mulf(a, mufu(MUFU_RCP, b)));
         struct ir_val *turn = sel(fcmp(FCMP_OGE, a, fconst(0)), fconst(PI_HI), fconst(-PI_HI));
         return sel(fcmp(FCMP_OLT, b, fconst(0)), addf(t, turn), t);
@@ -2543,7 +2445,7 @@ static struct ir_val *cheap_math(const char *name, struct ir_val *a, struct ir_v
         return mufu(MUFU_EX2, mulf(a, fconst(LOG2E_HI)));
     if (is_fn(name, "exp10"))
         return mufu(MUFU_EX2, mulf(a, fconst(3.32192802f)));
-    // MUFU.LG2's error is absolute (tens of thousands of ulps just below 1), Apple's fast logs are the precise ones
+    // MUFU.LG2 is tens of thousands of ulps out just below 1, and Apple's fast logs are the precise ones
     if (is_fn(name, "log2"))
         return fast ? NULL : mufu(MUFU_LG2, a);
     if (is_fn(name, "log"))
@@ -2556,9 +2458,9 @@ static struct ir_val *cheap_math(const char *name, struct ir_val *a, struct ir_v
         int powr = is_fn(name, "powr");
         return pow_ir(a, b, powr, 0);  // fast has C's special cases as well
     }
-    if (is_fn(name, "sinh") || is_fn(name, "cosh")) {  // (e^x -+ e^-x) / 2: inf from e^-x past -87, Apple's isn't
+    if (is_fn(name, "sinh") || is_fn(name, "cosh")) {
         int cosh = is_fn(name, "cosh");
-        if (fast) {  // of e^|x| and its reciprocal, so that the sign is only put back: sinh(-88.5) is finite
+        if (fast) {  // from e^|x|, as Apple's sinh(-88.5) is finite
             struct ir_val *e = mufu(MUFU_EX2, mulf(absf(a), fconst(LOG2E_HI))), *r = mufu(MUFU_RCP, e);
             r = mulf(cosh ? addf(e, r) : subf(e, r), fconst(0.5f));
             return cosh ? r : xorsign(r, a);
@@ -2566,7 +2468,7 @@ static struct ir_val *cheap_math(const char *name, struct ir_val *a, struct ir_v
         struct ir_val *e = mufu(MUFU_EX2, mulf(a, fconst(LOG2E_HI)));
         return madf(mufu(MUFU_RCP, e), fconst(cosh ? 0.5f : -0.5f), mulf(e, fconst(0.5f)));
     }
-    if (is_fn(name, "tanh")) {  // fast: (e^2x - 1) / (e^2x + 1), inf / inf = NaN for a big x as Apple's; half +-1
+    if (is_fn(name, "tanh")) {  // fast is NaN for a big x, as Apple's
         struct ir_val *e = mufu(MUFU_EX2, mulf(a, fconst(2 * LOG2E_HI)));
         struct ir_val *r = mufu(MUFU_RCP, addf(e, fconst(1)));
         return fast ? mulf(subf(e, fconst(1)), r) : madf(r, fconst(-2), fconst(1));
@@ -2574,23 +2476,21 @@ static struct ir_val *cheap_math(const char *name, struct ir_val *a, struct ir_v
     if (is_fn(name, "asinh") || is_fn(name, "acosh")) {
         int acosh = is_fn(name, "acosh");
         s = madf(a, a, fconst(acosh ? -1 : 1));
-        if (!fast) {  // log(|x| + sqrt(x^2 +- 1)), asinh's signed as x
+        if (!fast) {
             struct ir_val *v = acosh ? a : absf(a);
             struct ir_val *r = mulf(mufu(MUFU_LG2, addf(v, mufu(MUFU_SQRT, s))), fconst(LN2));
-            if (acosh)  // x + sqrt(x^2 - 1) cancels to 0 for a big negative x, where Apple's has NaN
+            if (acosh)  // cancels to 0 for a big negative x, where Apple's has NaN
                 return sel(fcmp(FCMP_OLT, a, fconst(1)), konst(IR_F32, FLT_NAN), r);
             return xorsign(r, a);
         }
-        // as Apple's: x^2 +- 1 times its rsqrt fused into the sum (wrong for a big negative x there too), the
-        // rsqrt's argument held below inf so that an infinite square gives inf
+        // as Apple's, rsqrt fused into the sum; its argument stays below inf so an infinite square gives inf
         struct ir_val *v = madf(s, mufu(MUFU_RSQ, op2(IR_FMIN, IR_F32, s, fconst(0x1.fffffep127f))), a);
         if (acosh)
             v = sel(fcmp(FCMP_OEQ, s, fconst(0)), a, v);
         return mulf(mufu(MUFU_LG2, v), fconst(LN2));
     }
     if (is_fn(name, "atanh")) {
-        // fast: log((1 + x) / (1 - x)) / 2 as Apple's, whose quotient is (1 + x) times the exactly rounded
-        // reciprocal; for a small x that rounding is most of the result, so the log has to be exact near 1
+        // Apple's fast quotient uses the exactly rounded reciprocal, whose rounding dominates a small x's result
         if (fast)
             return log_ir(mulf(addf(fconst(1), a), rcp_exact(subf(fconst(1), a))), 0.5f, 0.5f * LN2);
         struct ir_val *q = mulf(addf(fconst(1), a), mufu(MUFU_RCP, subf(fconst(1), a)));
@@ -2599,17 +2499,16 @@ static struct ir_val *cheap_math(const char *name, struct ir_val *a, struct ir_v
     return NULL;
 }
 
-// OpenCL's half_ maths, to 8192 ulps: MUFU and the cheap forms, but MUFU.LG2's error is absolute, so the logs
-// (and powr's log2) near 1 take log_ir; NULL for the rest
+// OpenCL's half_ maths, to 8192 ulps; logs take log_ir as MUFU.LG2's error is absolute near 1
 static struct ir_val *half_math(const char *name, struct ir_val *a, struct ir_val *b)
 {
     struct ir_val *r = NULL;
     if (is_fn(name, "half_sin") || is_fn(name, "half_cos")) {
-        // past 2^16 any result in [-1, 1] does, which the fast reduction keeps to, but inf and NaN want NaN
+        // past 2^16 any result in [-1, 1] passes, but inf and NaN want NaN
         int sin = is_fn(name, "half_sin");
         sincos_ir(a, sin ? &r : NULL, sin ? NULL : &r, TRIG_FAST);
         r = sel(fcmp(FCMP_OLT, absf(a), finf(0)), r, konst(IR_F32, FLT_NAN));
-    } else if (is_fn(name, "half_tan"))  // and any number for tan, where the fast one has NaN
+    } else if (is_fn(name, "half_tan"))  // any number passes, where the fast one has NaN
         r = tan_ir(a, TRIG_HALF);
     else if (is_fn(name, "half_exp"))
         r = mufu(MUFU_EX2, mulf(a, fconst(LOG2E_HI)));
@@ -2623,7 +2522,7 @@ static struct ir_val *half_math(const char *name, struct ir_val *a, struct ir_va
         r = log_ir(a, LOG2E_HI, 1);
     else if (is_fn(name, "half_log10"))
         r = log_ir(a, 0.434294492f, 0.30103001f);
-    else if (is_fn(name, "half_powr"))  // powr's special cases as pow_ir's half form has them
+    else if (is_fn(name, "half_powr"))
         r = mufu(MUFU_EX2, mulf(b, log_ir(a, LOG2E_HI, 1)));
     else if (is_fn(name, "half_rsqrt"))
         r = mufu(MUFU_RSQ, a);
@@ -2632,7 +2531,6 @@ static struct ir_val *half_math(const char *name, struct ir_val *a, struct ir_va
     return r;
 }
 
-// One lane of a math intrinsic on float/half lanes; NULL when name isn't one.
 static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, enum ir_type t)
 {
     if (is_fn(name, "nextafter"))
@@ -2651,8 +2549,7 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
     else if (is_fn(name, "fmin3"))
         r = op2(IR_FMIN, IR_F32, op2(IR_FMIN, IR_F32, a, b), c);
     else if (is_fn(name, "fmedian3")) {
-        // min(max(a, b), max(min(a, b), c)) as Apple's: half leaves every NaN out; float too for a NaN a or b, but
-        // one that reaches the outer compares (a NaN c, or both a and b) is read as a select takes it
+        // NaN handling as Apple's: half drops every NaN, float only a NaN a or b that doesn't reach the selects
         struct ir_val *lo = op2(IR_FMIN, IR_F32, a, b), *hi = op2(IR_FMAX, IR_F32, a, b);
         if (t == IR_F16) {
             r = op2(IR_FMIN, IR_F32, hi, op2(IR_FMAX, IR_F32, lo, c));
@@ -2723,11 +2620,11 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
         r = pow_ir(a, b, is_fn(name, "powr"), 1);
     else if (is_fn(name, "pown") || is_fn(name, "rootn"))  // n an i32, which widen leaves
         r = pown_ir(a, b, is_fn(name, "rootn"));
-    else if (is_fn(name, "mix") && g_info->denorms)  // OpenCL's (the kernels keeping denormals): a + (b - a) t
+    else if (is_fn(name, "mix") && g_info->denorms)  // OpenCL's, the kernels keeping denormals
         r = madf(subf(b, a), c, a);
-    else if (is_fn(name, "mix"))  // t b + (a - t a), as Apple's: mix(0, 1, inf) is NaN, mix(x, x, t) not always x
+    else if (is_fn(name, "mix"))  // as Apple's, mix(0, 1, inf) is NaN and mix(x, x, t) not always x
         r = madf(c, b, madf(negf(c), a, a));
-    else if (is_fn(name, "step"))  // x >= edge ? 1 : 0, so 0 with a NaN as Apple's
+    else if (is_fn(name, "step"))  // 0 with a NaN, as Apple's
         r = sel(fcmp(FCMP_OGE, b, a), fconst(1), fconst(0));
     else if (is_fn(name, "sign"))
         r = sel(fcmp(FCMP_OGT, a, fconst(0)), fconst(1), sel(fcmp(FCMP_OLT, a, fconst(0)), fconst(-1), fconst(0)));
@@ -2738,23 +2635,22 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
                  : is_fn(name, "trunc") ? SASS_RND_TRUNC
                                         : SASS_RND_NEAREST;
     } else if (is_fn(name, "round")) {
-        // halves away from zero: trunc(|x| + 0.49999997) with x's sign, exact everywhere, unlike trunc(x + 0.5),
-        // which rounds 0.49999997 + 0.5 up to 1; at 0.5 itself the sum's tie goes to 1
+        // not trunc(x + 0.5), which rounds 0.49999997 + 0.5 up to 1
         struct ir_val *t = op1(IR_FRND, IR_F32, addf(absf(a), fconst(0.49999997f)));
         t->aux = SASS_RND_TRUNC;
         r = op2(IR_OR, IR_F32, op2(IR_AND, IR_F32, a, konst(IR_F32, 0x80000000u)), t);
     } else if (is_fn(name, "dfdx") || is_fn(name, "dfdy")) {
         r = op1(IR_DERIV, IR_F32, a);
         r->aux = is_fn(name, "dfdy");
-    } else if (is_fn(name, "fwidth")) {  // |d/dx| + |d/dy|
+    } else if (is_fn(name, "fwidth")) {
         struct ir_val *dx = op1(IR_DERIV, IR_F32, a), *dy = op1(IR_DERIV, IR_F32, a);
         dy->aux = 1;
         r = op2(IR_FADD, IR_F32, op1(IR_FABS, IR_F32, dx), op1(IR_FABS, IR_F32, dy));
-    } else if (is_fn(name, "fract")) {  // x - floor(x); precise: below 1 (for tiny negative x) and 0 for inf
+    } else if (is_fn(name, "fract")) {  // precise stays below 1 for a tiny negative x and gives 0 for inf
         struct ir_val *fl = op1(IR_FRND, IR_F32, a);
         fl->aux = SASS_RND_FLOOR;
         r = op2(IR_FSUB, IR_F32, a, fl);
-        if (t == IR_F16)  // Apple's half fract is min(x - floor(x), 0x1.ffcp-1): even NaN and inf give that
+        if (t == IR_F16)  // Apple's half fract clamps even NaN and inf to 0x1.ffcp-1
             r = op2(IR_FMIN, IR_F32, r, fconst(0x1.ffcp-1f));
         else if (precise) {
             r = sel(fcmp(FCMP_OGE, r, fconst(1)), fconst(0x1.fffffep-1f), r);
@@ -2772,7 +2668,7 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
         r = op3(IR_FFMA, IR_F32, a, b, c);
     else if (is_fn(name, "fmod") && precise)
         r = fmod_precise(a, b);
-    else if (is_fn(name, "fmod")) {  // x - y * trunc(x / y), as Apple's fast fmod (garbage for a big x / y)
+    else if (is_fn(name, "fmod")) {  // as Apple's fast fmod, garbage for a big x / y
         struct ir_val *q = op1(IR_FRND, IR_F32, op2(IR_FMUL, IR_F32, a, mufu(MUFU_RCP, b)));
         q->aux = SASS_RND_TRUNC;
         r = op3(IR_FFMA, IR_F32, op1(IR_FNEG, IR_F32, q), b, a);
@@ -2822,9 +2718,7 @@ static struct ir_val *math(const char *name, LLVMValueRef call, unsigned lane, e
     return narrow(r, t);
 }
 
-// one lane of an integer intrinsic; NULL when name isn't one
-// a narrower integer's register as a whole 32-bit value: its bits above the type's are junk (a truncation keeps the
-// low bits as they were), so they're cleared, or for a signed one copies of its sign
+// a narrower integer's upper register bits are junk, as truncation leaves them
 static struct ir_val *int_extend(struct ir_val *v, unsigned bits, int is_signed)
 {
     if (bits >= 32 || v->type != IR_I32)
@@ -2849,9 +2743,7 @@ static struct ir_val *iminmax(enum ir_op op, struct ir_val *a, struct ir_val *b,
     return v;
 }
 
-// A saturating sum or product r: of lanes narrower than 32 bits (exact in 32), clamped to the type's range (an
-// unsigned one's from above only); of 32-bit ones, the limit where overflow says it didn't fit, signed on the side
-// of sign's sign, unsigned sign itself.
+// Narrower lanes are exact in 32 bits and just clamp; 32-bit ones pick the limit by sign where overflow is set.
 static struct ir_val *saturate_int(struct ir_val *r, struct ir_val *overflow, struct ir_val *sign, unsigned bits,
                                    int is_signed)
 {
@@ -2866,8 +2758,7 @@ static struct ir_val *saturate_int(struct ir_val *r, struct ir_val *overflow, st
     return sel(overflow, limit, r);
 }
 
-// The rest of the integer intrinsics, on a and b as imath extends them; NULL when name isn't one. Lanes of more
-// than 32 bits keep their low word, so only the counts of their bits, which take the high one as 0, are made.
+// Lanes over 32 bits keep only their low word, so only bit counts, taking the high word as 0, are made for them.
 static struct ir_val *ibits(const char *name, LLVMValueRef call, unsigned lane, struct ir_val *a, struct ir_val *b,
                             unsigned bits, int is_signed)
 {
@@ -2894,12 +2785,12 @@ static struct ir_val *ibits(const char *name, LLVMValueRef call, unsigned lane, 
         }
         return r;
     }
-    if (is_fn(name, "rotate")) {  // a << s | a >> (bits - s), where s = 0 shifts by 0 both ways
+    if (is_fn(name, "rotate")) {  // masked so s = 0 shifts by 0 both ways
         struct ir_val *s = op2(IR_AND, IR_I32, b, konst(IR_I32, bits - 1));
         struct ir_val *back = op2(IR_AND, IR_I32, op2(IR_SUB, IR_I32, konst(IR_I32, bits), s), konst(IR_I32, bits - 1));
         return op2(IR_OR, IR_I32, op2(IR_SHL, IR_I32, a, s), op2(IR_SHR, IR_I32, a, back));
     }
-    if (is_fn(name, "fshl") || is_fn(name, "fshr")) {  // the shift into the other operand split in two: never by 32
+    if (is_fn(name, "fshl") || is_fn(name, "fshr")) {  // split in two so it never shifts by 32
         struct ir_val *s = op2(IR_AND, IR_I32, c, konst(IR_I32, bits - 1));
         struct ir_val *rest = op2(IR_SUB, IR_I32, konst(IR_I32, bits - 1), s);
         if (is_fn(name, "fshl"))
@@ -2912,7 +2803,7 @@ static struct ir_val *ibits(const char *name, LLVMValueRef call, unsigned lane, 
         int ins = name[4] == 'i';
         struct ir_val *off = get(LLVMGetOperand(call, 1 + ins), lane), *n = get(LLVMGetOperand(call, 2 + ins), lane);
         struct ir_val *none = icmp(IR_EQ, n, konst(IR_I32, 0));
-        if (!ins) {  // the field to the top, then down
+        if (!ins) {
             struct ir_val *up = op2(IR_SHL, IR_I32, get(LLVMGetOperand(call, 0), lane),
                                     op2(IR_SUB, IR_I32, op2(IR_SUB, IR_I32, konst(IR_I32, 32), off), n));
             return sel(none, konst(IR_I32, 0), op2(shr, IR_I32, up, op2(IR_SUB, IR_I32, konst(IR_I32, 32), n)));
@@ -2933,7 +2824,7 @@ static struct ir_val *ibits(const char *name, LLVMValueRef call, unsigned lane, 
         return iminmax(IR_MAX, iminmax(IR_MIN, a, b, is_signed),
                        iminmax(IR_MIN, iminmax(IR_MAX, a, b, is_signed), c, is_signed), is_signed);
     if (!strncmp(name, "air.hadd.", 9) || !strncmp(name, "air.rhadd.", 10)) {
-        // (a + b) >> 1 without the carry out: a & b + (a ^ b) >> 1; rounded up, a | b - (a ^ b) >> 1
+        // without the carry out of a + b
         struct ir_val *half = op2(shr, IR_I32, op2(IR_XOR, IR_I32, a, b), konst(IR_I32, 1));
         if (name[4] == 'h')
             return op2(IR_ADD, IR_I32, op2(IR_AND, IR_I32, a, b), half);
@@ -2957,7 +2848,7 @@ static struct ir_val *ibits(const char *name, LLVMValueRef call, unsigned lane, 
     int add = !strncmp(name, "air.add_sat.", 12) || is_fn(name, "sadd.sat") || is_fn(name, "uadd.sat");
     if (add || !strncmp(name, "air.sub_sat.", 12) || is_fn(name, "ssub.sat") || is_fn(name, "usub.sat")) {
         struct ir_val *r = op2(add ? IR_ADD : IR_SUB, IR_I32, a, b), *overflow;
-        if (is_signed)  // the result's sign wrong: a and b alike (a sum) or unlike (a difference) and r not as a
+        if (is_signed)  // the result's sign is wrong
             overflow = op2(IR_AND, IR_I32, op2(IR_XOR, IR_I32, a, add ? r : b), op2(IR_XOR, IR_I32, add ? b : a, r));
         overflow = is_signed ? icmp(IR_LT | IR_SIGNED, overflow, konst(IR_I32, 0))
                              : icmp(IR_LT, add ? r : a, add ? a : b);
@@ -2975,7 +2866,7 @@ static struct ir_val *ibits(const char *name, LLVMValueRef call, unsigned lane, 
         if (!is_signed)
             return saturate_int(r, op2(IR_POR, IR_PRED, icmp(IR_NE, hi, konst(IR_I32, 0)), carry),
                                 konst(IR_I32, 0xffffffffu), bits, 0);
-        // the 64-bit sum's high word, against the sign the low one would extend to
+        // overflow when the 64-bit sum's high word isn't the low one's sign
         hi = op2(IR_ADD, IR_I32, op2(IR_ADD, IR_I32, hi, op2(IR_SAR, IR_I32, c, konst(IR_I32, 31))),
                  sel(carry, konst(IR_I32, 1), konst(IR_I32, 0)));
         return saturate_int(r, icmp(IR_NE, hi, op2(IR_SAR, IR_I32, r, konst(IR_I32, 31))), hi, bits, 1);
@@ -2986,7 +2877,7 @@ static struct ir_val *ibits(const char *name, LLVMValueRef call, unsigned lane, 
 static struct ir_val *imath(const char *name, LLVMValueRef call, unsigned lane)
 {
     int abs = is_fn(name, "abs");
-    // an unsigned abs (air.abs.u, OpenCL's) is the value itself
+    // OpenCL's air.abs.u is the value itself
     int is_signed = strstr(name, ".s.") || !strncmp(name, "llvm.s", 6) || (abs && !strstr(name, ".u."));
     unsigned bits = 8 * scalar_bytes(lane_type(LLVMTypeOf(call), lane));
     struct ir_val *a = int_extend(get(LLVMGetOperand(call, 0), lane), bits, is_signed);
@@ -2999,9 +2890,9 @@ static struct ir_val *imath(const char *name, LLVMValueRef call, unsigned lane)
         r = op2(IR_MIN, IR_I32, a, b);
     else if (abs && !is_signed)
         return a;
-    else if (abs)  // max(x, -x)
+    else if (abs)
         r = op2(IR_MAX, IR_I32, a, op2(IR_SUB, IR_I32, konst(IR_I32, 0), a));
-    else if (!strncmp(name, "air.clamp.", 10)) {  // min(max(x, lo), hi)
+    else if (!strncmp(name, "air.clamp.", 10)) {
         struct ir_val *hi = int_extend(get(LLVMGetOperand(call, 2), lane), bits, is_signed);
         struct ir_val *lo = op2(IR_MAX, IR_I32, a, b);
         lo->aux = is_signed;
@@ -3031,7 +2922,7 @@ static struct pair64 pair_zero(void)
     return (struct pair64){ word(0), word(0) };
 }
 
-// lane `lane` of v as a pair; 0 where its high word isn't known
+// 0 where the high word isn't known
 static int pair_at(LLVMValueRef v, unsigned lane, struct pair64 *p)
 {
     p->hi = high_word(v, lane);
@@ -3103,7 +2994,7 @@ static struct ir_val *add_carry(struct ir_val *a, struct ir_val *b, struct ir_va
     return s;
 }
 
-// the 128-bit product of two unsigned 64-bit integers: four words, lowest first
+// unsigned, lowest word first
 static void mul128(struct pair64 x, struct pair64 y, struct ir_val *w[4])
 {
     struct ir_val *c1 = NULL, *c2 = NULL;
@@ -3118,8 +3009,7 @@ static void mul128(struct pair64 x, struct pair64 y, struct ir_val *w[4])
     w[3] = op2(IR_ADD, IR_I32, mulhi_u32(x.hi, y.hi), c2);
 }
 
-// the high 64 bits of the 128-bit product: a signed one is the unsigned product less each operand that was
-// negative, shifted up 64 bits
+// signed is the unsigned product less each negative operand's other operand, shifted up 64 bits
 static struct pair64 mulhi64(struct pair64 x, struct pair64 y, int is_signed)
 {
     struct ir_val *w[4];
@@ -3135,12 +3025,11 @@ static struct pair64 mulhi64(struct pair64 x, struct pair64 y, int is_signed)
     return hi;
 }
 
-// x << n, x >> n or its arithmetic shift, by the low 6 bits of n: 32 and over move a word, the rest split
 static struct pair64 shift64(LLVMOpcode op, struct pair64 x, struct ir_val *amount)
 {
     struct ir_val *n = op2(IR_AND, IR_I32, amount, word(63));
     struct ir_val *big = icmp(IR_GE, n, word(32)), *k = op2(IR_AND, IR_I32, n, word(31));
-    struct ir_val *rest = op2(IR_SUB, IR_I32, word(31), k);  // 31 - k, so a split never shifts by 32
+    struct ir_val *rest = op2(IR_SUB, IR_I32, word(31), k);  // so a split never shifts by 32
     if (op == LLVMShl) {
         struct ir_val *carry = op2(IR_SHR, IR_I32, op2(IR_SHR, IR_I32, x.lo, word(1)), rest);
         return (struct pair64){ sel(big, word(0), op2(IR_SHL, IR_I32, x.lo, k)),
@@ -3175,9 +3064,7 @@ static struct pair64 shift64_const(LLVMOpcode op, struct pair64 x, unsigned c)
                             op2(sh, IR_I32, x.hi, word(c)) };
 }
 
-// n / d and n % d, unsigned, by shift and subtract in a loop of 64 steps: the remainder takes the dividend's bits
-// from the top, and the quotient a bit for each time the divisor goes into it. Apple's GPUs give 0 for a division
-// by 0 and the dividend for its remainder.
+// Apple's GPUs give 0 for a division by 0 and the dividend for its remainder
 static void udivmod64(struct pair64 n, struct pair64 d, struct pair64 *q, struct pair64 *r)
 {
     struct ir_block *pre = g_cur, *head = ir_block(g_f), *done = ir_block(g_f);
@@ -3185,7 +3072,6 @@ static void udivmod64(struct pair64 n, struct pair64 d, struct pair64 *q, struct
     ir_edge(pre, head);
     g_cur = head;
     struct ir_val *zero = word(0), *one = word(1);
-    // the loop's carried values: the bit being taken, the remainder and the quotient so far
     struct ir_val *i = ir_add(head, IR_PHI, IR_I32, 2);
     struct ir_val *rl = ir_add(head, IR_PHI, IR_I32, 2), *rh = ir_add(head, IR_PHI, IR_I32, 2);
     struct ir_val *ql = ir_add(head, IR_PHI, IR_I32, 2), *qh = ir_add(head, IR_PHI, IR_I32, 2);
@@ -3218,7 +3104,6 @@ static void udivmod64(struct pair64 n, struct pair64 d, struct pair64 *q, struct
     *r = rem;
 }
 
-// LLVM's udiv, sdiv, urem and srem of 64-bit lanes: signed ones divide the magnitudes
 static struct pair64 idiv64(struct pair64 a, struct pair64 b, int is_signed, int rem)
 {
     struct ir_val *an = NULL, *bn = NULL;
@@ -3239,15 +3124,13 @@ static struct pair64 idiv64(struct pair64 a, struct pair64 b, int is_signed, int
     return pick64(icmp(IR_NE, flag(an), flag(bn)), neg64(q), q);
 }
 
-// the pair a saturated signed result takes: the limit on the side of word's sign
 static struct pair64 signed_limit(struct ir_val *sign_word)
 {
     struct ir_val *s = op2(IR_SAR, IR_I32, sign_word, word(31));
     return (struct pair64){ op2(IR_XOR, IR_I32, s, word(0xffffffffu)), op2(IR_XOR, IR_I32, s, word(0x7fffffffu)) };
 }
 
-// 64-bit min, max, clamp, abs, bit counts and the saturating, high-product, averaging and bit-field functions of
-// lane `lane`, where the operands' high words are known; 0 if not
+// 0 unless the operands' high words are known
 static int imath64(const char *name, LLVMValueRef call, unsigned lane)
 {
     int is_signed = strstr(name, ".s.") || !strncmp(name, "llvm.s", 6) || (is_fn(name, "abs") && !strstr(name, ".u."));
@@ -3255,7 +3138,7 @@ static int imath64(const char *name, LLVMValueRef call, unsigned lane)
     unsigned nargs = LLVMGetNumOperands(call) - 1;
     if (!pair_at(LLVMGetOperand(call, 0), lane, &x))
         return 0;
-    // the 64-bit operands after the first: min3 and the like take pairs, bit fields a pair and then offsets
+    // bit field functions take 32-bit offsets after the first pair
     int bits_fn = !strncmp(name, "air.extract_bits.", 17) || !strncmp(name, "air.insert_bits.", 16) ||
                   is_fn(name, "rotate");
     if (!bits_fn && nargs > 1 && !pair_at(LLVMGetOperand(call, 1), lane, &y))
@@ -3265,7 +3148,7 @@ static int imath64(const char *name, LLVMValueRef call, unsigned lane)
     struct ir_val *zero = word(0), *ones = word(0xffffffffu);
     if (is_fn(name, "popcount") || is_fn(name, "ctpop")) {
         r = (struct pair64){ op2(IR_ADD, IR_I32, op1(IR_POPC, IR_I32, x.lo), op1(IR_POPC, IR_I32, x.hi)), zero };
-    } else if (is_fn(name, "clz") || is_fn(name, "ctlz")) {  // 32 + the low word's, where the high one is 0
+    } else if (is_fn(name, "clz") || is_fn(name, "ctlz")) {
         struct ir_val *hi = op2(IR_SUB, IR_I32, word(31), op1(IR_FLO, IR_I32, x.hi));
         struct ir_val *lo = op2(IR_SUB, IR_I32, word(63), op1(IR_FLO, IR_I32, x.lo));
         r = (struct pair64){ sel(icmp(IR_EQ, x.hi, zero), lo, hi), zero };
@@ -3285,17 +3168,17 @@ static int imath64(const char *name, LLVMValueRef call, unsigned lane)
         struct ir_val *lt = less64(x, y, is_signed);
         r = is_min ? pick64(lt, x, y) : pick64(lt, y, x);
     } else if (!strncmp(name, "air.clamp.", 10)) {
-        r = pick64(less64(x, y, is_signed), y, x);  // max(x, lo)
-        r = pick64(less64(r, z, is_signed), r, z);  // min(that, hi)
+        r = pick64(less64(x, y, is_signed), y, x);
+        r = pick64(less64(r, z, is_signed), r, z);
     } else if (!strncmp(name, "air.min3.", 9) || !strncmp(name, "air.max3.", 9)) {
         int is_min = name[5] == 'i';
         struct pair64 m = is_min ? pick64(less64(x, y, is_signed), x, y) : pick64(less64(x, y, is_signed), y, x);
         r = is_min ? pick64(less64(m, z, is_signed), m, z) : pick64(less64(m, z, is_signed), z, m);
     } else if (!strncmp(name, "air.median3.", 12)) {
         struct ir_val *xy = less64(x, y, is_signed);
-        struct pair64 lo = pick64(xy, x, y), hi = pick64(xy, y, x);  // min and max of the first two
-        struct pair64 top = pick64(less64(hi, z, is_signed), hi, z);  // min(hi, z)
-        r = pick64(less64(lo, top, is_signed), top, lo);              // max(lo, that)
+        struct pair64 lo = pick64(xy, x, y), hi = pick64(xy, y, x);
+        struct pair64 top = pick64(less64(hi, z, is_signed), hi, z);
+        r = pick64(less64(lo, top, is_signed), top, lo);
     } else if (!strncmp(name, "air.add_sat.", 12) || !strncmp(name, "air.sub_sat.", 12)) {
         int add = name[4] == 'a';
         r = add ? add64(x, y) : sub64(x, y);
@@ -3303,7 +3186,7 @@ static int imath64(const char *name, LLVMValueRef call, unsigned lane)
             struct ir_val *over = add ? less64(r, x, 0) : less64(x, y, 0);
             r = pick64(over, add ? (struct pair64){ ones, ones } : pair_zero(), r);
         } else {
-            // the sign of the result against the operand's, where the operands could overflow it
+            // overflow when like-signed operands give a result of the other sign
             struct ir_val *same = op2(IR_XOR, IR_I32, x.hi, y.hi);
             if (add)
                 same = op2(IR_XOR, IR_I32, same, ones);
@@ -3326,10 +3209,10 @@ static int imath64(const char *name, LLVMValueRef call, unsigned lane)
             r = pick64(over, (struct pair64){ ones, ones }, sum);
         } else {
             struct pair64 hi = mulhi64(x, y, 1), sum = add64(low, z);
-            // the 128-bit sum: z extended with its sign into the high 64 bits, and the carry out of the low ones
+            // the 128-bit sum, z sign-extended
             struct ir_val *ext = op2(IR_SAR, IR_I32, z.hi, word(31));
             hi = add64(add64(hi, (struct pair64){ ext, ext }), (struct pair64){ flag(less64(sum, low, 0)), zero });
-            struct ir_val *s = op2(IR_SAR, IR_I32, sum.hi, word(31));  // what the high 64 bits are when it fits
+            struct ir_val *s = op2(IR_SAR, IR_I32, sum.hi, word(31));  // the high 64 bits when it fits
             struct ir_val *over = op2(IR_POR, IR_PRED, icmp(IR_NE, hi.lo, s), icmp(IR_NE, hi.hi, s));
             r = pick64(over, signed_limit(hi.hi), sum);
         }
@@ -3337,7 +3220,7 @@ static int imath64(const char *name, LLVMValueRef call, unsigned lane)
         struct ir_val *lt = less64(x, y, is_signed);
         r = sub64(pick64(lt, y, x), pick64(lt, x, y));
     } else if (!strncmp(name, "air.hadd.", 9) || !strncmp(name, "air.rhadd.", 10)) {
-        // (a + b) >> 1 without the carry out: a & b + (a ^ b) >> 1; rounded up, a | b - (a ^ b) >> 1
+        // without the carry out of a + b
         struct pair64 diff = { op2(IR_XOR, IR_I32, x.lo, y.lo), op2(IR_XOR, IR_I32, x.hi, y.hi) };
         struct pair64 half = shift64_const(is_signed ? LLVMAShr : LLVMLShr, diff, 1);
         if (name[4] == 'h')
@@ -3346,14 +3229,13 @@ static int imath64(const char *name, LLVMValueRef call, unsigned lane)
             r = sub64((struct pair64){ op2(IR_OR, IR_I32, x.lo, y.lo), op2(IR_OR, IR_I32, x.hi, y.hi) }, half);
     } else if (is_fn(name, "reverse_bits") || is_fn(name, "bitreverse")) {
         r = (struct pair64){ op1(IR_BREV, IR_I32, x.hi), op1(IR_BREV, IR_I32, x.lo) };
-    } else if (is_fn(name, "rotate")) {  // a << s | a >> (64 - s), where s = 0 shifts by 0 both ways
+    } else if (is_fn(name, "rotate")) {  // shift64 masks, so s = 0 shifts by 0 both ways
         struct ir_val *s = op2(IR_AND, IR_I32, get(LLVMGetOperand(call, 1), lane), word(63));
         struct pair64 up = shift64(LLVMShl, x, s);
         struct pair64 down = shift64(LLVMLShr, x, op2(IR_SUB, IR_I32, word(64), s));
         r = (struct pair64){ op2(IR_OR, IR_I32, up.lo, down.lo), op2(IR_OR, IR_I32, up.hi, down.hi) };
     } else if (!strncmp(name, "air.extract_bits.", 17)) {
         struct ir_val *off = get(LLVMGetOperand(call, 1), lane), *n = get(LLVMGetOperand(call, 2), lane);
-        // the field to the top, then down
         struct pair64 up = shift64(LLVMShl, x, op2(IR_SUB, IR_I32, op2(IR_SUB, IR_I32, word(64), off), n));
         struct pair64 field = shift64(is_signed ? LLVMAShr : LLVMLShr, up, op2(IR_SUB, IR_I32, word(64), n));
         r = pick64(icmp(IR_EQ, n, zero), pair_zero(), field);
@@ -3377,16 +3259,14 @@ static int imath64(const char *name, LLVMValueRef call, unsigned lane)
     return 1;
 }
 
-// A float as the 64-bit integer Apple's GPUs make of it: the mantissa shifted by the exponent, whatever the shift
-// carries out of the top lost (a signed result wraps, and is 0 from 2^87 on, a NaN and infinity with it), then
-// negated if the float was. An unsigned result is 0 for a negative float or a NaN and saturates above 2^64.
+// As Apple's GPUs do it: signed wraps and is 0 from 2^87 (NaN and inf too), unsigned is 0 below 0 and saturates.
 static struct pair64 float_to_pair(struct ir_val *f, int is_signed)
 {
     struct ir_val *zero = word(0);
     struct ir_val *abs = op2(IR_AND, IR_I32, f, word(0x7fffffff));
     struct ir_val *neg = icmp(IR_NE, op2(IR_AND, IR_I32, f, word(0x80000000u)), zero);
     struct ir_val *m = op2(IR_OR, IR_I32, op2(IR_AND, IR_I32, abs, word(0x7fffff)), word(0x800000));
-    struct ir_val *e = op2(IR_SUB, IR_I32, op2(IR_SHR, IR_I32, abs, word(23)), word(150));  // the lowest bit's
+    struct ir_val *e = op2(IR_SUB, IR_I32, op2(IR_SHR, IR_I32, abs, word(23)), word(150));  // of the lowest bit
     struct ir_val *left = icmp(IR_GE, e, zero), *wide = icmp(IR_GE, e, word(64));
     left->aux |= IR_SIGNED;
     wide->aux |= IR_SIGNED;
@@ -3397,15 +3277,13 @@ static struct pair64 float_to_pair(struct ir_val *f, int is_signed)
     if (is_signed)
         return pick64(neg, neg64(mag), mag);
     struct ir_val *nan = icmp(IR_GT, abs, word(0x7f800000));
-    struct ir_val *over = icmp(IR_GE, e, word(41));  // 2^64 and up
+    struct ir_val *over = icmp(IR_GE, e, word(41));  // 2^64 up
     over->aux |= IR_SIGNED;
     mag = pick64(over, (struct pair64){ word(0xffffffffu), word(0xffffffffu) }, mag);
     return pick64(op2(IR_POR, IR_PRED, neg, nan), pair_zero(), mag);
 }
 
-// A 64-bit integer as a float, rounded once: the value normalised to its top 32 bits and a sticky bit for the
-// rest, which a 32-bit conversion then rounds to nearest even. A half is made from the float rounded to odd
-// instead, so that its own rounding after it is the only one.
+// Rounded once, from the top 32 bits plus a sticky bit; a half goes via a float rounded to odd for the same reason.
 static struct ir_val *pair_to_float(struct pair64 x, int is_signed, int to_half)
 {
     struct ir_val *zero = word(0);
@@ -3419,7 +3297,7 @@ static struct ir_val *pair_to_float(struct pair64 x, int is_signed, int to_half)
                             sel(icmp(IR_EQ, x.hi, zero), op2(IR_SUB, IR_I32, word(63), op1(IR_FLO, IR_I32, x.lo)),
                                 op2(IR_SUB, IR_I32, word(31), op1(IR_FLO, IR_I32, x.hi))),
                             zero);
-    struct pair64 y = shift64(LLVMShl, x, lz);  // the top bit set, unless x is 0
+    struct pair64 y = shift64(LLVMShl, x, lz);
     struct ir_val *sticky = flag(icmp(IR_NE, y.lo, zero));
     struct ir_val *w = y.hi, *scale;
     if (to_half) {
@@ -3438,8 +3316,7 @@ static struct ir_val *pair_to_float(struct pair64 x, int is_signed, int to_half)
     return neg ? sel(neg, op1(IR_FNEG, IR_F32, f), f) : f;
 }
 
-// The handle a texture or sampler operand names: a bound slot's descriptor heap index, from the const bank's table,
-// or the resource ID an argument buffer holds (a texture's header index, a sampler's index << 20).
+// An argument buffer's resource ID is a texture's header index or a sampler's index << 20.
 static struct ir_val *handle_of_ptr(struct ptr p, enum space space)
 {
     if (p.param) {
@@ -3447,8 +3324,7 @@ static struct ir_val *handle_of_ptr(struct ptr p, enum space space)
             airc_fail("a subroutine's texture or sampler used as another kind or at an offset");
         return p.base;
     }
-    if (p.space == space) {  // read where it's used: kept in a register from the prologue on, it costs one throughout
-        // (an array's element picked at run time p.base slots further on)
+    if (p.space == space) {  // read where used, as one kept from the prologue costs a register throughout
         struct ir_val *at = p.base ? op2(IR_SHL, IR_I32, p.base, konst(IR_I32, 2)) : NULL;
         struct ir_val *h = ir_add(g_cur, IR_CBUF, IR_I32, at ? 1 : 0);
         h->imm = space == SP_TEXTURE ? NVK_TEXTURE_HANDLE(p.slot) : NVK_SAMPLER_HANDLE(p.slot);
@@ -3457,7 +3333,7 @@ static struct ir_val *handle_of_ptr(struct ptr p, enum space space)
         return h;
     }
     if (p.space == SP_GLOBAL && !p.off)
-        return op2(IR_OR, IR_I32, p.base, konst(IR_I32, 0));  // the ID's low word
+        return op2(IR_OR, IR_I32, p.base, konst(IR_I32, 0));
     airc_fail("texture/sampler operand is not a texture/sampler");
 }
 
@@ -3468,13 +3344,10 @@ static struct ir_val *handle_of(LLVMValueRef v, enum space space)
 
 enum { USE_PLAIN, USE_COMPARE, USE_FACES, USE_LEVELS, USE_NEAREST };
 
-// A slot's use the plugin sets the sampler or texture up for: a subroutine's parameter keeps it for the slots its
-// calls pass.
+// tells the plugin how to set the slot up; a subroutine's parameter passes it on to its callers' slots
 static void note_use(struct ptr p, int use);
 
-// A bound sampler's handle, noting whether the slot is sampled with a depth compare or without: a compare wants
-// DEPTH_COMPARE in the sampler even for Metal's default compare function, never, and a plain sample wants it clear,
-// so the plugin sets or clears it per slot.
+// A compare needs DEPTH_COMPARE in the sampler even for Metal's default never, a plain sample needs it clear.
 static struct ir_val *sampler_handle(LLVMValueRef v, int compare)
 {
     struct ptr p = ptr_of(v);
@@ -3482,8 +3355,7 @@ static struct ir_val *sampler_handle(LLVMValueRef v, int compare)
     return handle_of_ptr(p, SP_SAMPLER);
 }
 
-// A cube's handle for a texel read or write, which address its faces as layers: the plugin describes a texture
-// at such a slot as the 2D array of its faces.
+// texel reads and writes address a cube's faces as layers, so the plugin describes it as a 2D array
 static struct ir_val *faces_handle(LLVMValueRef v)
 {
     struct ptr p = ptr_of(v);
@@ -3496,9 +3368,7 @@ static int is_konst(const struct ir_val *v, int64_t imm)
     return v->op == IR_CONST && v->imm == imm;
 }
 
-// A texel write's texture handle at a level past the base: SUST addresses the level its header describes, so the
-// plugin gives a texture written at levels a run of headers, one a level, and the handle is the run's start plus
-// the level. Only a bound texture has the run; an argument buffer's is written at its base.
+// SUST writes the level its header describes, so the plugin gives bound textures one header per level.
 static struct ir_val *level_handle(struct ir_val *handle, LLVMValueRef texture, struct ir_val *level)
 {
     if (is_konst(level, 0))
@@ -3510,10 +3380,7 @@ static struct ir_val *level_handle(struct ir_val *handle, LLVMValueRef texture, 
     return op2(IR_ADD, IR_I32, handle, level);
 }
 
-// A 2D fetch or sample. 1D textures are 2D ones of height 1, sampled down the middle of their row; a 1D array
-// is a 2D texture with one row per layer. Metal samples arrays only with normalized coordinates, so a layer's
-// row centre is (layer + 0.5) / layers.
-// a texture op's offset, n components of `bits` bits each in one register (AOFFI), as NAK packs it; NULL for none
+// packed into one register for AOFFI as NAK does
 static struct ir_val *packed_offset(LLVMValueRef flag, LLVMValueRef off, unsigned n, unsigned bits)
 {
     struct ir_val *f = get(flag, 0);
@@ -3564,9 +3431,7 @@ static void load_value(LLVMValueRef in, struct ptr p, unsigned align);
 static void vector_access(LLVMValueRef in, const char *name);
 static void async_copy(LLVMValueRef in, const char *name);
 
-// A coherent load or store, volatile or not, is seen by the whole device (and, as no other processor shares this
-// memory, by the system): an atomic add of 0 returns what's there, an exchange writes without caching. The word's
-// bits, so a float's sign of zero stays.
+// Atomics bypass the caches, so an add of 0 loads and an exchange stores; on the bits, so a float's -0 stays.
 static void coherent_access(LLVMValueRef call, int load)
 {
     struct ptr p = fit_offset(ptr_of(LLVMGetOperand(call, load ? 0 : 1)));
@@ -3585,9 +3450,7 @@ static void coherent_access(LLVMValueRef call, int load)
         set(call, 0, a);
 }
 
-// AIR's atomics, air.atomic.{global,local}.<op>[.weak][.s|.u].<type>: one ATOM each, on the 32-bit word the pointer
-// names. A load is an add of 0 and a store an exchange; a compare-exchange takes the expected value from the
-// pointer it's given and leaves the old value there, returning it.
+// a compare-exchange reads the expected value through its pointer and leaves the old value there
 static void atomic_op(LLVMValueRef call, const char *name)
 {
     static const struct {
@@ -3609,8 +3472,7 @@ static void atomic_op(LLVMValueRef call, const char *name)
     struct ptr p = ptr_of(LLVMGetOperand(call, 0));
     if (op < 0 || strstr(name, "64") || p.space != (shared ? SP_SHARED : SP_GLOBAL))
         airc_fail("unsupported atomic (%s)", name);
-    // an aligned word of threadgroup memory is read and written atomically by LDS and STS; as ATOMS (an add of 0, an
-    // exchange) the load can return a word that atomics of other warps, past the barrier before it, still change
+    // LDS and STS are atomic on an aligned word; an ATOMS load can return a word other warps' atomics still change
     if (shared && !strcmp(ops[op].name, "load")) {
         set(call, 0, load_lane(fit_offset(p), 0, LLVMTypeOf(call)));
         return;
@@ -3638,7 +3500,7 @@ static void atomic_op(LLVMValueRef call, const char *name)
             data = f ? op1(IR_FNEG, IR_F32, data) : op2(IR_SUB, IR_I32, konst(IR_I32, 0), data);
     }
     if (f && (ops[op].op == SASS_ATOM_EXCH || ops[op].op == SASS_ATOM_CAS))
-        type = SASS_ATOM_U32;  // the same bits
+        type = SASS_ATOM_U32;
     p = fit_offset(p);
     struct ir_val *a = ir_add(g_cur, IR_ATOM, t, swap ? 3 : 2);
     a->src[0] = p.base;
@@ -3657,8 +3519,6 @@ static void atomic_op(LLVMValueRef call, const char *name)
         set(call, 0, a);
 }
 
-// The SIMD-group shuffles to a lane the call names, lane by lane. 16-bit values go through 32 bits. False for a
-// call that isn't one.
 static int simd_op(LLVMValueRef call, const char *name)
 {
     static const struct {
@@ -3695,10 +3555,7 @@ static struct ir_val *lowest_bit(struct ir_val *mask)
     return op2(IR_SUB, IR_I32, konst(IR_I32, 31), op1(IR_FLO, IR_I32, op1(IR_BREV, IR_I32, mask)));
 }
 
-// Where a reduction over the active lanes of each `cluster` (the SIMD group's 32, or a quad's 4) reads at each
-// step: at distance o, any active lane of the other o-lane half of its aligned 2o-lane group, as every active lane
-// of a half holds that half's whole by then. A half with none adds nothing. Lanes switched off by divergence, an
-// early return or a short threadgroup are never read: their registers hold anything.
+// Each step reads an active lane of the other half, as inactive lanes' registers hold anything.
 static unsigned reduce_plan(unsigned cluster, struct ir_val **src, struct ir_val **has)
 {
     struct ir_val *lane = s2r(SR_LANEID), *active = active_lanes();
@@ -3712,9 +3569,7 @@ static unsigned reduce_plan(unsigned cluster, struct ir_val **src, struct ir_val
     return n;
 }
 
-// A prefix over the active lanes below this one in its cluster, as Mesa's generic scan: each step takes in what the
-// nearest lane below not yet counted has gathered, then goes on to what that lane hadn't. below is those lanes,
-// the ones an exclusive prefix reads the inclusive one of the nearest of.
+// Mesa's generic scan over active lanes only; an exclusive prefix reads the nearest of *below's inclusive one
 static unsigned scan_plan(unsigned cluster, struct ir_val **src, struct ir_val **has, struct ir_val **below)
 {
     struct ir_val *lane = s2r(SR_LANEID);
@@ -3732,9 +3587,6 @@ static unsigned scan_plan(unsigned cluster, struct ir_val **src, struct ir_val *
     return n;
 }
 
-// The rest of the SIMD-group functions, and the quad ones (groups of 4 lanes, which IR_SHFL_QUAD keeps a shuffle
-// within): votes, reductions, prefix sums and products, and shuffles to a lane worked out from this one's. False
-// for a call that isn't one of them.
 static int simd_lanes(LLVMValueRef call, const char *name)
 {
     static const char *const prefixes[] = { "simd_prefix_inclusive_", "simd_prefix_exclusive_",
@@ -3751,7 +3603,7 @@ static int simd_lanes(LLVMValueRef call, const char *name)
     };
     LLVMTypeRef t = LLVMTypeOf(call);
     int is_signed = strstr(name, ".s.") != NULL;
-    if (!strcmp(name, "air.simdgroup.barrier"))  // a warp runs its lanes together: nothing to wait for
+    if (!strcmp(name, "air.simdgroup.barrier"))  // a warp runs its lanes together
         return 1;
     if (is_fn(name, "get_simdgroup_size")) {
         set(call, 0, konst(IR_I32, 32));
@@ -3790,7 +3642,7 @@ static int simd_lanes(LLVMValueRef call, const char *name)
         set(call, 0, r);
         return 1;
     }
-    if (is_fn(name, "is_uniform")) {  // every active lane holds the first one's value
+    if (is_fn(name, "is_uniform")) {
         struct ir_val *x = widen(get(LLVMGetOperand(call, 0), 0));
         struct ir_val *same = icmp(IR_EQ, x, shfl(x, SASS_SHFL_IDX, lowest_bit(active_lanes())));
         set(call, 0, icmp(IR_EQ, op1(IR_VOTE, IR_I32, same), active_lanes()));
@@ -3825,7 +3677,7 @@ static int simd_lanes(LLVMValueRef call, const char *name)
                     r->aux = is_signed;
                 x = sel(has[i], r, x);
             }
-            if (prefix == 1 || prefix == 3) {  // the inclusive one of the nearest lane below, the identity for none
+            if (prefix == 1 || prefix == 3) {
                 struct ir_val *identity = product ? (f ? fconst(1) : konst(IR_I32, 1)) : konst(x->type, 0);
                 x = sel(icmp(IR_NE, below, konst(IR_I32, 0)), shfl(x, SASS_SHFL_IDX, op1(IR_FLO, IR_I32, below)),
                         identity);
@@ -3834,7 +3686,6 @@ static int simd_lanes(LLVMValueRef call, const char *name)
         }
         return 1;
     }
-    // shuffles to a lane computed from this one's: index (or delta) and, for a fill, the data's width
     static const struct {
         const char *fn;
         int mode, rotate, fill;
@@ -3873,7 +3724,7 @@ static int simd_lanes(LLVMValueRef call, const char *name)
         int fill = shuffles[s].fill;
         struct ir_val *by = op2(IR_AND, IR_I32, get(LLVMGetOperand(call, 1 + fill), 0), konst(IR_I32, 0xffff));
         src = by;
-        if (shuffles[s].rotate) {  // a fill's width is a power of 2: the lane moves within its slice that wide
+        if (shuffles[s].rotate) {  // a fill's width is a power of 2, the slice the lane moves within
             struct ir_val *lane = s2r(SR_LANEID), *mask = konst(IR_I32, quad ? 3 : 31);
             if (fill && LLVMGetNumOperands(call) > 4)
                 mask = op2(IR_SUB, IR_I32, op2(IR_AND, IR_I32, get(LLVMGetOperand(call, 3), 0), konst(IR_I32, 0xffff)),
@@ -3881,7 +3732,7 @@ static int simd_lanes(LLVMValueRef call, const char *name)
             struct ir_val *at = op2(IR_AND, IR_I32, lane, mask);
             struct ir_val *moved = op2(shuffles[s].rotate > 0 ? IR_ADD : IR_SUB, IR_I32, at, by);
             src = op2(IR_OR, IR_I32, op2(IR_XOR, IR_I32, lane, at), op2(IR_AND, IR_I32, moved, mask));
-            if (fill)  // past the slice's end (or its start), from the fill
+            if (fill)  // past the slice's ends comes from the fill
                 in_range = shuffles[s].rotate > 0 ? icmp(IR_LE, moved, mask)
                                                   : icmp(IR_GE | IR_SIGNED, moved, konst(IR_I32, 0));
         }
@@ -3896,11 +3747,6 @@ static int simd_lanes(LLVMValueRef call, const char *name)
     return 1;
 }
 
-// AIR's texture calls - sample (with its LOD, gradient, depth and compare forms), gather and read - as one IR_TEX
-// in NAK's operand order. After the texture and the sampler come: a depth texture's i32, the coordinate, an
-// array's layer (a cube's face, to read one), a compare's reference, a gradient's two derivatives and min LOD,
-// then (but for cubes) an offset (whether there is one, then it; a read has no flag), then a sample's LOD (level
-// or bias, its value, a min-LOD clamp), a gather's component, a read's LOD.
 static struct ir_val *texture_size(struct ir_val *texture, int mask)
 {
     struct ir_val *q = op2(IR_TXQ, IR_I32, konst(IR_I32, 0), texture);
@@ -3908,8 +3754,7 @@ static struct ir_val *texture_size(struct ir_val *texture, int mask)
     return op1(IR_I2F, IR_F32, q);
 }
 
-// TXD takes no 3D or cube texture: their gradients become an explicit LOD, to sample at. A cube's coordinate on
-// its face is the other two over the major axis, whose derivatives come by the quotient rule.
+// TXD takes no 3D or cube texture, so their gradients become an explicit LOD
 static struct ir_val *gradient_lod(struct ir_val *texture, int cube, LLVMValueRef coord, LLVMValueRef ddx,
                                    LLVMValueRef ddy)
 {
@@ -3930,7 +3775,7 @@ static struct ir_val *gradient_lod(struct ir_val *texture, int cube, LLVMValueRe
         }
         return mulf(mufu(MUFU_LG2, op2(IR_FMAX, IR_F32, m[0], m[1])), fconst(0.5f));
     }
-    // the major axis: z, else y, else x where it's the largest; the other two in q order (yz for x, xz for y)
+    // face coordinates over the major axis, differentiated by the quotient rule
     struct ir_val *a[3] = { absf(p[0]), absf(p[1]), absf(p[2]) };
     struct ir_val *z = fcmp(FCMP_OGE, a[2], op2(IR_FMAX, IR_F32, a[0], a[1]));
     struct ir_val *y = fcmp(FCMP_OGE, a[1], op2(IR_FMAX, IR_F32, a[0], a[2]));
@@ -3949,7 +3794,7 @@ static struct ir_val *gradient_lod(struct ir_val *texture, int cube, LLVMValueRe
     }
     struct ir_val *l = texture_size(texture, 1);
     struct ir_val *lm = mulf(mulf(l, l), op2(IR_FMAX, IR_F32, m[0], m[1]));
-    return madf(mufu(MUFU_LG2, lm), fconst(0.5f), fconst(-1));  // the face spans [-1, 1]: half the texels a unit
+    return madf(mufu(MUFU_LG2, lm), fconst(0.5f), fconst(-1));  // the face spans [-1, 1]
 }
 
 static void texture_op(LLVMValueRef call, const char *name)
@@ -3960,10 +3805,9 @@ static void texture_op(LLVMValueRef call, const char *name)
     int cube = strstr(name, "_cube") != NULL, array = strstr(name, "_array") != NULL;
     int d1 = strstr(name, "_1d") != NULL, d3 = strstr(name, "_3d") != NULL;
     int ms = strstr(name, "_ms") != NULL;
-    // Metal 1.x's AIR (Roblox ships shaders built for it) returns a plain vector, with no residency flag; its samples
-    // have no min LOD operand, its reads no sampler or offset
+    // Metal 1.x's AIR, which some apps still ship, has no residency flag, min LOD, or read sampler and offset
     int legacy = LLVMGetTypeKind(LLVMTypeOf(call)) != LLVMStructTypeKind;
-    // the OpenGL renderer's reads name no sampler either: texture, coordinate, level, 0 (a residency flag comes back)
+    // the OpenGL renderer's reads name no sampler either
     int bare = read && LLVMGetTypeKind(LLVMTypeOf(LLVMGetOperand(call, 1))) != LLVMPointerTypeKind;
     if ((ms && (!read || array)) || (!d1 && !d3 && !cube && !strstr(name, "_2d")))
         airc_fail("unsupported texture op (%s)", name);
@@ -3972,10 +3816,10 @@ static void texture_op(LLVMValueRef call, const char *name)
     struct ir_val *handle = read ? texture : op2(IR_OR, IR_I32, texture, sampler_handle(LLVMGetOperand(call, 1), compare));
     if (!read && !gather && (strstr(name, ".u.") || strstr(name, ".s.") || strstr(name, ".i.")))
         note_use(ptr_of(LLVMGetOperand(call, 1)), USE_NEAREST);
-    unsigned i = (legacy || bare) && read ? 1 : depth ? 3 : 2;  // a legacy read has no sampler
+    unsigned i = (legacy || bare) && read ? 1 : depth ? 3 : 2;
     LLVMValueRef coord = LLVMGetOperand(call, i++);
     LLVMValueRef layer = array || (cube && read) ? LLVMGetOperand(call, i++) : NULL;
-    // a cube array's texel is read as the layer of its cube's face in the 2D array of all the faces
+    // a cube array's texel reads are into the 2D array of all faces
     struct ir_val *layer_val = layer ? get(layer, 0) : NULL;
     if (cube && array && read) {
         struct ir_val *cube_index = op2(IR_MUL, IR_I32, get(LLVMGetOperand(call, i++), 0), konst(IR_I32, 6));
@@ -3987,7 +3831,7 @@ static void texture_op(LLVMValueRef call, const char *name)
         ddx = LLVMGetOperand(call, i++);
         ddy = LLVMGetOperand(call, i);
         grad_min = legacy ? NULL : LLVMGetOperand(call, i + 1);
-        i += legacy ? 1 : 2;  // and the min LOD, which goes (but for a LOD worked out here)
+        i += legacy ? 1 : 2;
     }
     unsigned ncoord = d3 || (cube && !read) ? 3 : d1 ? 1 : 2;
     struct ir_val *offset = NULL;
@@ -4007,7 +3851,7 @@ static void texture_op(LLVMValueRef call, const char *name)
         }
     }
 
-    // the LOD: a read's or a sample's level, a sample's bias (implicit LOD in a fragment function, else LOD 0)
+    // a bias only has derivatives to apply to in a fragment function, else it's LOD 0
     int lod_mode = SASS_LOD_ZERO;
     struct ir_val *lod = NULL, *min_lod = NULL;
     unsigned comp = 0;
@@ -4032,7 +3876,7 @@ static void texture_op(LLVMValueRef call, const char *name)
             if (min_lod)
                 lod_mode = lod_mode == SASS_LOD_AUTO ? SASS_LOD_CLAMP : SASS_LOD_BIAS_CLAMP;
         } else if (!level->imm) {
-            // no derivatives: LOD 0, a bias left out, raised to the clamp
+            // no derivatives, so LOD 0 raised to the clamp
             lod = min_lod;
             min_lod = NULL;
         }
@@ -4050,9 +3894,7 @@ static void texture_op(LLVMValueRef call, const char *name)
     if (lod_mode == SASS_LOD_ZERO || lod_mode == SASS_LOD_AUTO || lod_mode == SASS_LOD_CLAMP)
         lod = NULL;
 
-    // the first vector: the layer (an integer), then the coordinates (TXD: the coordinates, then the layer, with
-    // the offset in its low half); a 1D texture is a 2D one a row high, a 1D array one with a row per layer (the
-    // plugin lays them out so)
+    // the plugin lays 1D textures out as 2D ones a row high, 1D arrays with a row per layer
     struct ir_val *src[12];
     unsigned n = 0;
     int dim = d3 ? SASS_DIM_3D
@@ -4060,14 +3902,14 @@ static void texture_op(LLVMValueRef call, const char *name)
               : array && !d1 ? SASS_DIM_ARRAY_2D
                              : SASS_DIM_2D;
     struct ir_val *first = layer && !d1 && !grad ? layer_val : NULL;
-    if (min_lod) {  // the clamp (8.8, NAK keeps it at 1/16 at least) in the high half of the layer's word
+    if (min_lod) {  // 8.8 in the layer word's high half; NAK keeps it at 1/16 at least
         struct ir_val *ml = op2(IR_FMAX, IR_F32, op2(IR_FMUL, IR_F32, min_lod, fconst(256)), fconst(16));
         ml = op2(IR_SHL, IR_I32, op1(IR_F2I, IR_I32, ml), konst(IR_I32, 16));
         first = first ? op2(IR_OR, IR_I32, op2(IR_AND, IR_I32, first, konst(IR_I32, 0xffff)), ml) : ml;
     }
     if (first)
         src[n++] = first;
-    // the hardware takes a cube's direction over a major axis of 1: it picks the face but does not divide by it
+    // the hardware picks a cube's face but doesn't divide by the major axis
     struct ir_val *cube_scale = NULL;
     if (cube && !read) {
         struct ir_val *major = op1(IR_FABS, IR_F32, get(coord, 0));
@@ -4097,7 +3939,6 @@ static void texture_op(LLVMValueRef call, const char *name)
         src[n++] = offset ? op2(IR_OR, IR_I32, l, offset) : l;
     }
     unsigned n0 = n;
-    // the second, after the handle: the LOD, the offset, the reference; a gradient's derivatives instead
     if (grad) {
         for (unsigned c = 0; c < ncoord; c++) {
             src[n++] = get(ddx, c);
@@ -4123,7 +3964,6 @@ static void texture_op(LLVMValueRef call, const char *name)
     memcpy(t->src, src, n * sizeof(src[0]));
     t->aux = IR_TEXA(op, dim, flags, n0) | (results == 1 ? IR_TEXA_SCALAR : 0);
 
-    // the results: a vector or (depth) a scalar, then whether the texel was resident
     for (unsigned l = 0; l < results; l++) {
         enum ir_type lt = ir_type_of(lane_type(rt, l));
         struct ir_val *p = op1(IR_PROJ, lt == IR_F16 ? IR_F32 : lt, t);
@@ -4136,7 +3976,6 @@ static void texture_op(LLVMValueRef call, const char *name)
 
 static void store_value(struct ptr p, LLVMTypeRef t, LLVMValueRef val, unsigned align);
 
-// A call: an intrinsic in place, or one of the module's functions inlined or (noinline) called.
 static void inline_call(LLVMValueRef call, LLVMValueRef fn);
 static int call_sub(LLVMValueRef call, LLVMValueRef fn);
 static void control_point(LLVMValueRef call);
@@ -4153,8 +3992,7 @@ static LLVMValueRef first_node(LLVMModuleRef m, const char *name)
     return node;
 }
 
-// a function the module only declares, defined in a linked module: Metal calls a visible function NAME through
-// a declaration NAME.MTL_VISIBLE_FN_REF
+// Metal calls a visible function NAME through a declaration NAME.MTL_VISIBLE_FN_REF
 static LLVMValueRef linked_function(const char *name)
 {
     size_t n = strlen(name);
@@ -4167,7 +4005,7 @@ static LLVMValueRef linked_function(const char *name)
             if (s && strlen(s) == n && !strncmp(s, name, n) && LLVMGetFirstBasicBlock(fn))
                 return fn;
         }
-    // one linked under another name: its module's visible function
+    // linked under another name
     for (unsigned i = 0; g_linked_names && i < g_nlinked; i++) {
         const char *a = g_linked_names[i];
         if (!a || strlen(a) != n || strncmp(a, name, n) || !LLVMGetNamedMetadataNumOperands(g_linked[i], "air.visible"))
@@ -4185,8 +4023,7 @@ static LLVMValueRef linked_function(const char *name)
     return NULL;
 }
 
-// The normalized integer fields of a 32-bit word an air.pack or air.unpack name packs: <unorm|snorm><n>x<bits>,
-// unorm4x8.srgb, unorm.rgb10a2 and unorm.rgb565, first field lowest. How many there are, or 0 for none of these.
+// first field lowest; 0 when the name isn't a normalised packing
 static unsigned packed_fields(const char *name, unsigned *bits, int *snorm, int *srgb)
 {
     const char *k = strchr(name + 4, '.') + 1;
@@ -4209,24 +4046,22 @@ static unsigned packed_fields(const char *name, unsigned *bits, int *snorm, int 
     return (unsigned)count;
 }
 
-// sRGB's transfer function, to it from linear (encode) or back
 static struct ir_val *srgb(struct ir_val *c, int encode)
 {
     struct ir_val *lin, *curve;
-    if (encode) {  // 12.92 c up to 0.0031308, 1.055 c^(1/2.4) - 0.055 above
+    if (encode) {
         lin = op2(IR_FMUL, IR_F32, c, fconst(12.92f));
         curve = mufu(MUFU_EX2, op2(IR_FMUL, IR_F32, mufu(MUFU_LG2, c), fconst(1 / 2.4f)));
         curve = op3(IR_FFMA, IR_F32, curve, fconst(1.055f), fconst(-0.055f));
         return sel(fcmp(FCMP_OGT, c, fconst(0.0031308f)), curve, lin);
     }
-    lin = op2(IR_FMUL, IR_F32, c, fconst(1 / 12.92f));  // c / 12.92 up to 0.04045, ((c + 0.055) / 1.055)^2.4 above
+    lin = op2(IR_FMUL, IR_F32, c, fconst(1 / 12.92f));
     curve = op3(IR_FFMA, IR_F32, c, fconst(1 / 1.055f), fconst(0.055f / 1.055f));
     curve = mufu(MUFU_EX2, op2(IR_FMUL, IR_F32, mufu(MUFU_LG2, curve), fconst(2.4f)));
     return sel(fcmp(FCMP_OGT, c, fconst(0.04045f)), curve, lin);
 }
 
-// k / d correctly rounded, k an integral float: the reciprocal's product corrected by its exact remainder (checked
-// against every 16-bit k for the divisors packed fields use), where k * (1 / d) is off by an ulp at times
+// k * (1 / d) is sometimes an ulp out; checked against every 16-bit k for the packed fields' divisors
 static struct ir_val *div_exact(struct ir_val *k, unsigned d)
 {
     struct ir_val *rcp = fconst(1.0f / (float)d);
@@ -4235,10 +4070,8 @@ static struct ir_val *div_exact(struct ir_val *k, unsigned d)
     return op3(IR_FFMA, IR_F32, e, rcp, q);
 }
 
-// An 8x8 simdgroup matrix is a <64 x T> in AIR that only its first two lanes carry: each thread owns two elements
-// of one row, (fm, fn) and (fm, fn + 1) with the coordinates Apple's hardware deals them out by, and the operations
-// work across the whole simdgroup. The multiply-accumulate reads each row of A and column of B from the threads that
-// hold them, a shuffle for every element.
+// An 8x8 simdgroup matrix's <64 x T> carries only two lanes, each thread's (fm, fn) and (fm, fn + 1) as Apple
+// deals them out.
 static void simdgroup_matrix(LLVMValueRef in, int multiply)
 {
     LLVMTypeRef rt = LLVMTypeOf(in);
@@ -4252,7 +4085,7 @@ static void simdgroup_matrix(LLVMValueRef in, int multiply)
                             op2(IR_SHL, IR_I32, bit[0], konst(IR_I32, 1)));
     enum ir_type et = ir_type_of(lane_type(rt, 0));
     struct ir_val *out[2];
-    if (!multiply) {  // the diagonal: element e of this thread is on it when the row is the column
+    if (!multiply) {
         struct ir_val *x = get(LLVMGetOperand(in, 0), 0);
         for (unsigned e = 0; e < 2; e++)
             out[e] = sel(icmp(IR_EQ, fm, op2(IR_ADD, IR_I32, fn, konst(IR_I32, e))), x, konst(x->type, 0));
@@ -4264,8 +4097,6 @@ static void simdgroup_matrix(LLVMValueRef in, int multiply)
             acc[e] = widen(get(LLVMGetOperand(in, 2), e));
         }
         for (unsigned k = 0; k < 8; k++) {
-            // A[fm][k] lives in the thread with this thread's row bits and k's column bits, B[k][fn + e] in the one
-            // with k's row bits and this thread's column bits
             struct ir_val *from_a = op2(IR_OR, IR_I32, op2(IR_AND, IR_I32, lane, konst(IR_I32, 0x16)),
                                         konst(IR_I32, (k >> 2 & 1) << 3 | (k >> 1 & 1)));
             struct ir_val *from_b = op2(IR_OR, IR_I32, op2(IR_AND, IR_I32, lane, konst(IR_I32, 0x09)),
@@ -4284,12 +4115,7 @@ static void simdgroup_matrix(LLVMValueRef in, int multiply)
 static struct ir_val *bfloat_to_float(struct ir_val *x);
 static struct ir_val *float_to_bfloat(struct ir_val *x);
 
-// OpenCL's work-item functions (air.get_global_id.i32 and the rest), which Apple's OpenCL compiles to these rather
-// than to kernel arguments. The dimension is an argument; from 3 on an id is 0 and a size 1, as OpenCL has it. There
-// is no global offset (the dispatch has none), and the work dimension is the last axis longer than 1. 0 for another
-// air.get_ name.
-// OpenCL's shuffle(x, mask) and shuffle2(x, y, mask): lane i is lane mask[i] of x (then of y), the mask taken modulo
-// their lanes
+// OpenCL's shuffle and shuffle2, the mask taken modulo the lanes
 static void shuffle_lanes(LLVMValueRef in)
 {
     unsigned nops = (unsigned)LLVMGetNumOperands(in) - 1;
@@ -4320,8 +4146,7 @@ static void shuffle_lanes(LLVMValueRef in)
 
 static unsigned hidden_arg(enum nvk_arg_kind kind, unsigned index, unsigned *off);
 
-// word i of what OpenCL's renderer binds at buffer 0 for a dispatch: the global work offset's x, y and z, then
-// work_dim; a hidden buffer argument, AIRC_CL_OFFSETS, only in a kernel that asks
+// the global work offset's x, y, z, then work_dim, from a hidden buffer only kernels that ask get
 static struct ir_val *cl_offsets(unsigned i)
 {
     if (!g_cl_offsets[i]) {
@@ -4336,7 +4161,7 @@ static struct ir_val *cl_offsets(unsigned i)
     return g_cl_offsets[i];
 }
 
-// axis l of a work-item value: offset 1 for the global work offset itself, 2 for kind's value past it
+// offset 1 is the global work offset itself, 2 adds it to kind's value
 static struct ir_val *workitem_axis(enum nvk_arg_kind kind, int offset, unsigned l)
 {
     if (offset == 1)
@@ -4350,7 +4175,7 @@ static int workitem(LLVMValueRef in, const char *what)
     static const struct {
         const char *name;
         enum nvk_arg_kind kind;
-        int size;  // 1 for a size, which is 1 past the axes
+        int size;  // past the third axis a size is 1, an id 0
         int offset;
     } fn[] = {
         { "global_id.", NVK_ARG_TID, 0, 2 },     { "local_id.", NVK_ARG_TG_TID, 0, 0 },
@@ -4387,7 +4212,7 @@ static int workitem(LLVMValueRef in, const char *what)
     return 1;
 }
 
-// OpenCL's printf, which hands its va_list to air.vprintf
+// OpenCL's printf hands its va_list to air.vprintf
 static int is_printf(LLVMValueRef fn)
 {
     for (LLVMBasicBlockRef b = LLVMGetFirstBasicBlock(fn); b; b = LLVMGetNextBasicBlock(b))
@@ -4424,7 +4249,7 @@ static void call(LLVMValueRef in)
         control_point(in);
         return;
     }
-    if (!fn || !LLVMIsAFunction(fn))  // a function pointer's value, which has no name to look up
+    if (!fn || !LLVMIsAFunction(fn))
         airc_fail("indirect call");
     if (strncmp(name, "air.", 4) && strncmp(name, "llvm.", 5))
         airc_fail("call to %s, which no linked module defines", name);
@@ -4436,9 +4261,9 @@ static void call(LLVMValueRef in)
         g_info->barriers = 1;
         return;
     }
-    if (!strncmp(name, "llvm.lifetime.", 14))  // allocas are variables, alive wherever they're used
+    if (!strncmp(name, "llvm.lifetime.", 14))  // allocas are variables, alive wherever used
         return;
-    // hints, and a SIMD group's barrier: its threads run together
+    // a SIMD group's threads run together
     if (!strcmp(name, "llvm.assume") || !strncmp(name, "llvm.experimental.noalias.scope.decl", 36) ||
         !strncmp(name, "llvm.dbg.", 9) || !strcmp(name, "llvm.donothing") || !strcmp(name, "llvm.sideeffect") ||
         !strcmp(name, "air.simdgroup.barrier"))
@@ -4470,7 +4295,7 @@ static void call(LLVMValueRef in)
         insert(g_ptrs, in, 0, g_scope)->p = (struct ptr){ .space = SP_SHARED };
         return;
     }
-    if (!strcmp(name, "air.wait_wg_events")) {  // the copies are done: what's left is to see each other's
+    if (!strcmp(name, "air.wait_wg_events")) {  // the copies are done, only visibility is left
         ir_add(g_cur, IR_BAR, IR_VOID, 0);
         g_info->barriers = 1;
         return;
@@ -4479,7 +4304,7 @@ static void call(LLVMValueRef in)
         shuffle_lanes(in);
         return;
     }
-    if (!strcmp(name, "air.atomic.fence")) {  // whatever the memory and scope: as for the whole device
+    if (!strcmp(name, "air.atomic.fence")) {  // device scope whatever was asked
         ir_add(g_cur, IR_BAR, IR_VOID, 0)->aux = 1;
         return;
     }
@@ -4501,7 +4326,7 @@ static void call(LLVMValueRef in)
         texture_op(in, name);
         return;
     }
-    if (!strncmp(name, "air.is_null_texture", 19)) {  // no texture bound: header index 0, the unbound texture's
+    if (!strncmp(name, "air.is_null_texture", 19)) {  // header index 0 is the unbound texture
         struct ir_val *index = op2(IR_AND, IR_I32, handle_of(LLVMGetOperand(in, 0), SP_TEXTURE), konst(IR_I32, 0xfffff));
         struct ir_val *null = op2(IR_CMP, IR_PRED, index, konst(IR_I32, 0));
         null->aux = IR_EQ;
@@ -4510,7 +4335,7 @@ static void call(LLVMValueRef in)
     }
     if (!strncmp(name, "air.get_", 8) && workitem(in, name + 8))
         return;
-    if (!strncmp(name, "air.get_null_texture", 20)) {  // the unbound texture's handle, 0, as an argument buffer's ID
+    if (!strncmp(name, "air.get_null_texture", 20)) {
         struct ptr p = { .space = SP_GLOBAL, .base = konst(IR_I64, 0) };
         insert(g_ptrs, in, 0, g_scope)->p = p;
         return;
@@ -4521,8 +4346,7 @@ static void call(LLVMValueRef in)
         return;
     }
     if (!strncmp(name, "air.write_texture_", 18)) {
-        // after the texture: the coordinate, an array's layer (a cube's face, then a cube array's cube), the texel;
-        // 1D textures are 2D ones a row (a layer) high, cubes and cube arrays 2D arrays of their faces
+        // 1D textures are 2D ones a row high, cubes and cube arrays 2D arrays of their faces
         int d1 = strstr(name, "_1d") != NULL, d3 = strstr(name, "_3d") != NULL;
         int cube = strstr(name, "_cube") != NULL, cube_array = strstr(name, "_cube_array.") != NULL;
         int layered = strstr(name, "_array") != NULL || cube;
@@ -4539,7 +4363,7 @@ static void call(LLVMValueRef in)
             src[ncoord] = op2(IR_ADD, IR_I32, op2(IR_MUL, IR_I32, get(LLVMGetOperand(in, 3), 0), konst(IR_I32, 6)),
                               src[ncoord]);
         for (unsigned c = 0; c < 4; c++)
-            src[n + c] = widen(get(texel, c));  // before the store, which ir_add appends
+            src[n + c] = widen(get(texel, c));  // before ir_add appends the store
         LLVMValueRef tex = LLVMGetOperand(in, 0);
         struct ir_val *level = get(LLVMGetOperand(in, cube_array ? 5 : layered ? 4 : 3), 0);
         src[n + 4] = level_handle(cube ? faces_handle(tex) : handle_of(tex, SP_TEXTURE), tex, level);
@@ -4564,7 +4388,7 @@ static void call(LLVMValueRef in)
         return;
     }
     if (!strncmp(name, "air.get_", 8) && (strstr(name, "_texture_") || strstr(name, "_depth_"))) {
-        // TXQ's dimensions are width, height, depth (an array's layers; a 1D array's are its height) and levels
+        // TXQ's depth is an array's layers, but a 1D array's are its height
         int levels = !strncmp(name, "air.get_num_mip_levels", 22);
         if (!strncmp(name, "air.get_num_samples", 19)) {  // TEXTURE_TYPE's third word
             struct ir_val *q = op2(IR_TXQ, IR_I32, konst(IR_I32, 0), handle_of(LLVMGetOperand(in, 0), SP_TEXTURE));
@@ -4580,7 +4404,7 @@ static void call(LLVMValueRef in)
                    : 0;
         if (!mask)
             airc_fail("unsupported texture query (%s)", name);
-        unsigned nops = (unsigned)LLVMGetNumOperands(in);  // the texture, the LOD if any, the callee
+        unsigned nops = (unsigned)LLVMGetNumOperands(in);
         struct ir_val *lod = !levels && nops > 2 ? get(LLVMGetOperand(in, 1), 0) : konst(IR_I32, 0);
         struct ir_val *q = op2(IR_TXQ, IR_I32, lod, handle_of(LLVMGetOperand(in, 0), SP_TEXTURE));
         q->aux = mask;
@@ -4604,7 +4428,7 @@ static void call(LLVMValueRef in)
         set(in, 0, sel(ne, konst(IR_I32, 1), konst(IR_I32, 0)));
         return;
     }
-    if (is_fn(name, "sincos")) {  // the sine, and the cosine into the variable the pointer names
+    if (is_fn(name, "sincos")) {
         struct ptr p = ptr_of(LLVMGetOperand(in, 1));
         if (p.space != SP_PRIVATE || p.base)
             airc_fail("the cosine of %s goes elsewhere than a variable", name);
@@ -4634,7 +4458,7 @@ static void call(LLVMValueRef in)
         struct ir_val *r = NULL;
         enum ir_type t = ir_type_of(rt);
         for (unsigned l = 0; l < nlanes(LLVMTypeOf(a)); l++) {
-            // half rounds after every step, as Apple's does
+            // half rounds after every step, as Apple's
             struct ir_val *x = get(a, l), *y = get(b, l);
             if (t != IR_F16) {
                 x = widen(x);
@@ -4645,7 +4469,6 @@ static void call(LLVMValueRef in)
         set(in, 0, r);
         return;
     }
-    // air.unpack.<fields>.<type> / air.pack...: normalized integer fields of a 32-bit word
     unsigned fields[4], count;
     int snorm, to_srgb;
     if (!strncmp(name, "air.simdgroup_matrix_8x8_multiply_accumulate.", 45) ||
@@ -4654,8 +4477,7 @@ static void call(LLVMValueRef in)
         return;
     }
     if (!strncmp(name, "air.unpack.unorm.rgb9e5.", 24)) {
-        // three 9-bit mantissas sharing a 5-bit exponent: each is m * 2^(e - 15 - 9), the scale built in the
-        // exponent field of a float
+        // m * 2^(e - 15 - 9), the scale built in a float's exponent field
         struct ir_val *x = get(LLVMGetOperand(in, 0), 0);
         struct ir_val *e = op2(IR_SHR, IR_I32, x, konst(IR_I32, 27));
         struct ir_val *scale = op2(IR_OR, IR_F32, op2(IR_SHL, IR_I32, op2(IR_ADD, IR_I32, e, konst(IR_I32, 103)),
@@ -4668,8 +4490,7 @@ static void call(LLVMValueRef in)
         return;
     }
     if (!strncmp(name, "air.unpack.unorm.rg11b10f.", 26)) {
-        // unsigned floats of 5 exponent bits and 6 (red, green) or 5 (blue) of mantissa: a half's layout with the
-        // sign gone and the mantissa short, so shifted up into a half they widen exactly, denormals and infinity too
+        // a half's layout without sign and with a short mantissa, so shifted into a half they widen exactly
         struct ir_val *x = get(LLVMGetOperand(in, 0), 0);
         for (unsigned l = 0, at = 0; l < 3; at += l++ < 2 ? 11 : 10) {
             unsigned lift = l < 2 ? 4 : 5;
@@ -4685,14 +4506,13 @@ static void call(LLVMValueRef in)
         for (unsigned l = 0, at = 0; l < count && l < n; at += fields[l++]) {
             unsigned bits = fields[l], max = (1u << (bits - snorm)) - 1;
             struct ir_val *f;
-            if (snorm) {  // the field to the top, then back down arithmetically: sign-extended
+            if (snorm) {
                 struct ir_val *top = op2(IR_SHL, IR_I32, x, konst(IR_I32, 32 - at - bits));
                 f = op1(IR_I2F, IR_F32, op2(IR_SAR, IR_I32, top, konst(IR_I32, 32 - bits)));
                 f->aux = 1;
                 f = op2(IR_FMAX, IR_F32, div_exact(f, max), fconst(-1.0f));
             } else if (to_srgb && l < 3) {
-                // Apple decodes sRGB to 12 bits: the nearest k / 4095. Byte 80 is 328.50016 / 4095, nearer the
-                // midpoint than the curve's accuracy here, so it's set apart.
+                // Apple decodes sRGB to the nearest k / 4095; byte 80 sits too near a midpoint for the curve here
                 struct ir_val *field = op2(IR_AND, IR_I32, op2(IR_SHR, IR_I32, x, konst(IR_I32, at)),
                                            konst(IR_I32, 0xff));
                 f = op2(IR_FMUL, IR_F32, op1(IR_I2F, IR_F32, field), fconst(1.0f / 255));
@@ -4714,16 +4534,15 @@ static void call(LLVMValueRef in)
         for (unsigned l = 0, at = 0; l < count; at += fields[l++]) {
             unsigned bits = fields[l], max = (1u << (bits - snorm)) - 1;
             struct ir_val *f = widen(get(v, l));
-            if (to_srgb && l < 3)  // the max first: NaN is 0
+            if (to_srgb && l < 3)  // max first, so NaN is 0
                 f = srgb(op2(IR_FMIN, IR_F32, op2(IR_FMAX, IR_F32, f, fconst(0.0f)), fconst(1.0f)), 1);
-            // f * max rounded half away from zero, exactly as Apple does: rounded towards zero, f * max + 0.5 can't
-            // reach the next integer when it's just short of it, so truncating it is exact
+            // half away from zero as Apple; the FFMA rounds towards zero so the truncation is exact
             struct ir_val *half = snorm ? op2(IR_OR, IR_F32, op2(IR_AND, IR_F32, f, konst(IR_F32, 0x80000000u)),
                                               konst(IR_F32, 0x3f000000))
                                         : fconst(0.5f);
             struct ir_val *t = op3(IR_FFMA, IR_F32, f, fconst((float)max), half);
             t->aux = SASS_RND_TRUNC;
-            struct ir_val *i = op1(IR_F2I, IR_I32, t);  // NaN is 0, and below 0 is 0 unsigned
+            struct ir_val *i = op1(IR_F2I, IR_I32, t);  // NaN is 0, as is below 0 unsigned
             i->aux = snorm;
             if (snorm)
                 i = iminmax(IR_MAX, i, konst(IR_I32, -(int)max), 1);
@@ -4737,7 +4556,7 @@ static void call(LLVMValueRef in)
     }
     if (!strncmp(name, "air.pack.half2x16.", 18) || !strncmp(name, "air.unpack.half2x16.", 20)) {
         LLVMValueRef v = LLVMGetOperand(in, 0);
-        if (name[4] == 'u') {  // each half widened
+        if (name[4] == 'u') {
             for (unsigned l = 0; l < 2; l++) {
                 struct ir_val *h = op2(IR_SHR, IR_I32, get(v, 0), konst(IR_I32, 16 * l));
                 set(in, l, narrow(op1(IR_H2F, IR_F32, h), ir_type_of(lane_type(rt, l))));
@@ -4749,16 +4568,15 @@ static void call(LLVMValueRef in)
         set(in, 0, op2(IR_OR, IR_I32, lo, op2(IR_SHL, IR_I32, hi, konst(IR_I32, 16))));
         return;
     }
-    // air.convert.<kind>.<type>.<kind>.<type>, lane by lane
     char dk, sk, dbuf[16], sbuf[16];
     if (sscanf(name, "air.convert.%c.%15[^.].%c.%15s", &dk, dbuf, &sk, sbuf) == 4) {
         for (unsigned l = 0; l < n; l++) {
             struct ir_val *s = get(LLVMGetOperand(in, 0), l), *r;
             enum ir_type dt = ir_type_of(lane_type(rt, l));
-            if (s->type == IR_PRED)  // a bool is 1 (or as a signed one, -1) or 0
+            if (s->type == IR_PRED)  // a signed bool is -1
                 s = sel(s, konst(IR_I32, sk == 's' ? -1 : 1), konst(IR_I32, 0));
             LLVMValueRef from = LLVMGetOperand(in, 0);
-            // a bfloat's bits, a float's top half, go through a float
+            // a bfloat is a float's top half, so it goes through a float
             int to_bfloat = LLVMGetTypeKind(lane_type(rt, l)) == LLVMBFloatTypeKind;
             if (LLVMGetTypeKind(lane_type(LLVMTypeOf(from), l)) == LLVMBFloatTypeKind)
                 s = bfloat_to_float(s);
@@ -4772,11 +4590,11 @@ static void call(LLVMValueRef in)
                 set(in, l, to_bfloat ? float_to_bfloat(r) : r);
                 continue;
             }
-            if (sk != 'f')  // a narrow lane keeps only its low bits
+            if (sk != 'f')  // a narrow lane's upper bits are junk
                 s = int_extend(s, 8 * scalar_bytes(lane_type(LLVMTypeOf(from), l)), sk == 's');
             if (dk == 'f' && sk == 'f') {
                 r = to_bfloat ? float_to_bfloat(widen(s)) : narrow(widen(s), dt);
-            } else if (dk == 'f') {  // from an integer
+            } else if (dk == 'f') {
                 struct ir_val *i2f = op1(IR_I2F, IR_F32, s);
                 i2f->aux = sk == 's';
                 r = to_bfloat ? float_to_bfloat(i2f) : narrow(i2f, dt);
@@ -4787,14 +4605,14 @@ static void call(LLVMValueRef in)
                 r = op1(IR_F2I, IR_I32, widen(s));
                 r->aux = dk == 's';
                 unsigned bits = 8 * scalar_bytes(lane_type(rt, l));
-                if (bits < 32) {  // saturated to the narrower type, not its low bits of the 32-bit one
+                if (bits < 32) {  // saturate to the narrower type rather than truncate
                     int max = dk == 's' ? (1 << (bits - 1)) - 1 : (1 << bits) - 1;
                     if (dk == 's')
                         r = iminmax(IR_MAX, r, konst(IR_I32, -max - 1), 1);
                     r = iminmax(IR_MIN, r, konst(IR_I32, max), dk == 's');
                 }
             } else {
-                r = s;  // integer to integer: 32-bit lanes already
+                r = s;
                 if (is_i64(lane_type(rt, l))) {
                     struct ir_val *hi = is_i64(lane_type(LLVMTypeOf(from), l)) ? high_word(from, l) : NULL;
                     if (!is_i64(lane_type(LLVMTypeOf(from), l)))
@@ -4803,7 +4621,7 @@ static void call(LLVMValueRef in)
                         set_high(in, l, hi);
                 }
             }
-            if (dt == IR_PRED) {  // to a bool: anything but 0 is true
+            if (dt == IR_PRED) {
                 struct ir_val *ne = op2(IR_CMP, IR_PRED, r, konst(r->type, 0));
                 ne->aux = IR_NE;
                 r = ne;
@@ -4821,7 +4639,6 @@ static void call(LLVMValueRef in)
         if (n > 1)
             airc_fail("unsupported intrinsic %s", name);
     }
-    // what's left is maths on lanes, which takes no pointer and has a result
     for (int i = 0; i < LLVMGetNumOperands(in) - 1; i++)
         if (is_ptr(LLVMTypeOf(LLVMGetOperand(in, i))))
             n = 0;
@@ -4843,10 +4660,8 @@ static void call(LLVMValueRef in)
     }
 }
 
-// An alloca indexed only by constants is a set of variables, one per lane offset. A store sets a variable's value
-// in the current block; a load reads the block's own last store, or else the value on entry to the block, which
-// waits as an input-less phi at the block's head until the whole function is converted and every block's
-// predecessors are known (resolve_private).
+// A constant-indexed alloca is one variable per lane offset; a load before any store in its block gets an
+// input-less phi that resolve_private fills once every block's predecessors are known.
 static struct entry *g_defs[1 << HASH_BITS], *g_entry_vals[1 << HASH_BITS];
 struct private_read {
     struct ir_block *block;
@@ -4856,8 +4671,8 @@ struct private_read {
 };
 static struct private_read *g_private_reads;
 
-// Pointers kept in private memory (MPS packs its buffers into structs on the stack): one per variable, as the one
-// stored there, in whichever block. A variable given different pointers in different blocks isn't followed.
+// MPS packs its buffers into structs on the stack; a variable given different pointers in different blocks isn't
+// followed.
 struct private_ptr {
     unsigned var;
     struct ptr p;
@@ -4872,7 +4687,6 @@ static int same_ptr(struct ptr a, struct ptr b)
            a.count == b.count;
 }
 
-// the variable a pointer kept in private or local memory goes in: local memory's by its offset
 static unsigned pointer_var(struct ptr p)
 {
     return p.space == SP_LOCAL ? 0x80000000u | (unsigned)p.off : private_var(p, 0);
@@ -4896,7 +4710,6 @@ static void private_write(unsigned var, struct ir_val *v)
     insert(g_defs, g_cur, var, 0)->v = v;
 }
 
-// a constant global's lanes as the values its variables hold where the shader starts
 static void const_table(struct ptr p, LLVMValueRef init)
 {
     LLVMTypeRef t = LLVMTypeOf(init);
@@ -4904,7 +4717,7 @@ static void const_table(struct ptr p, LLVMValueRef init)
         insert(g_defs, g_prologue, private_var(p, lane_offset(t, l)), 0)->v = const_lane(init, l);
 }
 
-// a scalar constant of type t as memory holds it, at at; undefined is left as it is (0)
+// undefined stays 0
 static void put_scalar(unsigned char *at, LLVMValueRef c, LLVMTypeRef t)
 {
     if (LLVMIsAConstantInt(c)) {
@@ -4955,7 +4768,7 @@ static void put_const(unsigned char *at, LLVMValueRef c)
 
 static unsigned hidden_arg(enum nvk_arg_kind kind, unsigned index, unsigned *off);
 
-// the address of constant table g's copy in the kernel's data, which it's added to the first time
+// adds g to the kernel's data the first time
 static struct ir_val *table_base(LLVMValueRef g)
 {
     struct table *t = g_tables;
@@ -4964,7 +4777,7 @@ static struct ir_val *table_base(LLVMValueRef g)
     if (t)
         return t->base;
     unsigned a, bytes = layout(LLVMGlobalGetValueType(g), &a);
-    unsigned at = (g_info->data_size + 15) & ~15u;  // as aligned as any access to it needs
+    unsigned at = (g_info->data_size + 15) & ~15u;  // enough for any access
     if (bytes > (16u << 20) - at)
         airc_fail("more than 16 MB of constant tables");
     if (at + bytes > g_data_cap) {
@@ -4988,15 +4801,14 @@ static struct ir_val *table_base(LLVMValueRef g)
     return t->base;
 }
 
-// A pointer into a constant table, for what the table's variables can't do (an index into more elements than
-// selects pick from, an address taken), as one into its copy in memory; any other as it is.
+// for what a table's variables can't do, such as a big variable index or a taken address
 static struct ptr in_memory(struct ptr p)
 {
     if (p.space != SP_PRIVATE || !p.table)
         return p;
     struct ptr q = { .space = SP_GLOBAL, .base = table_base(p.table), .off = p.off, .bytes = p.bytes,
                      .table = p.table };
-    if (p.base) {  // already indexed: like add_index, kept inside the table
+    if (p.base) {  // clamped inside the table, as add_index does
         struct ir_val *i = op2(IR_MIN, IR_I32, p.base, konst(IR_I32, p.count - 1));
         i->aux = 0;
         q.base = op2(IR_ADDR, IR_I64, q.base, i);
@@ -5025,7 +4837,6 @@ static struct ir_val *private_read(unsigned var, enum ir_type t)
 
 static struct ir_val *private_entry(struct ir_block *b, unsigned var, enum ir_type t);
 
-// a variable's value where b ends: its last store there, or what it held coming in
 static struct ir_val *private_exit(struct ir_block *b, unsigned var, enum ir_type t)
 {
     struct entry *e = find(g_defs, b, var, 0);
@@ -5040,8 +4851,7 @@ static int is_sub_entry(const struct ir_block *b)
     return 0;
 }
 
-// one input per predecessor (a lone one is folded away later); none at all: never stored, undefined, but for a
-// constant table read first in a subroutine
+// no predecessors means undefined, except a constant table read first in a subroutine
 static void private_fill(struct ir_block *b, unsigned var, struct ir_val *phi)
 {
     if (!b->npreds) {
@@ -5055,7 +4865,7 @@ static void private_fill(struct ir_block *b, unsigned var, struct ir_val *phi)
         return;
     }
     phi->src = ir_alloc(b->npreds * sizeof(*phi->src));
-    phi->nsrc = b->npreds;  // before the recursion: a loop comes back to this phi
+    phi->nsrc = b->npreds;  // before recursing, as a loop comes back to this phi
     for (unsigned k = 0; k < b->npreds; k++)
         phi->src[k] = private_exit(b->preds[k], var, phi->type);
 }
@@ -5079,7 +4889,6 @@ static void resolve_private(void)
         private_entry(r->block, r->var, r->phi->type);
 }
 
-// element k's variable at a variable index's i == k
 static struct ir_val *index_is(struct ptr p, unsigned k)
 {
     struct ir_val *eq = op2(IR_CMP, IR_PRED, p.base, konst(IR_I32, k));
@@ -5089,7 +4898,7 @@ static struct ir_val *index_is(struct ptr p, unsigned k)
 
 static struct ir_val *load_lane(struct ptr p, unsigned off, LLVMTypeRef st)
 {
-    if (p.space == SP_PRIVATE && p.base) {  // the indexed element out of all of them
+    if (p.space == SP_PRIVATE && p.base) {
         struct ir_val *r = private_read(private_var(p, off), ir_type_of(st));
         for (unsigned k = 1; k < p.count; k++)
             r = sel(index_is(p, k), private_read(private_var(p, off + k * p.stride), ir_type_of(st)), r);
@@ -5118,7 +4927,7 @@ static struct ir_val *load_lane(struct ptr p, unsigned off, LLVMTypeRef st)
     }
     v->imm = p.off + off;
     v->aux = (int)bytes;
-    if (flag)  // a bool is a byte in memory, its low bit the value
+    if (flag)  // a bool is a byte in memory
         return icmp(IR_NE, op2(IR_AND, IR_I32, v, konst(IR_I32, 1)), konst(IR_I32, 0));
     return v;
 }
@@ -5129,9 +4938,7 @@ static unsigned low_bit(int64_t x, unsigned cap)
     return !b || b > cap ? cap : (unsigned)b;
 }
 
-// What a global pointer's alignment is known to be: a buffer starts 16-byte aligned, and every index or offset on
-// the way keeps only what its step does. MPS indexes a float * and stores a float4 through it, declaring 16 bytes
-// of alignment Apple's GPUs don't need; a 128-bit STG on an address that isn't faults (Misaligned Address).
+// MPS declares 16-byte alignment on float * stores that Apple's GPUs don't need, and a misaligned 128-bit STG faults.
 static unsigned global_align(struct ptr p)
 {
     unsigned a = low_bit(p.off, 16);
@@ -5158,7 +4965,6 @@ static unsigned global_align(struct ptr p)
     return a;
 }
 
-// 2 or 4 lanes of 32 bits one after another, which one 64- or 128-bit access moves when aligned to its size
 static int wide_lanes(LLVMTypeRef t, unsigned align)
 {
     unsigned n = nlanes(t);
@@ -5172,8 +4978,7 @@ static int wide_lanes(LLVMTypeRef t, unsigned align)
     return 1;
 }
 
-// A vector of bytes or halfwords filling 4, 8 or 16 bytes (a uchar4, a ushort2, a half4), which one access of that
-// size moves when aligned to it: its size, or 0. A 3-lane one's slot has a lane of padding, which a load may read.
+// a 3-lane vector's slot has a lane of padding, which a load may read
 static unsigned packed_bytes(LLVMTypeRef t, unsigned align)
 {
     if (LLVMGetTypeKind(t) != LLVMVectorTypeKind)
@@ -5185,8 +4990,7 @@ static unsigned packed_bytes(LLVMTypeRef t, unsigned align)
     return size;
 }
 
-// The 32-bit value lane x is bits at.. of, as a packed load leaves its lanes; NULL if it isn't one. Only x's low
-// bits get stored, so a mask on the way doesn't matter.
+// the word a packed load's lane came from; only x's low bits get stored, so a mask on the way doesn't matter
 static struct ir_val *word_of(struct ir_val *x, unsigned at, unsigned bits)
 {
     if (x->op == IR_AND && x->src[1]->op == IR_CONST && x->src[1]->imm == (1u << bits) - 1)
@@ -5199,9 +5003,7 @@ static struct ir_val *word_of(struct ir_val *x, unsigned at, unsigned bits)
     return x->type == IR_I32 ? x : NULL;
 }
 
-// A pointer read from an array of them at an index known at run time (buffers or textures and samplers copied into
-// a local array): a select over those stored in it of the kind the first element holds. In local memory the index
-// is a byte offset from p.off, which any 8-byte slot to the alloca's end may be.
+// a select over the pointers stored in the array; in local memory the index is a byte offset from p.off
 static struct ptr picked_ptr(struct ptr p)
 {
     struct ptr q = { 0 };
@@ -5244,13 +5046,12 @@ static void load(LLVMValueRef in)
     while (LLVMIsAConstantExpr(g) && LLVMGetConstOpcode(g) == LLVMBitCast)
         g = LLVMGetOperand(g, 0);
     if (LLVMIsAGlobalVariable(g) && LLVMGetPointerAddressSpace(LLVMTypeOf(g)) == 2) {
-        // the static initialiser's globals, and the function constants it copies into them
         const char *name = LLVMGetValueName(g);
         for (unsigned l = 0; l < nlanes(t); l++) {
             struct ir_val *v = global_state(g, l);
             if (!v && name && strstr(name, ".MTL_FC_INIT_"))
                 v = function_constant(g, lane_type(t, l));
-            if (!v && LLVMGetInitializer(g))  // a constant that's just its initialiser (MPS's implicit attributes)
+            if (!v && LLVMGetInitializer(g))  // MPS's implicit attributes
                 v = const_lane(LLVMGetInitializer(g), l);
             if (!v)
                 airc_fail("read of constant global %s, which holds nothing known", name ? name : "?");
@@ -5271,14 +5072,13 @@ static void load(LLVMValueRef in)
         return;
     }
     if (is_ptr(t) && (p.space == SP_TEXTURE || p.space == SP_SAMPLER)) {
-        // an element of an array of textures or samplers: the slot that many after the array's first
         if (p.param)
             airc_fail("an array of textures or samplers passed to a subroutine");
         struct ptr q = { .space = p.space, .base = p.base, .slot = p.slot + (unsigned)(p.off / 8) };
         insert(g_ptrs, in, 0, g_scope)->p = q;
         return;
     }
-    if (is_ptr(t)) {  // a buffer's address, or a texture's or sampler's resource ID, from an argument buffer
+    if (is_ptr(t)) {  // from an argument buffer
         if (p.space != SP_GLOBAL || ptr_space(t) != SP_GLOBAL)
             airc_fail("loading a pointer from or to threadgroup or thread memory");
         struct ir_val *v = ir_add(g_cur, IR_LDG, IR_I64, 1);
@@ -5292,7 +5092,7 @@ static void load(LLVMValueRef in)
     load_value(in, p, LLVMGetAlignment(in));
 }
 
-// in's lanes from p, which is align-byte aligned as the code says (and as far again as global_align finds)
+// align is what the code declares; global_align checks it holds
 static void load_value(LLVMValueRef in, struct ptr p, unsigned align)
 {
     LLVMTypeRef t = LLVMTypeOf(in);
@@ -5310,7 +5110,7 @@ static void load_value(LLVMValueRef in, struct ptr p, unsigned align)
     }
     unsigned packed = p.space == SP_GLOBAL ? packed_bytes(t, align) : 0;
     if (packed && global_align(p) >= packed) {
-        // one load, its lanes shifted out of the words and cleared above their bits, as a U8 or U16 load leaves them
+        // lanes cleared above their bits, as a U8 or U16 load leaves them
         struct ir_val *v = ir_add(g_cur, IR_LDG, packed > 4 ? IR_VOID : IR_I32, 1), *words[4] = { v };
         v->src[0] = p.base;
         v->imm = p.off;
@@ -5357,8 +5157,7 @@ static void store_value(struct ptr p, LLVMTypeRef t, LLVMValueRef val, unsigned 
     unsigned packed = p.space == SP_GLOBAL ? packed_bytes(t, align) : 0;
     unsigned bits = packed ? 8 * scalar_bytes(lane_type(t, 0)) : 0;
     if (packed && nlanes(t) * bits == 8 * packed && global_align(p) >= packed) {
-        // the lanes packed into words and stored in one go; a 3-lane vector isn't, as that would write its padding.
-        // Masked, the lanes share no bit, so x * 2^at + word packs them as an IMAD each.
+        // not 3-lane vectors, which would write their padding; masked lanes share no bit, so an IMAD packs each
         struct ir_val *words[4] = { NULL }, *whole[4] = { NULL };
         for (unsigned l = 0; l < nlanes(t); l++) {
             unsigned at = l * bits % 32;
@@ -5368,7 +5167,7 @@ static void store_value(struct ptr p, LLVMTypeRef t, LLVMValueRef val, unsigned 
                 x = op2(IR_AND, IR_I32, x, konst(IR_I32, (1u << bits) - 1));
             *w = !*w ? x : op2(IR_ADD, IR_I32, op2(IR_MUL, IR_I32, x, konst(IR_I32, 1u << at)), *w);
         }
-        for (unsigned w = 0; w < packed / 4; w++)  // the lanes of a word loaded the same way: the word itself
+        for (unsigned w = 0; w < packed / 4; w++)  // lanes of a word loaded the same way store the word itself
             if (whole[w])
                 words[w] = whole[w];
         struct ir_val *s = ir_add(g_cur, IR_STG, IR_VOID, 1 + packed / 4);
@@ -5382,7 +5181,7 @@ static void store_value(struct ptr p, LLVMTypeRef t, LLVMValueRef val, unsigned 
     for (unsigned l = 0; l < nlanes(t); l++) {
         LLVMTypeRef st = lane_type(t, l);
         unsigned bytes = scalar_bytes(st);
-        if (p.space == SP_PRIVATE && p.base) {  // every element keeps its value but the indexed one
+        if (p.space == SP_PRIVATE && p.base) {
             for (unsigned k = 0; k < p.count; k++) {
                 unsigned var = private_var(p, lane_offset(t, l) + k * p.stride);
                 struct ir_val *old = private_read(var, ir_type_of(st));
@@ -5391,7 +5190,7 @@ static void store_value(struct ptr p, LLVMTypeRef t, LLVMValueRef val, unsigned 
             continue;
         }
         if (bytes == 8 && LLVMGetTypeKind(st) == LLVMIntegerTypeKind) {
-            // a 64-bit integer, which values keep the low word of: the high one where it's known, else 0
+            // values keep only the low word; the high one is 0 where unknown
             struct ir_val *words[2] = { get(val, l), high_or_zero(val, l) };
             for (unsigned w = 0; w < 2; w++) {
                 unsigned at = lane_offset(t, l) + 4 * w;
@@ -5427,7 +5226,7 @@ static void store_value(struct ptr p, LLVMTypeRef t, LLVMValueRef val, unsigned 
         } else if (p.space == SP_SHARED || p.space == SP_LOCAL) {
             struct ir_val *base = p.space == SP_LOCAL ? local_base(p, lane_offset(t, l) + bytes) : p.base;
             s = ir_add(g_cur, p.space == SP_SHARED ? IR_STS : IR_STL, IR_VOID, 2);
-            s->src[0] = base;  // may be NULL: address 0 plus the offset
+            s->src[0] = base;  // NULL for address 0
             s->src[1] = data;
         } else {
             airc_fail("store to a texture or sampler");
@@ -5447,13 +5246,13 @@ static void store(LLVMValueRef in)
     while (LLVMIsAConstantExpr(g) && LLVMGetConstOpcode(g) == LLVMBitCast)
         g = LLVMGetOperand(g, 0);
     if (LLVMIsAGlobalVariable(g) && LLVMGetPointerAddressSpace(LLVMTypeOf(g)) == 2) {
-        for (unsigned l = 0; l < nlanes(t); l++)  // the static initialiser filling a global
+        for (unsigned l = 0; l < nlanes(t); l++)  // the static initialiser
             insert(g_vals, g, l, 0)->v = get(val, l);
         return;
     }
     struct ptr p = ptr_of(addr);
     if (is_ptr(t) && (p.space == SP_PRIVATE || p.space == SP_LOCAL)) {
-        if (p.base)  // into an element picked at run time: only a load that never comes gets through
+        if (p.base)  // dropped, which holds only while nothing loads it back
             return;
         unsigned var = pointer_var(p);
         struct ptr q = LLVMIsUndef(val) || LLVMIsPoison(val) ? (struct ptr){ 0 } : ptr_of(val);
@@ -5468,11 +5267,11 @@ static void store(LLVMValueRef in)
         } else if (e->block == g_cur) {
             e->p = q;
         } else if (e->block && !same_ptr(e->p, q)) {
-            e->block = NULL;  // a different one on another path: not followed
+            e->block = NULL;  // a different one on another path isn't followed
         }
         return;
     }
-    if (is_ptr(t) && p.space == SP_GLOBAL && ptr_space(t) == SP_GLOBAL) {  // an address into device memory, as its words
+    if (is_ptr(t) && p.space == SP_GLOBAL && ptr_space(t) == SP_GLOBAL) {
         struct ir_val *lo, *hi;
         ptr_words(ptr_of(val), &lo, &hi);
         p = fit_offset(p);
@@ -5484,7 +5283,7 @@ static void store(LLVMValueRef in)
         s->aux = 8;
         return;
     }
-    // a wider integer loaded and stored again, as memcpy does it: its words copied, as values only keep the low one
+    // a wide integer copied memcpy-style goes word by word, as values keep only the low one
     LLVMTypeRef lane0 = nlanes(t) ? lane_type(t, 0) : t;
     if (LLVMGetTypeKind(lane0) == LLVMIntegerTypeKind && LLVMGetIntTypeWidth(lane0) > 32 && LLVMIsAInstruction(val) &&
         LLVMGetInstructionOpcode(val) == LLVMLoad) {
@@ -5511,7 +5310,7 @@ static void store(LLVMValueRef in)
     store_value(p, t, val, LLVMGetAlignment(in));
 }
 
-// the length of a memcpy or memset, which local memory's 4 KB a thread bounds well enough to write out
+// a thread's 4 KB of local memory bounds it well enough to unroll
 static unsigned mem_length(LLVMValueRef in)
 {
     LLVMValueRef len = LLVMGetOperand(in, 2);
@@ -5540,7 +5339,7 @@ static void mem_store(struct ptr p, unsigned off, struct ir_val *data, unsigned 
     s->aux = (int)bytes;
 }
 
-// words where both ends sit on one, read before any is written for a memmove's overlap
+// everything is read before anything is written, for a memmove's overlap
 static void mem_copy(LLVMValueRef in)
 {
     unsigned n = mem_length(in);
@@ -5571,7 +5370,6 @@ static void mem_set(LLVMValueRef in)
     }
 }
 
-// half h (its bits) into private memory or memory at p + off
 static void store_half(struct ptr p, unsigned off, struct ir_val *h)
 {
     if (p.space != SP_PRIVATE) {
@@ -5584,12 +5382,12 @@ static void store_half(struct ptr p, unsigned off, struct ir_val *h)
     }
 }
 
-// f as a half, rounded towards zero, +inf or -inf: the nearest one, a step back towards f where that went past it
+// round to nearest, then step back where that went past f
 static struct ir_val *half_directed(struct ir_val *f, const char *mode)
 {
     struct ir_val *h = op1(IR_F2H, IR_F16, f), *g = op1(IR_H2F, IR_F32, h);
     struct ir_val *neg = icmp(IR_NE, ibin(IR_AND, h, ik(0x8000)), ik(0));
-    struct ir_val *past, *away;  // whether to step, and whether that's away from zero (else towards it)
+    struct ir_val *past, *away;
     if (!strncmp(mode, "rtz", 3)) {
         past = fcmp(FCMP_OGT, absf(g), absf(f));
         away = konst(IR_PRED, 0);
@@ -5604,7 +5402,6 @@ static struct ir_val *half_directed(struct ir_val *f, const char *mode)
     return op2(IR_OR, IR_F16, sel(past, step, h), konst(IR_F16, 0));
 }
 
-// element i of the elements bytes apart from p
 static struct ptr element(struct ptr p, struct ir_val *i, unsigned bytes)
 {
     if (p.space == SP_GLOBAL) {
@@ -5617,9 +5414,7 @@ static struct ptr element(struct ptr p, struct ir_val *i, unsigned bytes)
     return p;
 }
 
-// OpenCL's async_work_group_copy and async_work_group_strided_copy (air.async_wg_[strided_]copy.<dst>.<src>, the
-// types p3v4i32 and so on), done there and then by the whole threadgroup, each thread an element in turn; the event
-// is a null one and waiting for it a barrier. The stride steps through the global side.
+// done synchronously by the whole threadgroup, so the event is null and waiting for it a barrier
 static void async_copy(LLVMValueRef in, const char *name)
 {
     int strided = LLVMGetNumOperands(in) == 6;  // dst, src, count, stride, event and the callee
@@ -5639,7 +5434,7 @@ static void async_copy(LLVMValueRef in, const char *name)
     ir_edge(start, head);
     g_cur = head;
     struct ir_val *i = ir_add(head, IR_PHI, IR_I32, 2);
-    ir_add(head, IR_CBR, IR_VOID, 1)->src[0] = icmp(IR_GE, i, n);  // the way out first, as fmod_precise has it
+    ir_add(head, IR_CBR, IR_VOID, 1)->src[0] = icmp(IR_GE, i, n);  // exit edge first, as in fmod_precise
     ir_edge(head, done);
     ir_edge(head, body);
     g_cur = body;
@@ -5658,21 +5453,18 @@ static void async_copy(LLVMValueRef in, const char *name)
     insert(g_ptrs, in, 0, g_scope)->p = (struct ptr){ .space = SP_SHARED };
 }
 
-// OpenCL's vloadN and vstoreN: N lanes one after another at p + offset N elements. vload_half / vstore_half take
-// halves in memory to and from float lanes, and vloada_half3 / vstorea_half3 step 4 elements; vstore_half rounds as
-// the .rtz/.rtp/.rtn after the address space says (air.vstore_half.global.rtz.v4f32), to nearest even without
-// one.
+// vloada_half3 and vstorea_half3 step 4 elements; vstore_half rounds to nearest even unless named .rtz/.rtp/.rtn
 static void vector_access(LLVMValueRef in, const char *name)
 {
     int load = name[5] == 'l';
-    const char *kind = name + (load ? 9 : 10);  // past air.vload / air.vstore
+    const char *kind = name + (load ? 9 : 10);
     int aligned = *kind == 'a', half = !strncmp(kind + aligned, "_half", 5);
     LLVMValueRef val = load ? in : LLVMGetOperand(in, 0);
     LLVMTypeRef t = LLVMTypeOf(val), et = lane_type(t, 0);
     unsigned n = nlanes(t), esz = half ? 2 : scalar_bytes(et);
     unsigned step = aligned && n == 3 ? 4 : n;
     struct ptr p = add_index(ptr_of(LLVMGetOperand(in, load ? 1 : 2)), LLVMGetOperand(in, load ? 0 : 1), step * esz, 0);
-    if (!half) {  // the code promises an element's alignment, so wider accesses go by what global_align finds
+    if (!half) {  // only an element's alignment is promised, so global_align decides wider accesses
         if (load)
             load_value(in, p, 16);
         else
@@ -5695,13 +5487,12 @@ static void vector_access(LLVMValueRef in, const char *name)
 }
 
 static const uint8_t g_icond[][2] = {
-    // LLVMIntPredicate from LLVMIntEQ: condition, signed
+    // indexed by LLVMIntPredicate from LLVMIntEQ
     { IR_EQ, 0 }, { IR_NE, 0 }, { IR_GT, 0 }, { IR_GE, 0 }, { IR_LT, 0 },
     { IR_LE, 0 }, { IR_GT, 1 }, { IR_GE, 1 }, { IR_LT, 1 }, { IR_LE, 1 },
 };
 
-// a 64-bit bitwise operation, sum, product or shift of lane `lane`, with both words where the high ones it needs
-// are known (MPS takes a struct of two floats apart with lshr i64 32); 0 if not
+// 0 where a needed high word isn't known; MPS takes a struct of two floats apart with lshr i64 32
 static int binary64(LLVMValueRef in, LLVMOpcode op, unsigned lane)
 {
     LLVMValueRef yv = LLVMGetOperand(in, 1);
@@ -5717,7 +5508,7 @@ static int binary64(LLVMValueRef in, LLVMOpcode op, unsigned lane)
             return 0;
         r = op == LLVMAdd ? add64(x, y) : op == LLVMSub ? sub64(x, y) : mul64(x, y);
     } else if (op == LLVMShl || op == LLVMLShr || op == LLVMAShr) {
-        // by a count in the low word's low 6 bits; a constant one, left past 32, doesn't need the high word
+        // a constant left shift of 32 or more doesn't need the high word
         struct ir_val *amount = y.lo;
         int constant = amount->op == IR_CONST;
         unsigned c = constant ? (unsigned)amount->imm & 63 : 0;
@@ -5733,8 +5524,7 @@ static int binary64(LLVMValueRef in, LLVMOpcode op, unsigned lane)
     return 1;
 }
 
-// a - b or a + b as one fused multiply-add when an operand is a product marked for contraction (the multiply stays
-// for any other use; dead code goes otherwise); NULL when neither is
+// the multiply stays for any other use, else dead code elimination drops it
 static struct ir_val *fuse_multiply(LLVMValueRef in, int sub, enum ir_type t, struct ir_val *a, struct ir_val *b)
 {
     LLVMValueRef x = LLVMGetOperand(in, 0), y = LLVMGetOperand(in, 1);
@@ -5767,16 +5557,15 @@ static void binary(LLVMValueRef in, LLVMOpcode op, unsigned n)
         struct ir_val *a = get(LLVMGetOperand(in, 0), l), *b = get(LLVMGetOperand(in, 1), l);
         enum ir_type t = a->type;
         if (ir >= IR_FADD && ir <= IR_FMUL && LLVMGetTypeKind(lane_type(LLVMTypeOf(in), l)) == LLVMBFloatTypeKind) {
-            // widened, computed as floats and rounded back to bfloat, as its conversions are
             set(in, l, float_to_bfloat(op2(ir, IR_F32, bfloat_to_float(a), bfloat_to_float(b))));
             continue;
         }
-        if (t == IR_PRED) {  // i1 logic
+        if (t == IR_PRED) {
             if (op == LLVMAnd || op == LLVMOr) {
                 set(in, l, op2(op == LLVMAnd ? IR_PAND : IR_POR, IR_PRED, a, b));
                 continue;
             }
-            if (op == LLVMXor) {  // xor with true is not; in general a != b
+            if (op == LLVMXor) {
                 struct ir_val *c = op2(IR_CMP, IR_PRED, sel(a, konst(IR_I32, 1), konst(IR_I32, 0)),
                                        sel(b, konst(IR_I32, 1), konst(IR_I32, 0)));
                 c->aux = IR_NE;
@@ -5785,9 +5574,9 @@ static void binary(LLVMValueRef in, LLVMOpcode op, unsigned n)
             }
             airc_fail("unsupported i1 arithmetic %d", op);
         }
-        if (op == LLVMAShr || op == LLVMLShr)  // a narrow lane keeps only its low bits; the shift needs the rest
+        if (op == LLVMAShr || op == LLVMLShr)  // a narrow lane's junk upper bits would shift in
             a = int_extend(a, 8 * scalar_bytes(lane_type(LLVMTypeOf(in), l)), op == LLVMAShr);
-        // Metal's fast-math sums of products are fused, as Apple's GPUs do: x * y + c as one rounding
+        // Apple's GPUs fuse Metal's fast-math sums of products
         if ((op == LLVMFAdd || op == LLVMFSub) && (t == IR_F32 || t == IR_F16) && can_contract(in)) {
             struct ir_val *fused = fuse_multiply(in, op == LLVMFSub, t, a, b);
             if (fused) {
@@ -5810,8 +5599,7 @@ static void fdiv(LLVMValueRef in, unsigned n)
         struct ir_val *a = get(LLVMGetOperand(in, 0), l), *b = get(LLVMGetOperand(in, 1), l);
         enum ir_type t = a->type;
         if (t == IR_F32 && b->op == IR_CONST) {
-            // a constant divisor's reciprocal is rounded once, where MUFU.RCP's error can tip x / 62 off an exact
-            // half
+            // MUFU.RCP's error can tip x / 62 off an exact half
             float d, r;
             uint32_t bits = (uint32_t)b->imm;
             memcpy(&d, &bits, 4);
@@ -5822,7 +5610,7 @@ static void fdiv(LLVMValueRef in, unsigned n)
                 continue;
             }
         }
-        // a / fast::sqrt(x): one MUFU.RSQ instead of MUFU.SQRT and MUFU.RCP after it, its error no larger
+        // one MUFU.RSQ for a / fast::sqrt(x), no less accurate than SQRT then RCP
         if (t == IR_F32 && b->op == IR_MUFU && b->aux == MUFU_SQRT && can_contract(in)) {
             set(in, l, op2(IR_FMUL, IR_F32, a, mufu(MUFU_RSQ, b->src[0])));
             continue;
@@ -5831,8 +5619,7 @@ static void fdiv(LLVMValueRef in, unsigned n)
     }
 }
 
-// n / d (or n % d), unsigned, as NIR lowers it: the divisor's float reciprocal scaled to 32 bits and refined with a
-// multiply-high, a quotient estimate from it, then two corrections
+// as NIR lowers it
 static struct ir_val *udivmod(struct ir_val *n, struct ir_val *d, int rem)
 {
     struct ir_val *rcp = op1(IR_F2I, IR_I32,
@@ -5849,14 +5636,13 @@ static struct ir_val *udivmod(struct ir_val *n, struct ir_val *d, int rem)
     }
     if (rem)
         return r;
-    // as Apple's GPUs divide by 0: all ones, but 0 for 0 / 0 (the estimate above would make it n + 1)
+    // Apple's GPUs give all ones for n / 0, but 0 for 0 / 0
     struct ir_val *zero = konst(IR_I32, 0);
     struct ir_val *ones = sel(icmp(IR_NE, n, zero), konst(IR_I32, -1), zero);
     return sel(icmp(IR_EQ, d, zero), ones, q);
 }
 
-// n / d or n % d for a power of two d over 1 by shifts and masks; a signed one rounds towards zero, d - 1 added to a
-// negative n first
+// a negative n is biased by d - 1 so signed division rounds towards zero
 static struct ir_val *divmod_pow2(struct ir_val *n, uint32_t d, int is_signed, int rem)
 {
     int k = __builtin_ctz(d);
@@ -5866,8 +5652,7 @@ static struct ir_val *divmod_pow2(struct ir_val *n, uint32_t d, int is_signed, i
     return rem ? ibin(IR_SUB, n, ibin(IR_AND, biased, ik(~(d - 1)))) : ibin(IR_SAR, biased, ik(k));
 }
 
-// LLVM's udiv, sdiv, urem and srem. Signed ones divide the magnitudes: the quotient is negated when the signs
-// differ, the remainder takes the dividend's sign. Narrower integers are widened first (their high bits are junk).
+// narrower integers are extended first, as their high bits are junk
 static void idiv(LLVMValueRef in, LLVMOpcode op, unsigned n)
 {
     int is_signed = op == LLVMSDiv || op == LLVMSRem, rem = op == LLVMURem || op == LLVMSRem;
@@ -5906,8 +5691,7 @@ static void idiv(LLVMValueRef in, LLVMOpcode op, unsigned n)
     }
 }
 
-// a bitcast between vectors of different lane counts (<4 x half> to <2 x i32>, <4 x i8> to i32...): the source
-// lanes packed into 32-bit words, the result's lanes sliced out of them
+// between different lane counts, through 32-bit words
 static void bitcast_lanes(LLVMValueRef in)
 {
     LLVMValueRef src = LLVMGetOperand(in, 0);
@@ -5917,7 +5701,7 @@ static void bitcast_lanes(LLVMValueRef in)
     for (unsigned l = 0; l < nlanes(st); l++) {
         LLVMTypeRef lt = lane_type(st, l);
         unsigned w = 8 * scalar_bytes(lt);
-        int wide = w == 64 && LLVMGetTypeKind(lt) == LLVMIntegerTypeKind;  // a pair of words: the low one, the high one
+        int wide = w == 64 && LLVMGetTypeKind(lt) == LLVMIntegerTypeKind;
         if ((w > 32 && !wide) || (bit % 32) + w > 32 + 32 * wide || bit / 32 + wide >= 8 || (wide && bit % 32))
             airc_fail("bitcast of %u-bit lanes", w);
         struct ir_val *v = op2(IR_OR, IR_I32, get(src, l), konst(IR_I32, 0));
@@ -5954,13 +5738,12 @@ static void bitcast_lanes(LLVMValueRef in)
     }
 }
 
-// a bfloat is the top 16 bits of a float
 static struct ir_val *bfloat_to_float(struct ir_val *x)
 {
     return op2(IR_OR, IR_F32, op2(IR_SHL, IR_I32, x, konst(IR_I32, 16)), konst(IR_F32, 0));
 }
 
-// rounded to nearest even, a NaN kept a (quiet) NaN, and a value past the largest bfloat rounding up to inf
+// a NaN stays a quiet NaN rather than rounding to inf
 static struct ir_val *float_to_bfloat(struct ir_val *x)
 {
     struct ir_val *bits = op2(IR_OR, IR_I32, x, konst(IR_I32, 0));
@@ -6003,7 +5786,7 @@ static void cast(LLVMValueRef in, LLVMOpcode op, unsigned n)
         switch (op) {
         case LLVMZExt:
         case LLVMSExt:
-            if (s->type == IR_PRED)  // true is 1, or -1 sign-extended
+            if (s->type == IR_PRED)
                 r = sel(s, konst(IR_I32, op == LLVMSExt ? -1 : 1), konst(IR_I32, 0));
             else if (op == LLVMSExt && scalar_bytes(lane_type(LLVMTypeOf(LLVMGetOperand(in, 0)), l)) < 4) {
                 int shift = 32 - 8 * (int)scalar_bytes(lane_type(LLVMTypeOf(LLVMGetOperand(in, 0)), l));
@@ -6022,10 +5805,10 @@ static void cast(LLVMValueRef in, LLVMOpcode op, unsigned n)
                 r = op2(IR_CMP, IR_PRED, op2(IR_AND, IR_I32, s, konst(IR_I32, 1)), konst(IR_I32, 0));
                 r->aux = IR_NE;
             } else {
-                r = s;  // narrower integers keep their low bits; users mask what they need
+                r = s;  // users mask what they need
             }
             break;
-        case LLVMBitCast:  // the same bits; a change of type keeps a value of its own so widen() sees halves
+        case LLVMBitCast:  // a new value on a type change, so widen() sees halves
             r = s->type == t ? s : op2(IR_OR, t, s, konst(t, 0));
             break;
         case LLVMFPExt:
@@ -6036,7 +5819,6 @@ static void cast(LLVMValueRef in, LLVMOpcode op, unsigned n)
             break;
         case LLVMSIToFP:
         case LLVMUIToFP:
-            // a narrow lane keeps only its low bits
             s = int_extend(s, 8 * scalar_bytes(lane_type(LLVMTypeOf(LLVMGetOperand(in, 0)), l)), op == LLVMSIToFP);
             r = op1(IR_I2F, IR_F32, s->type == IR_PRED ? sel(s, konst(IR_I32, 1), konst(IR_I32, 0)) : s);
             r->aux = op == LLVMSIToFP;
@@ -6054,7 +5836,6 @@ static void cast(LLVMValueRef in, LLVMOpcode op, unsigned n)
     }
 }
 
-// the words of a pointer's value (ptr_value): a global one's two, a shared or local one's offset and 0
 static void ptr_words(struct ptr p, struct ir_val **lo, struct ir_val **hi)
 {
     struct ir_val *v = ptr_value(p);
@@ -6072,7 +5853,6 @@ static void ptr_words(struct ptr p, struct ir_val **lo, struct ir_val **hi)
     }
 }
 
-// two pointers compared as the unsigned addresses they are
 static struct ir_val *compare_pointers(LLVMValueRef in)
 {
     struct ptr a = ptr_of(LLVMGetOperand(in, 0)), b = ptr_of(LLVMGetOperand(in, 1));
@@ -6087,13 +5867,11 @@ static struct ir_val *compare_pointers(LLVMValueRef in)
         return op2(IR_PAND, IR_PRED, lo, hi_eq);
     if (cond == IR_NE)
         return op2(IR_POR, IR_PRED, lo, op1(IR_PNOT, IR_PRED, hi_eq));
-    // the high words decide unless they're equal, where the low ones do
     struct ir_val *hi = icmp(cond == IR_LE ? IR_LT : cond == IR_GE ? IR_GT : cond, ahi, bhi);
     return op2(IR_POR, IR_PRED, hi, op2(IR_PAND, IR_PRED, hi_eq, lo));
 }
 
-// a 64-bit integer comparison of lane `lane` where both high words are known: the high words decide unless they're
-// equal, and then the low ones do, as unsigned whatever the predicate
+// the low words compare unsigned whatever the predicate
 static int compare64(LLVMValueRef in, unsigned lane)
 {
     struct pair64 x, y;
@@ -6144,7 +5922,6 @@ static void compare(LLVMValueRef in, unsigned n)
     }
 }
 
-// lanes [first, first + count) of an aggregate value, as LLVM's extractvalue/insertvalue name them
 static unsigned member_lane(LLVMTypeRef t, unsigned idx)
 {
     unsigned first = 0;
@@ -6159,9 +5936,7 @@ static LLVMTypeRef member_type(LLVMTypeRef t, unsigned idx)
     return LLVMGetTypeKind(t) == LLVMStructTypeKind ? LLVMStructGetTypeAtIndex(t, idx) : LLVMGetElementType(t);
 }
 
-// control point i of a post-tessellation vertex function's patch, (i, patch): each member of the struct it
-// returns is the generic attribute of its location, of the patch's input vertex i. A kernel's (OpenGL's
-// tessellation control stage) is its stage input at stage-in grid position i, the thread's own y.
+// a kernel's, as OpenGL's tessellation control stage, come from its stage input at (i, the thread's y)
 static void control_point(LLVMValueRef call)
 {
     struct ir_val *i = get(LLVMGetOperand(call, 0), 0), *vtx = NULL;
@@ -6208,32 +5983,31 @@ static struct ir_block **blocks_of(LLVMBasicBlockRef bb)
     return e->blocks;
 }
 
-// returns of an inlined function: where each comes from, and what it returns
 struct ret {
     struct ir_block *from;
     struct ir_val **vals;
-    struct ptr *ptrs;  // the pointer lanes'
-    struct ir_val **highs;  // the 64-bit lanes' high words
+    struct ptr *ptrs;
+    struct ir_val **highs;
     struct ret *next;
 };
 static struct ret *g_rets;
-static struct ir_block *g_cont;  // where an inlined function's returns go, NULL in a subroutine's own body
+static struct ir_block *g_cont;  // NULL in a subroutine's own body
 static LLVMTypeRef g_ret_type;
 
 static void emit_outputs(LLVMValueRef ret);
 static void sub_return(LLVMValueRef ret);
 
-// a phi waiting for its incoming values, which may come from blocks not converted yet
+// incoming values may come from blocks not converted yet
 struct pending_phi {
     LLVMValueRef phi;
-    int pointer;  // one lane, the pointer's value (ptr_value)
+    int pointer;  // one lane, the ptr_value
     unsigned scope;
     struct ir_val **lanes;
-    struct ir_val **highs;  // the high words of its 64-bit lanes, NULL for the others
+    struct ir_val **highs;
     struct pending_phi *next;
 };
 static struct pending_phi *g_phis;
-static LLVMBasicBlockRef g_bb;  // the block being converted
+static LLVMBasicBlockRef g_bb;
 
 static void postorder(LLVMBasicBlockRef b, LLVMBasicBlockRef *seen, unsigned *nseen, LLVMBasicBlockRef *out,
                       unsigned *nout, unsigned cap)
@@ -6293,7 +6067,7 @@ static void terminator(LLVMValueRef in, LLVMOpcode op)
         ir_edge(b, blocks_of(LLVMGetSuccessor(in, 1))[0]);
         break;
     }
-    case LLVMSwitch: {  // a chain of compares; successor 0 the default
+    case LLVMSwitch: {  // successor 0 is the default
         struct ir_val *v = get(LLVMGetOperand(in, 0), 0);
         unsigned ncases = LLVMGetNumSuccessors(in) - 1;
         for (unsigned i = 0; i < ncases; i++) {
@@ -6319,7 +6093,7 @@ static void terminator(LLVMValueRef in, LLVMOpcode op)
     }
 }
 
-// Convert fn's body in the current scope, into fresh blocks; the caller has made g_cur branch to its entry.
+// the caller branches to the returned entry
 static struct ir_block *body(LLVMValueRef fn)
 {
     LLVMValueRef outer_fn = g_body_fn;
@@ -6335,7 +6109,7 @@ static struct ir_block *body(LLVMValueRef fn)
     struct ir_block *entry = blocks_of(LLVMGetFirstBasicBlock(fn))[0];
     struct pending_phi *outer = g_phis;
     g_phis = NULL;
-    while (npost) {  // reverse postorder: a block's dominators come first
+    while (npost) {  // reverse postorder, so a block's dominators come first
         LLVMBasicBlockRef bb = post[--npost];
         struct ir_block **bl = blocks_of(bb);
         g_cur = bl[0];
@@ -6343,12 +6117,11 @@ static struct ir_block *body(LLVMValueRef fn)
             g_bb = bb;  // an inlined call converts other blocks on the way
             instruction(in);
         }
-        blocks_of(bb)[1] = g_cur;  // calls inlined on the way may have moved the end elsewhere
+        blocks_of(bb)[1] = g_cur;  // inlined calls may have moved the end
         insert(g_origins, g_cur, 0, 0)->bb = bb;
         (void)bl;
     }
-    // every phi's incoming values in its block's predecessor order: the IR block that ends each LLVM
-    // predecessor is the tail recorded for it
+    // matched to predecessors through the tail IR block recorded for each LLVM block
     for (struct pending_phi *p = g_phis; p; p = p->next) {
         unsigned saved = g_scope;
         g_scope = p->scope;
@@ -6360,7 +6133,7 @@ static struct ir_block *body(LLVMValueRef fn)
             for (unsigned i = 0; i < LLVMCountIncoming(p->phi) && !found; i++)
                 if (origin && origin->bb == LLVMGetIncomingBlock(p->phi, i)) {
                     struct ir_block *saved_cur = g_cur;
-                    g_cur = b->preds[k];  // a constant made for the edge lives in the prologue anyway
+                    g_cur = b->preds[k];  // constants for the edge go in the prologue anyway
                     for (unsigned l = 0; l < n; l++) {
                         if (p->lanes[l]->nsrc != b->npreds) {
                             p->lanes[l]->nsrc = b->npreds;
@@ -6394,7 +6167,7 @@ static struct ir_block *body(LLVMValueRef fn)
         }
         g_scope = saved;
     }
-    note_picked_uses();  // a subroutine's calls take its parameters' uses as soon as its body is done
+    note_picked_uses();
     g_phis = outer;
     free(seen);
     free(post);
@@ -6407,11 +6180,10 @@ static void inline_call(LLVMValueRef call, LLVMValueRef fn)
     if (g_depth == MAX_INLINE_DEPTH)
         airc_fail("calls nest deeper than %d", MAX_INLINE_DEPTH);
     unsigned caller = g_scope, callee = ++g_next_scope;
-    // the callee's parameters are the call's arguments, lanes and pointers alike
     for (unsigned i = 0; i < LLVMCountParams(fn); i++) {
         LLVMValueRef p = LLVMGetParam(fn, i), a = LLVMGetOperand(call, i);
         if (is_ptr(LLVMTypeOf(p))) {
-            if (LLVMIsUndef(a) || LLVMIsPoison(a))  // a resource the callee doesn't use; any use fails
+            if (LLVMIsUndef(a) || LLVMIsPoison(a))  // unused by the callee, or any use fails
                 continue;
             struct ptr q = ptr_of(a);
             insert(g_ptrs, p, 0, callee)->p = q;
@@ -6439,10 +6211,9 @@ static void inline_call(LLVMValueRef call, LLVMValueRef fn)
     g_scope = caller;
     ir_add(from, IR_BR, IR_VOID, 0);
     ir_edge(from, entry);
-    // the returned lanes: straight through from a single return, else one phi per lane in cont
     unsigned n = nlanes(g_ret_type);
     for (unsigned l = 0; l < n; l++) {
-        if (lane_is_ptr(g_ret_type, l)) {  // the same pointer from every return, or a phi of global ones
+        if (lane_is_ptr(g_ret_type, l)) {
             struct ptr q = g_rets->ptrs[l];
             for (struct ret *r = g_rets->next; r; r = r->next)
                 if (memcmp(&r->ptrs[l], &q, sizeof(q)))
@@ -6476,32 +6247,30 @@ static void inline_call(LLVMValueRef call, LLVMValueRef fn)
     g_cur = cont;
 }
 
-// A noinline function becomes a subroutine: its body converted once, each call passing the arguments in and the
-// results out. A pointer goes as its address (device, constant or threadgroup memory) or a texture's or sampler's
-// handle; an alloca's variables go in as values and come back out with the results. A call that can't pass its
-// arguments the way the first one did is inlined.
+// A noinline function becomes a subroutine; an alloca's variables go in as values and come back with the results,
+// and a call that can't pass its arguments as the first one did is inlined.
 
 enum pass { PASS_LANES, PASS_ADDRESS, PASS_HANDLE, PASS_PRIVATE, PASS_NONE };
 
 struct sub_param {
     enum pass how;
-    enum space space;   // what an address points into, or what a handle is of
+    enum space space;
     LLVMTypeRef type;   // the alloca whose variables go in and out
-    unsigned uses;      // a handle's USE_* in the body, a bit each
+    unsigned uses;      // USE_* bits
 };
 
 #define SUB_MAX_PARAMS 16
-#define SUB_MAX_SLOTS 32  // registers of arguments, and of results
+#define SUB_MAX_SLOTS 32  // argument registers, and result registers
 
 struct sub {
     LLVMValueRef fn;
-    int index;  // in g_f->subs
+    int index;
     int converting;
     struct sub_param params[SUB_MAX_PARAMS];
     struct sub *next;
 };
-static struct sub *g_subs, *g_sub;  // g_sub: the one whose body is being converted
-static int g_calls;                 // noinline functions become subroutines (else they're inlined like the rest)
+static struct sub *g_subs, *g_sub;  // g_sub's body is being converted
+static int g_calls;                 // else noinline functions are inlined too
 
 static void note_use(struct ptr p, int use)
 {
@@ -6517,8 +6286,7 @@ static void note_use(struct ptr p, int use)
         g_info->level_textures |= 1u << p.slot;
 }
 
-// A phi or select of textures or samplers picks a handle like a subroutine's parameter: what its uses need goes to
-// each texture or sampler it picks from, once they are all known.
+// A phi or select of textures or samplers acts like a subroutine parameter, passing its uses on to what it picks from.
 struct picked {
     struct sub_param *param;
     struct ptr from;
@@ -6542,7 +6310,7 @@ static void picked_from(struct sub_param *param, struct ptr from)
     g_picked = p;
 }
 
-// until nothing changes: one picked from another picks the uses up after it
+// iterates, as picks can chain
 static void note_picked_uses(void)
 {
     for (int changed = 1; changed;) {
@@ -6573,8 +6341,7 @@ static int has_ptr_lane(LLVMTypeRef t)
     return 0;
 }
 
-// a pointer, which private memory doesn't hold as a value, or a 64-bit integer, which it holds as two words: an
-// alloca with one can't go in and out of a subroutine a lane at a time
+// private memory holds no pointer values and 64-bit integers as two words, so these can't pass a lane at a time
 static int has_wide_lane(LLVMTypeRef t)
 {
     for (unsigned l = 0; l < nlanes(t); l++)
@@ -6583,7 +6350,6 @@ static int has_wide_lane(LLVMTypeRef t)
     return 0;
 }
 
-// how a call passes argument a for parameter p: 0 when it can't
 static int pass_of(LLVMValueRef p, LLVMValueRef a, struct sub_param *how)
 {
     memset(how, 0, sizeof(*how));
@@ -6607,7 +6373,7 @@ static int pass_of(LLVMValueRef p, LLVMValueRef a, struct sub_param *how)
     case SP_SAMPLER:
         how->how = PASS_HANDLE;
         return 1;
-    case SP_PRIVATE:  // the whole of an alloca, its variables at fixed offsets
+    case SP_PRIVATE:  // only a whole alloca
         if (q.base || q.off || !LLVMIsAInstruction(r) || LLVMGetInstructionOpcode(r) != LLVMAlloca)
             return 0;
         how->how = PASS_PRIVATE;
@@ -6618,7 +6384,6 @@ static int pass_of(LLVMValueRef p, LLVMValueRef a, struct sub_param *how)
     }
 }
 
-// registers an argument or a result passed this way takes
 static unsigned pass_slots(const struct sub_param *how)
 {
     switch (how->how) {
@@ -6689,7 +6454,7 @@ static struct sub *make_sub(LLVMValueRef fn, const struct sub_param *how, LLVMTy
                 private_write(private_var(q, lane_offset(how[i].type, l)),
                               param_value(ir_type_of(lane_type(how[i].type, l)), &slot));
             break;
-        case PASS_NONE:  // a resource the body doesn't use; any use fails
+        case PASS_NONE:  // unused by the body, or any use fails
             break;
         }
     }
@@ -6709,7 +6474,7 @@ static struct sub *make_sub(LLVMValueRef fn, const struct sub_param *how, LLVMTy
     return s;
 }
 
-// a subroutine's return: its results, then the variables of the allocas it was given
+// the results, then the variables of the allocas it was given
 static void sub_return(LLVMValueRef in)
 {
     struct ir_val *src[SUB_MAX_SLOTS];
@@ -6728,8 +6493,7 @@ static void sub_return(LLVMValueRef in)
     memcpy(r->src, src, n * sizeof(*src));
 }
 
-// whether a call passing its arguments as how has them fits s: one passing nothing where s takes an address or a
-// handle passes 0
+// nothing passed where s takes an address or a handle passes 0
 static int fits(const struct sub *s, const struct sub_param *how, unsigned np)
 {
     for (unsigned i = 0; i < np; i++) {
@@ -6798,7 +6562,6 @@ static int call_sub(LLVMValueRef call, LLVMValueRef fn)
     memcpy(c->src, args, n * sizeof(*args));
     c->imm = s->index;
     c->aux = (int)nresults;
-    // the results in the order the return has them, a register each
     unsigned k = 0;
     for (unsigned l = 0; l < nlanes(rt); l++, k++) {
         struct ir_val *r = op1(IR_PROJ, ir_type_of(lane_type(rt, l)), c);
@@ -6902,8 +6665,8 @@ static void instruction(LLVMValueRef in)
     case LLVMFPToSI:
     case LLVMFPToUI:
         if (op == LLVMFPExt && LLVMGetTypeKind(lane_type(t, 0)) == LLVMDoubleTypeKind)
-            break;  // a float promoted for printf, which reads none; any other use fails in get
-        if (is_ptr(t))  // a pointer cast: the same pointer
+            break;  // promoted for printf, which reads none; any other use fails in get
+        if (is_ptr(t))
             insert(g_ptrs, in, 0, g_scope)->p = ptr_of(LLVMGetOperand(in, 0));
         else
             cast(in, op, n);
@@ -6911,7 +6674,7 @@ static void instruction(LLVMValueRef in)
     case LLVMAddrSpaceCast:
         insert(g_ptrs, in, 0, g_scope)->p = ptr_of(LLVMGetOperand(in, 0));
         break;
-    case LLVMPtrToInt: {  // the address's words, or a shared or local pointer's offset
+    case LLVMPtrToInt: {
         struct ir_val *lo, *hi;
         ptr_words(ptr_of(LLVMGetOperand(in, 0)), &lo, &hi);
         set(in, 0, lo);
@@ -6930,7 +6693,7 @@ static void instruction(LLVMValueRef in)
             if (a.space != b.space)
                 airc_fail("a select of pointers into different memory");
             struct ptr q = { .space = a.space, .base = sel(get(c, 0), ptr_value(a), ptr_value(b)),
-                             .slot = a.slot > b.slot ? a.slot : b.slot };  // local: the further alloca's end
+                             .slot = a.slot > b.slot ? a.slot : b.slot };  // the further local alloca's end
             if (a.space == SP_TEXTURE || a.space == SP_SAMPLER) {
                 q.param = picker(a.space);
                 picked_from(q.param, a);
@@ -6952,7 +6715,7 @@ static void instruction(LLVMValueRef in)
     }
     case LLVMGetElementPtr:
     case LLVMAlloca:
-        ptr_of(in);  // pointers are made where they're used; keep any error close to its cause
+        ptr_of(in);  // made where used, but this keeps errors close to their cause
         break;
     case LLVMLoad:
         load(in);
@@ -6963,7 +6726,7 @@ static void instruction(LLVMValueRef in)
     case LLVMCall:
         call(in);
         break;
-    case LLVMExtractElement: {  // a variable index picks its lane with a chain of selects
+    case LLVMExtractElement: {
         LLVMValueRef vec = LLVMGetOperand(in, 0), idx = LLVMGetOperand(in, 1);
         int wide = is_i64(t);
         if (LLVMIsAConstantInt(idx)) {
@@ -7061,12 +6824,11 @@ static void instruction(LLVMValueRef in)
     }
 }
 
-enum { OUT_ABSENT = -9 };  // an output a function constant removes
-static int g_out[40];  // vertex: member i of the returned struct is the position (-1), point size (-2), render target
-                       // array index (-4), viewport index (-5) or generic output n
-                       // fragment: colour target n, or the sample mask (-3)
+enum { OUT_ABSENT = -9 };  // removed by a function constant
+// vertex: position -1, point size -2, layer -4, viewport -5 or generic output n; fragment: colour n, sample mask -3
+static int g_out[40];
 static unsigned g_nout;
-enum { FRAG_DEPTH = 8 };  // the g_out of a fragment function's [[depth]], after its colour targets
+enum { FRAG_DEPTH = 8 };
 
 static void emit_outputs(LLVMValueRef ret)
 {
@@ -7074,7 +6836,7 @@ static void emit_outputs(LLVMValueRef ret)
         ir_add(g_cur, IR_EXIT, IR_VOID, 0);
         return;
     }
-    if (!LLVMGetNumOperands(ret)) {  // a fragment function returning nothing: depth or stencil only
+    if (!LLVMGetNumOperands(ret)) {
         ir_add(g_cur, IR_EXIT, IR_VOID, 0);
         return;
     }
@@ -7089,7 +6851,7 @@ static void emit_outputs(LLVMValueRef ret)
             if (m > 4)
                 airc_fail("a vertex output wider than 4 lanes");
             struct ir_val *src[4];
-            for (unsigned l = 0; l < m; l++)  // before the store: a half lane's widening is an op of its own
+            for (unsigned l = 0; l < m; l++)  // before the store, as widening a half is an op of its own
                 src[l] = widen(get(val, first + l));
             struct ir_val *s = ir_add(g_cur, IR_AST, IR_VOID, m);
             static const unsigned builtin[] = { 0x70, 0x6c, 0, 0x64, 0x68 };
@@ -7100,8 +6862,7 @@ static void emit_outputs(LLVMValueRef ret)
         ir_add(g_cur, IR_EXIT, IR_VOID, 0);
         return;
     }
-    // fragment: a vec4 per colour target it writes, in target order from R0; a missing lane is 0 (alpha 1); then
-    // the sample mask, and the depth a register past the sample mask's (as NAK has it)
+    // as NAK lays them out: colour vec4s from R0, then the sample mask, then depth
     struct ir_val *src[34];
     unsigned nsrc = 0;
     int whole = g_nout == 1 && LLVMGetTypeKind(t) != LLVMStructTypeKind;
@@ -7121,9 +6882,9 @@ static void emit_outputs(LLVMValueRef ret)
         else if (g_out[i] == FRAG_DEPTH)
             depth = (int)i;
     }
-    if (mask >= 0)  // the sample mask after the colours
+    if (mask >= 0)
         src[nsrc++] = get(val, whole ? 0 : member_lane(t, (unsigned)mask));
-    else if (depth >= 0)  // its register is skipped all the same
+    else if (depth >= 0)  // the mask's register is skipped all the same
         src[nsrc++] = fconst(0);
     if (depth >= 0)
         src[nsrc++] = widen(get(val, whole ? 0 : member_lane(t, (unsigned)depth)));
@@ -7136,7 +6897,7 @@ static int is_fc_marker(const char *s, unsigned len)
     return s && len == 21 && !memcmp(s, "air.function_constant", 21);
 }
 
-// the node's kind, past a function constant's marker
+// skips a function constant's marker
 static const char *md_kind(LLVMValueRef node, unsigned *len)
 {
     int n = LLVMGetMDNodeNumOperands(node);
@@ -7152,8 +6913,7 @@ static const char *md_kind(LLVMValueRef node, unsigned *len)
     return s;
 }
 
-// whether an output exists: always, unless [[function_constant(x)]] makes it depend on a predicate
-// (!{!"air.function_constant", !{ptr @predicate, ...}, !"kind", ...})
+// !{!"air.function_constant", !{ptr @predicate, ...}, !"kind", ...}
 static int md_present(LLVMValueRef node)
 {
     int n = LLVMGetMDNodeNumOperands(node);
@@ -7171,7 +6931,7 @@ static int md_present(LLVMValueRef node)
     return present;
 }
 
-// the string after the node's kind (a vertex output's or fragment input's name), copied into out
+// the string after the node's kind
 static void md_name(LLVMValueRef node, char *out, size_t size)
 {
     int n = LLVMGetMDNodeNumOperands(node), seen = 0;
@@ -7242,8 +7002,7 @@ static void vertex_outputs(LLVMValueRef list)
     free(o);
 }
 
-// an integer attribute of an argument: a constant, or a global that a function constant sets
-// ([[texture(n)]] with n an expression of them)
+// a constant, or a global a function constant sets, as in [[texture(n)]] with n an expression of them
 static int md_int(LLVMValueRef v, unsigned *out)
 {
     if (LLVMIsAConstantInt(v))
@@ -7255,11 +7014,10 @@ static int md_int(LLVMValueRef v, unsigned *out)
     return 1;
 }
 
-// fragment: member i of the returned struct (or the whole value) is [[color(g_out[i])]]
 static void fragment_outputs(LLVMValueRef list)
 {
     int n = LLVMGetMDNodeNumOperands(list);
-    if (n > (int)(sizeof g_out / sizeof g_out[0]))  // colour targets, past 7, fail below
+    if (n > (int)(sizeof g_out / sizeof g_out[0]))  // colour targets past 7 fail below
         airc_fail("more than %zu fragment outputs", sizeof g_out / sizeof g_out[0]);
     LLVMValueRef *o = calloc(n, sizeof(*o));
     LLVMGetMDNodeOperands(list, o);
@@ -7269,7 +7027,7 @@ static void fragment_outputs(LLVMValueRef list)
         LLVMGetMDNodeOperands(o[i], f);
         unsigned len = 0;
         const char *k = m ? LLVMGetMDString(f[0], &len) : NULL;
-        if (is_fc_marker(k, len) && m > 3) {  // the function constant's predicate and the kind that follows
+        if (is_fc_marker(k, len) && m > 3) {
             if (!md_present(o[i])) {
                 g_out[i] = OUT_ABSENT;
                 free(all);
@@ -7295,8 +7053,7 @@ static void fragment_outputs(LLVMValueRef list)
         if (!k || len != 17 || memcmp(k, "air.render_target", 17) || m < 2 || !md_int(f[1], &target))
             airc_fail("unsupported fragment output %.*s", k ? (int)len : 1, k ? k : "?");
         g_out[i] = (int)target;
-        // [[color(0), index(1)]], dual-source blending's second colour, goes out as target 1's, where the blender
-        // takes it from
+        // dual-source blending's [[color(0), index(1)]] goes out as target 1, where the blender takes it
         if (m > 2 && md_int(f[2], &second) && second)
             g_out[i]++;
         if (g_out[i] > 7)
@@ -7308,7 +7065,7 @@ static void fragment_outputs(LLVMValueRef list)
     free(o);
 }
 
-// the string after key in an argument's metadata node, "" if it has none
+// "" if the key is absent
 static void md_value(LLVMValueRef node, const char *key, char *out, size_t size)
 {
     int n = LLVMGetMDNodeNumOperands(node);
@@ -7327,8 +7084,7 @@ static void md_value(LLVMValueRef node, const char *key, char *out, size_t size)
     free(o);
 }
 
-// a post-tessellation vertex function's [[patch(domain, n)]]: {"air.patch", domain, "air.patch_control_point", n},
-// without the count when the draw gives it
+// {"air.patch", domain, "air.patch_control_point", n}, without the count when the draw gives it
 static void patch_of(LLVMValueRef node)
 {
     char domain[16];
@@ -7349,8 +7105,7 @@ static void patch_of(LLVMValueRef node)
     free(o);
 }
 
-// the stage's function, from its !air.kernel/vertex/fragment node {fn, outputs, arguments}, a post-tessellation
-// vertex function's with its patch after them
+// !air.kernel/vertex/fragment is {fn, outputs, arguments}, then a post-tessellation vertex function's patch
 static LLVMValueRef stage_function(LLVMValueRef *arglist)
 {
     static const struct {
@@ -7368,7 +7123,7 @@ static LLVMValueRef stage_function(LLVMValueRef *arglist)
         LLVMGetMDNodeOperands(node, ops);
         LLVMValueRef fn = ops[0], outputs = ops[1], patch = cnt > 3 ? ops[3] : NULL;
         *arglist = ops[2];
-        for (int i = 3; i < cnt; i++) {  // the function's attributes: !{!"air.max_work_group_size", i32 N}
+        for (int i = 3; i < cnt; i++) {  // attributes such as !{!"air.max_work_group_size", i32 N}
             LLVMValueRef a[2];
             unsigned len;
             if (LLVMGetMDNodeNumOperands(ops[i]) != 2)
@@ -7382,7 +7137,7 @@ static LLVMValueRef stage_function(LLVMValueRef *arglist)
         if (!LLVMIsAFunction(fn))
             airc_fail("%s does not name a function", stages[s].md);
         g_info->stage = stages[s].stage;
-        // OpenCL's kernels come as __entry_<name>; its device says it has denormals whatever we answer
+        // OpenCL's kernels are __entry_<name>, and its device claims denormals whatever we answer
         g_info->denorms = g_info->stage == NVK_COMPUTE && !strncmp(LLVMGetValueName(fn), "__entry_", 8);
         if (g_info->stage == NVK_VERTEX && patch && md_has(patch, "air.patch"))
             patch_of(patch);
@@ -7395,8 +7150,7 @@ static LLVMValueRef stage_function(LLVMValueRef *arglist)
     airc_fail("no air.kernel, air.vertex or air.fragment found");
 }
 
-// a patch_control_point<T> argument's node: {"air.patch_control_point_input", {"air.patch_control_point_function",
-// fn}, then {"air.location_index", n, ...} for each member of T}
+// {"air.patch_control_point_input", {"air.patch_control_point_function", fn}, {"air.location_index", n, ...}...}
 static void control_points(LLVMValueRef node)
 {
     int n = LLVMGetMDNodeNumOperands(node);
@@ -7423,10 +7177,9 @@ static void control_points(LLVMValueRef node)
     free(o);
 }
 
-// the next 8-byte param of const bank 0, for a buffer's address or threadgroup memory's offset
 static unsigned param_slot(unsigned *off)
 {
-    if (*off == NVK_TEXTURE_HANDLE(0))  // past the 20th, after the handles (the plugin draws only 20)
+    if (*off == NVK_TEXTURE_HANDLE(0))  // past the 20th, after the handles, as the plugin draws only 20
         *off = NVK_SAMPLER_HANDLE(16);
     if (*off + 8 > 0x400)
         airc_fail("more than %d buffer and threadgroup arguments", (0x400 - PARAM_BASE - 0x80) / 8);
@@ -7445,8 +7198,6 @@ static unsigned hidden_arg(enum nvk_arg_kind kind, unsigned index, unsigned *off
     return a->cbuf_off;
 }
 
-// A kernel's stage input: its region's param, and one for each buffer its attributes are read from, and their
-// indices
 static void stage_in_args(unsigned *off)
 {
     g_region_off = hidden_arg(NVK_ARG_STAGE_IN_REGION, 0, off);
@@ -7471,9 +7222,8 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
         enum nvk_arg_kind kind;
     } kinds[] = {
         { "air.buffer", NVK_ARG_BUFFER },
-        { "air.indirect_buffer", NVK_ARG_BUFFER },  // an argument buffer: its address like any buffer's
-        // an OpenCL kernel's argument passed by value: its bytes in the buffer bound at its index, which the
-        // function reads through a constant pointer
+        { "air.indirect_buffer", NVK_ARG_BUFFER },
+        // OpenCL's by-value arguments, read through a constant pointer into the buffer bound at their index
         { "air.constant", NVK_ARG_BUFFER },
         { "air.threadgroup", NVK_ARG_THREADGROUP },
         { "air.thread_position_in_grid", NVK_ARG_TID },
@@ -7490,7 +7240,7 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
         { "air.position", NVK_ARG_POSITION },
         { "air.fragment_input", NVK_ARG_VARYING },
         { "air.vertex_input", NVK_ARG_VERTEX_INPUT },
-        { "air.stage_in", NVK_ARG_VERTEX_INPUT },  // a kernel's [[stage_in]] member: its attribute's location
+        { "air.stage_in", NVK_ARG_VERTEX_INPUT },  // a kernel's [[stage_in]] member
         { "air.render_target", NVK_ARG_RENDER_TARGET },
         { "air.point_coord", NVK_ARG_POINT_COORD },
         { "air.front_facing", NVK_ARG_FRONT_FACING },
@@ -7532,7 +7282,7 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
             unsigned len;
             const char *s = LLVMGetMDString(o[j], &len);
             if (!s || (len == 21 && !memcmp(s, "air.function_constant", 21)))
-                continue;  // an argument that exists when a function constant says so: bound when it does
+                continue;  // bound whenever the function constant keeps it
             if (!kind) {
                 kind = s;
                 kind_len = len;
@@ -7540,7 +7290,7 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
                     index = (unsigned)LLVMConstIntGetZExtValue(o[j + 1]);
             } else if (len == 18 && !memcmp(s, "air.location_index", 18) && j + 1 < on && md_int(o[j + 1], &value)) {
                 index = value;
-                if (j + 2 < on && md_int(o[j + 2], &value))  // how many elements an array of them has
+                if (j + 2 < on && md_int(o[j + 2], &value))  // an array's length
                     g_info->array_count[g_info->nargs] = value;
             } else if (len == 17 && !memcmp(s, "air.address_space", 17) && j + 1 < on && LLVMIsAConstantInt(o[j + 1])) {
                 space = (unsigned)LLVMConstIntGetZExtValue(o[j + 1]);
@@ -7555,7 +7305,7 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
                 k = kinds[j].kind;
         if (k < 0)
             airc_fail("unsupported argument %.*s", (int)kind_len, kind ? kind : "?");
-        if (k == NVK_ARG_BUFFER && space == 3)  // a threadgroup(n) buffer
+        if (k == NVK_ARG_BUFFER && space == 3)
             k = NVK_ARG_THREADGROUP;
         if (k == NVK_ARG_CONTROL_POINTS)
             control_points(nodes[i]);
@@ -7568,15 +7318,14 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
             g_info->patch_inputs |= 1u << index;
         if (k == NVK_ARG_SAMPLE_ID)
             g_info->flags |= NVK_FLAG_PER_SAMPLE;
-        if (k == NVK_ARG_VARYING) {  // the slot of the vertex output of its name, or the next one without them
+        if (k == NVK_ARG_VARYING) {  // matched to the vertex output by name
             index = g_info->nvary;
             if (g_vertex) {
                 char name[AIRC_NAME];
                 md_name(nodes[i], name, sizeof name);
                 for (index = 0; index < g_vertex->n && strcmp(g_vertex->names[index], name); index++)
                     ;
-                // SDL's solid colour shader takes its vertex input struct and reads only the colour from it, which
-                // Metal lets through: the slot past the outputs is one nothing writes
+                // Metal lets an input no output matches through, as some apps' shaders have; nothing writes this slot
                 if (index == g_vertex->n)
                     index = g_info->nvary > g_vertex->n ? g_info->nvary : g_vertex->n;
             }
@@ -7602,8 +7351,7 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
         if (kind_len == 12 && !memcmp(kind, "air.constant", 12))
             a->size = (uint16_t)size;
         a->access = md_has(nodes[i], "air.read_write") ? 1 : md_has(nodes[i], "air.write") ? 2 : 0;
-        // Metal lets the same buffer be bound twice, so read-only alone isn't enough: the AIR must also say no
-        // other argument reaches it
+        // Metal allows binding a buffer twice, so read-only also needs the AIR's no-alias
         if (k == NVK_ARG_BUFFER &&
             (space == 2 || md_has(nodes[i], "air.read") ||
              LLVMGetEnumAttributeAtIndex(fn, i + 1, LLVMGetEnumAttributeKindForName("readonly", 8))) &&
@@ -7619,9 +7367,8 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
     if (g_info->stage == NVK_COMPUTE && (stage_in || g_info->vertex_inputs))
         stage_in_args(&off);
     g_param_end = off;
-    // Metal binds textures and samplers at indices up to 127, the pools have 16 slots: one past them (MPS binds its
-    // sources at 64) takes a free low slot, kept in its cbuf_off for the dispatcher, clear of the constant samplers'
-    // and render targets' slots at the top
+    // Metal indices go to 127 but the pools have 16 slots, so higher ones (MPS binds at 64) take a free low slot,
+    // kept in cbuf_off for the dispatcher
     for (int kind = NVK_ARG_TEXTURE; kind <= NVK_ARG_SAMPLER; kind++) {
         uint32_t used = 0;
         for (unsigned i = 0; i < g_info->nargs; i++) {
@@ -7646,8 +7393,7 @@ static void stage_args(LLVMValueRef fn, LLVMValueRef arglist)
     }
 }
 
-// the static initialisers (C++ global constructors, one per source file a library was built from), which copy
-// function constants into globals: the first, or the one after another
+// C++ global constructors, one per source file, which copy function constants into globals
 static LLVMValueRef static_init(LLVMValueRef after)
 {
     for (LLVMValueRef fn = after ? LLVMGetNextFunction(after) : LLVMGetFirstFunction(g_module); fn;
@@ -7717,9 +7463,8 @@ void airc_front(void *module, void **linked, const char *const *linked_names, un
     g_prologue = g_cur = ir_block(f);
     entry_args();
 
-    // the static initialisers run first, inlined like any call (their stores fill the globals' state)
     for (LLVMValueRef init = static_init(NULL); init; init = static_init(init)) {
-        g_depth = 1;  // its return goes on into the shader proper
+        g_depth = 1;  // its return goes on into the shader
         struct ir_block *saved = g_cont;
         g_cont = ir_block(f);
         g_rets = NULL;
