@@ -15,7 +15,7 @@ RTX 3050 A laptop parts carry RTX 30 names on Ada chips.
 | Family | Chipsets | Status |
 |---|---|---|
 | GA10x (GA102, GA103, GA104, GA106, GA107) | 0x172-0x177 | driven, same path as GA106 |
-| AD10x (AD102-AD107) | 0x192-0x197 | refused: needs its own booter firmware |
+| AD10x (AD102-AD107) | 0x192-0x197 | untested, starts like GA10x |
 | TU10x (TU102, TU104, TU106) | 0x162-0x166 | refused: boot path, QMD, compiler |
 | TU11x (TU116, TU117) | 0x167-0x168 | refused: as TU10x |
 | GA100, Tegra, Hopper, Blackwell | | not in the table |
@@ -28,15 +28,22 @@ WPR2 heap size (from VRAM), the copy engine with physical engines behind it (PCE
 
 ### Firmware files
 
-- Where: `fw/570/*.bin`, `tools/install/make-package.sh`, `updater/Installer.swift`, `kext/abi.h`
+- Where: `fw/570/`, `tools/install/make-package.sh`, `updater/Installer.swift`, `kext/abi.h`
   (`MALACHITE_FW_NAMES`), `Gpu::autostart()` (`/Library/Application Support/Malachite/570/`), `ctl/malachitectl.c`.
 - GA10x: one set. NVIDIA's 570.144 `gsp`, `bootloader`, `booter_load` and `booter_unload` are byte-identical for
   GA102, GA103, GA104, GA106 and GA107, so the files we ship serve the whole family.
-- AD10x: same `gsp.bin`, but its own `bootloader`, `booter_load` and `booter_unload` (signed for Ada).
+- AD10x: same `gsp.bin`, but its own `bootloader`, `booter_load` and `booter_unload` (signed for Ada), byte-identical
+  for AD102-AD107: linux-firmware's `nvidia/ad102/gsp/*-570.144.bin.zst`.
 - TU10x/TU11x: another `gsp.bin` (`gsp_tu10x`), its own bootloader, and two booter sets (TU102/4/6 and TU116/7).
   FWSEC on Turing also needs the falcon bootloader from the ACR firmware.
-- Takes: a firmware set per family, chosen by the chip: a folder per set (`570/ad10x/`), the package and installer
-  copying them, `autostart()` and malachitectl reading the chip's folder. Code, small.
+- Layout: `570/gsp.bin` for every family; GA10x's set beside it, where it always was, so installs, updates and apps
+  from before keep working; every other family's set in a folder named by `chip->fwdir` (`570/ad10x/`). The package
+  carries both sets, the installer copies the folders too (an older app's installer copies only the top-level files),
+  `autostart()` reads the chip's folder, and the kext publishes it as `MalachiteFirmwareDir` for malachitectl.
+- Linux-firmware also has an Ada `scrubber` (SEC2, clears VRAM past what the VBIOS scrubbed). NVIDIA's driver needs it
+  when the pre-scrubbed top 256 MB doesn't hold WPR2 and the heaps (its newer releases run it on every Ada boot, as a
+  workaround). Ours take about 193 MB on 24 GB, as on GA10x, so it isn't shipped or run. First lead if booter-load or
+  GSP-RM's init fails on an Ada card.
 
 ### VBIOS and FWSEC (`core/vbios.c`, `core/fwsec.c`)
 
@@ -134,8 +141,10 @@ c5b5 need adding there. Data.
 
 - `sass86.c` encodes sm86 only; the latency table in `back.c` is sm80/sm86's; occupancy assumes 48 warps per SM.
 - GA10x: nothing in it is GA106's. GA102-GA107 are all sm86.
-- AD10x: sm89 runs sm86 code, and nvcc's sm86 and sm89 output are byte-identical for what we emit. Nothing to do.
-  It uses no HMMA, LDGSTS, LDSM or REDUX, so Ada's FP8 isn't missed.
+- AD10x: sm89 runs sm86 code, and nvcc's sm86 and sm89 output are byte-identical for what we emit (nvdisasm also
+  decodes `sass86_test`'s output the same as SM86 and SM89). Nothing to do. It uses no HMMA, LDGSTS, LDSM or REDUX, so
+  Ada's FP8 isn't missed. Its limits are sm86's: 48 warps and 64K registers per SM, 100 KB shared memory per SM, 99 KB
+  per CTA. Local memory is sized from GR info, so AD102's 12 GPCs need nothing.
 - Turing (sm75), decoded with nvdisasm:
   - LDG/STG memory order bits split into scope and order on sm75: today's LDG decodes as the constant (read-only) path
     and STG as invalid. Per-target encodings. Data.
@@ -160,10 +169,10 @@ c5b5 need adding there. Data.
   On a refused card graphics control still takes the framebuffer match category, which keeps Apple's framebuffer off
   the boot screen, while `Gpu` never publishes its own: likely no screen at all. They should start only once `Gpu`
   has accepted the chip. Code; needs
-  care, as reading BAR0 before `Gpu` has enabled memory decode on a secondary card returns all ones.
-- `updater/Checks.swift` takes the first NVIDIA device and doesn't check the family, although its comment says it
-  does. It should refuse or warn on what `chip.c` refuses.
-- README and the app say RTX 30 only, which still holds.
+  care, as reading BAR0 before `Gpu` has enabled memory decode on a secondary card returns all ones. Until then
+  `-nonvidia` is the way back for anyone whose card didn't come up.
+- `updater/Checks.swift` takes the first NVIDIA device; Turing isn't checked.
+- README says RTX 40 is untested; the app says RTX 30.
 
 ## Ampere laptops
 
@@ -178,8 +187,9 @@ GA103, GA104, GA106 and GA107 laptop parts get the same path. What isn't covered
 ## What each family still needs
 
 - Other GA10x: nothing known in code. Testing on each chip, GA102's 24 GB and GA107's 4 GB at the ends.
-- AD10x: a per-family firmware folder, then the Ada entry's `missing` cleared. The rest is classes the table already
-  has. Closest to working.
+- AD10x: wired up (firmware folder, classes), never run. A tester's first boot log says whether booter-load,
+  GSP-RM init, the golden context and the display come up; then the 3D, compute and NVDEC classes need a draw, a
+  dispatch and a decode each.
 - Turing: firmware set and FWSEC v2, the older booter and falcon load, LIBOS2 WPR layout, QMD V02_02, the compiler's
   sm75 target, video codec mask, and checking the C57x display methods.
 

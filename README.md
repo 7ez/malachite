@@ -5,7 +5,8 @@ NVIDIA driver for macOS 26 on OpenCore PCs. Native Metal, no Vulkan.
 NullMoth goes from AIR to SPIR-V to Vulkan to NIR to NAK to reach the same GPU, and they've probably added another layer
 since you started reading this. Malachite skips all that.
 
-Still experimental. RTX 30 series only for now, support for other cards is planned.
+Still experimental, more so on anything but RTX 30. RTX 40 should work but nobody has tried one yet; other cards are
+planned.
 
 - Download the app: [Malachite.zip](https://nv.aochi.uk/updates/Malachite.zip)
 - Problems: press Send logs in the app, and open an issue with the Log ID
@@ -13,7 +14,7 @@ Still experimental. RTX 30 series only for now, support for other cards is plann
 | | |
 |---|---|
 | macOS | 26 Tahoe, x86_64, built on 26.7.1 |
-| GPUs | RTX 30 series (GA10x), developed on an RTX 3060 |
+| GPUs | RTX 30 series (GA10x), developed on an RTX 3060; RTX 40 (AD10x) untested |
 | Metal | Metal 3, used by WindowServer and apps |
 | OpenGL | Through Apple's GL-on-Metal |
 | OpenCL | Through Apple's OpenCL-on-Metal |
