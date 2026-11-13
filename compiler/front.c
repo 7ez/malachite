@@ -482,6 +482,8 @@ static struct ir_val *get(LLVMValueRef v, unsigned lane)
         set(v, lane, c);
         return c;
     }
+    if (LLVMGetTypeKind(lane_type(LLVMTypeOf(v), lane)) == LLVMDoubleTypeKind)
+        airc_fail("unsupported value type %d", LLVMDoubleTypeKind);
     airc_fail("a value is used before it is defined (lane %u)", lane);
 }
 
@@ -4361,10 +4363,29 @@ static int workitem(LLVMValueRef in, const char *what)
     return 1;
 }
 
+// OpenCL's printf, which hands its va_list to air.vprintf
+static int is_printf(LLVMValueRef fn)
+{
+    for (LLVMBasicBlockRef b = LLVMGetFirstBasicBlock(fn); b; b = LLVMGetNextBasicBlock(b))
+        for (LLVMValueRef in = LLVMGetFirstInstruction(b); in; in = LLVMGetNextInstruction(in)) {
+            LLVMValueRef callee = LLVMGetInstructionOpcode(in) == LLVMCall ? LLVMGetCalledValue(in) : NULL;
+            const char *name = callee ? LLVMGetValueName(callee) : NULL;
+            if (name && !strcmp(name, "air.vprintf"))
+                return 1;
+        }
+    return 0;
+}
+
 static void call(LLVMValueRef in)
 {
     LLVMValueRef fn = LLVMGetCalledValue(in);
     const char *name = LLVMGetValueName(fn);
+    // nothing reads a printf buffer back, so printf prints nothing and says so
+    if (fn && LLVMGetFirstBasicBlock(fn) && is_printf(fn)) {
+        if (LLVMGetTypeKind(LLVMTypeOf(in)) != LLVMVoidTypeKind)
+            set(in, 0, konst(IR_I32, (uint32_t)-1));
+        return;
+    }
     if (fn && LLVMGetFirstBasicBlock(fn)) {
         if (!call_sub(in, fn))
             inline_call(in, fn);
@@ -6837,6 +6858,8 @@ static void instruction(LLVMValueRef in)
     case LLVMUIToFP:
     case LLVMFPToSI:
     case LLVMFPToUI:
+        if (op == LLVMFPExt && LLVMGetTypeKind(lane_type(t, 0)) == LLVMDoubleTypeKind)
+            break;  // a float promoted for printf, which reads none; any other use fails in get
         if (is_ptr(t))  // a pointer cast: the same pointer
             insert(g_ptrs, in, 0, g_scope)->p = ptr_of(LLVMGetOperand(in, 0));
         else
