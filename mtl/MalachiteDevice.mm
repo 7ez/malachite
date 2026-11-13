@@ -7299,11 +7299,10 @@ static uint64_t malachite_vram(void)
                        options:(NSUInteger)options
                    deallocator:(void (^)(void *, NSUInteger))deallocator
 {
-    // Shared memory off a page gets a copy, as Metal maps whole pages only (contents then isn't the pointer, which
-    // OpenCL checks): OpenCL frees the pattern it fills a buffer from before the GPU runs the fill, and a buffer over
-    // it filled with what malloc wrote there. A Managed one stays over the memory, CL_MEM_USE_HOST_PTR's, where apps
-    // read results straight after a finish.
-    if (((uintptr_t)pointer & (vm_page_size - 1)) &&
+    // OpenCL frees a fill's pattern (128 bytes at most) before the GPU runs the fill, so a buffer over it filled with
+    // what malloc wrote there: patterns off a page get a copy. Not more: reads and writes into app memory come this
+    // way too, and a copy per call loses the GPU's writes and starved the whole system.
+    if (((uintptr_t)pointer & (vm_page_size - 1)) && length <= 128 &&
         (options & MTLResourceStorageModeMask) != MTLResourceStorageModeManaged) {
         id b = [self newBufferWithBytes:pointer length:length options:options];
         if (deallocator)
