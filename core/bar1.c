@@ -1,7 +1,6 @@
-// CPU windows onto VRAM through BAR1. GSP-RM sets BAR1 up with 64 KB pages and page tables in VRAM; we
-// keep its directories and add big-page tables under its PD0, written through PRAMIN like everything there.
-// GSP-RM maps no VRAM into BAR1 itself, whatever its size: a static mapping of all of it is the client's to make
-// (kbusEnableStaticBar1Mapping in CPU-RM), and with a BAR1 that covers VRAM we make one too, with 2 MB pages
+// CPU windows onto VRAM through BAR1. GSP-RM sets BAR1 up with 64 KB pages and VRAM page tables; we add big-page
+// tables under its PD0 through PRAMIN. GSP-RM maps no VRAM there; the static mapping is the client's job
+// (kbusEnableStaticBar1Mapping in CPU-RM), so with a BAR1 covering VRAM we make one with 2 MB pages.
 #include "bar1.h"
 #include "gsp.h"
 #include "mem.h"
@@ -59,8 +58,7 @@ static void unmap_static(struct bar1 *b, uint64_t end)
     vmm_flush(g);
 }
 
-// usable VRAM up to end at the same BAR1 offsets, in 2 MB pages; only into entries
-// nobody else uses (or a mapping of ours an earlier session left), so a failure leaves BAR1 as it was
+// identity map up to end in 2 MB pages, only into free entries (or ours from a past session); failure changes nothing
 static int map_static(struct bar1 *b, uint64_t end)
 {
     struct gpu *g = gsp_gpu(b->s);

@@ -1,6 +1,5 @@
-// What differs between the GPUs GSP-RM runs that we drive: the classes each engine is reached through, limits,
-// and the GSP-RM image's signature section. One entry per family of chipsets (PMC_BOOT_0 [28:20]) that take the same
-// classes and firmware (nouveau, open-gpu-kernel-modules); docs/gpu-support.md has what each still needs.
+// Per-family engine classes, limits and GSP-RM signature section, by chipset (PMC_BOOT_0 [28:20]), from nouveau and
+// open-gpu-kernel-modules; docs/gpu-support.md has what each family still needs.
 #pragma once
 #include <stdint.h>
 
@@ -16,9 +15,9 @@ struct chip {
     const char *missing;  // what the driver lacks for the family, NULL once it drives it
 };
 
-// the chipset's entry, NULL for one outside every family
+// NULL outside every family
 const struct chip *chip_find(uint32_t chipset);
-// "GA104", NULL for a chipset without a known name
+// "GA104", NULL if unknown
 const char *chip_name(uint32_t chipset);
-// the product's name by PCI device ID, NULL when it isn't listed; the chip comes from PMC_BOOT_0, not this
+// by PCI device ID, NULL if unlisted; the chip comes from PMC_BOOT_0, not this
 const char *chip_product(uint16_t device);

@@ -14,8 +14,7 @@
 #include "../gsp.h"
 #include "rmfe_priv.h"
 
-// the classes NVK looks for (nvkmd_nvrm_pdev.c), as GSP-RM r570 provides them: the generic ones, then the chip's
-// channel, copy, 3D, 2D, inline-to-memory, compute and usermode classes
+// the class list clients probe, as GSP-RM r570 provides it: these, then the chip's own
 static const uint32_t generic_classes[] = {
     0x0000, 0x0080, 0x2080, 0x003e, 0x0040, 0x0071, 0x0079, 0x50a0, 0x90f1, 0xa06c, 0x9067,
 };

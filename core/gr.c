@@ -90,8 +90,7 @@ static int promote(struct gsp *s, const struct rm_client *c, uint32_t channel, s
         // past golden init the global buffers are the ones it got, already initialised
         int alloc = golden || !b->global;
         if (!alloc) {
-            // a channel gets one register access map: the unrestricted one for admin channels, the restricted one
-            // for user channels (kernel RM's kgrctxGetRegisterAccessMapId)
+            // one access map per channel: unrestricted for admin, restricted for user (kgrctxGetRegisterAccessMapId)
             if (b->id == (user ? NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_UNRESTRICTED_PRIV_ACCESS_MAP
                                : NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_PRIV_ACCESS_MAP))
                 continue;
@@ -139,10 +138,9 @@ fail:
     return -1;
 }
 
-// once per GSP-RM session, as nouveau's r535_gr_oneinit(): a channel with every context buffer, the 3D class
-// allocated on it so GSP-RM builds and caches the golden context; the global buffers stay for later channels.
-// Again on the same global buffers after a resume, which leaves GSP-RM without a golden context (ogkm makes its
-// golden channel on every kgraphicsStateLoad).
+// once per GSP-RM session: allocating the 3D class makes GSP-RM build and cache the golden context, and the global
+// buffers stay for later channels. Redone on them after a resume, which loses it (kernel RM redoes it on every
+// kgraphicsStateLoad).
 static int golden(struct gsp *s)
 {
     struct rm_client c;

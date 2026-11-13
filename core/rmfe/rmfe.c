@@ -1,6 +1,6 @@
-// The CPU side of NVIDIA's resource manager, as far as NVK's NVRM backend needs it: the NVRM escape ABI
-// (open-gpu-kernel-modules 610 headers, what NVK is built against) over the GSP-RM core.
-// Objects GSP-RM owns are forwarded under the caller's handles; memory, VA spaces and usermode live here.
+// The CPU side of NVIDIA's resource manager: the NVRM escape ABI (open-gpu-kernel-modules 610 headers, what its
+// clients build against) over the GSP-RM core. GSP-RM objects keep the caller's handles; memory, VA spaces and
+// usermode live here.
 #include "nvos.h"
 #include "nvstatus.h"
 #include "nv_escape.h"

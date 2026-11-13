@@ -1,8 +1,6 @@
 // VRAM allocation and GPU address spaces with client-owned page tables in system memory.
-// Page table layout is GP100's (nouveau's vmmgp100.c): PD3 2 bits, PD2 9, PD1 9, PD0 8 (dual 16-byte
-// entries, small-page half used), PT 9 bits of 4 KB pages; every level is allocated on first use. The VA space is
-// externally owned: GSP-RM takes our root through SET_PAGE_DIRECTORY (nouveau's split layout for its golden channel
-// leaves the channel on a root of GSP-RM's own, without our mappings).
+// GP100 layout (nouveau's vmmgp100.c): PD3 2 bits, PD2 9, PD1 9, PD0 8 (dual 16-byte entries), PT 9 of 4 KB pages.
+// The VA space is externally owned (SET_PAGE_DIRECTORY): a split layout leaves channels on GSP-RM's root, without ours.
 #include "../nvrm/fifo.h"
 #include "gsp.h"
 #include "falcon.h"
@@ -193,14 +191,13 @@ uint64_t vmm_alloc(struct vmm *v, uint64_t size, uint64_t align)
         align = PAGE;
     if (v->va_from)
         v = v->va_from;
-    // an address given back first, so that a process that maps and unmaps buffers keeps to the page tables it has
+    // freed addresses first, so map/unmap churn reuses the page tables already there
     size = (size + PAGE - 1) & ~(PAGE - 1);
     uint64_t va = ranges_take(&v->va_free, size, align);
     if (va)
         return va;
     va = (v->next_va + align - 1) & ~(align - 1);
-    // the shaders' shared and local memory windows (compute.c) sit at 0xfe000000..0xffffffff: memory mapped there
-    // can't be reached, an access to it is an Invalid Address Space exception
+    // 0xfe000000..0xffffffff is the shared/local memory window (compute.c); access there is Invalid Address Space
     if (va < 1ull << 32 && va + size > 0xfeull << 24)
         va = 1ull << 32;
     if (va + size > 1ull << 49) {
@@ -219,8 +216,7 @@ void vmm_free(struct vmm *v, uint64_t va, uint64_t size)
     ranges_put(&v->va_free, va, (size + PAGE - 1) & ~(PAGE - 1));
 }
 
-// the table below n at level l for va, made if it isn't there. PD0 entries are pairs, big-page table then small; a
-// PD0 has 256, so its big-page tables hang after the small ones in child[].
+// made on first use; a PD0 entry pairs big- and small-page tables, the big ones in child[256..511]
 static struct pt_node *pt_child(struct vmm *v, struct pt_node *n, int l, uint64_t va, int big)
 {
     unsigned i = (va >> levels[l].shift) & ((1u << levels[l].bits) - 1);
@@ -291,8 +287,7 @@ int vmm_map_vram(struct vmm *v, uint64_t va, uint64_t vram, uint64_t size, unsig
     return 0;
 }
 
-// A zero big-page entry leaves its range to the small pages, so the two sizes can share a 2 MB range. Compressed kinds
-// need these: the hardware takes them in 64 KB and 2 MB pages, in VRAM.
+// compressed kinds need 64 KB or 2 MB VRAM pages; a zero big-page entry defers to the small pages under it
 int vmm_map_vram_big(struct vmm *v, uint64_t va, uint64_t vram, uint64_t size, unsigned flags)
 {
     vmm_unmap(v, va, size);

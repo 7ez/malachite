@@ -1,8 +1,7 @@
 #include "chip.h"
 #include <stddef.h>
 
-// Ada keeps GA10x's channel, copy, usermode and window classes; its 3D, compute, video decoder, display root and
-// core are new. GA100 (0x170, no display) and the Tegra parts fall outside every range.
+// Ada reuses GA10x's channel, copy, usermode and window classes. GA100 (0x170, no display) and Tegra are left out.
 static const struct chip chips[] = {
     { 0x162, 0x166, "TU10x", 0xc46f, 0xc597, 0xc5c0, 0xc5b5, 0xc461, 0xc4b0, 0xc570, 0xc57d, 0xc57e, 0xc57b, 0xc57a,
       64 * 1024, ".fwsignature_tu10x", NULL, "Turing's FWSEC, booter and GSP boot, QMD v2 and sm75 shaders" },
@@ -24,8 +23,7 @@ static const struct {
     { 0x192, "AD102" }, { 0x193, "AD103" }, { 0x194, "AD104" }, { 0x196, "AD106" }, { 0x197, "AD107" },
 };
 
-// GeForce RTX 30 desktop and laptop parts as NVIDIA's open kernel modules list them, without the OEM variants that
-// share a device ID; the RTX 3050 A laptop parts are Ada chips
+// RTX 30 parts from NVIDIA's open kernel modules, minus OEM variants sharing an ID; the 3050 A laptops are Ada
 static const struct {
     uint16_t device;
     const char *name;

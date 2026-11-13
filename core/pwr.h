@@ -1,4 +1,4 @@
-// What GSP-RM says about the GPU's power state, and the hints it takes from the driver about when to downclock
+// The GPU's power state as GSP-RM reports it
 #pragma once
 #include "gsp.h"
 

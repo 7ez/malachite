@@ -3,9 +3,8 @@
 #pragma once
 #include <stdint.h>
 
-// A converted image is w x h pixels in rows of w, or of pad when the converter spaces them as the descriptor's
-// width. px was cleared before the conversion, so a set pixel past the w * h that tight rows fill means padded ones;
-// they are moved up to tight rows. px takes pad * h pixels. Returns 1 when it moved them.
+// The converter may space rows by pad (the descriptor's width). px was cleared first, so a set pixel past w * h means
+// padded rows; they are packed to rows of w. px holds pad * h pixels. Returns 1 if it repacked.
 static inline int cursor_unpad(uint32_t *px, uint32_t w, uint32_t h, uint32_t pad)
 {
     if (pad <= w)
@@ -21,8 +20,7 @@ static inline int cursor_unpad(uint32_t *px, uint32_t w, uint32_t h, uint32_t pa
     return 1;
 }
 
-// The pixel at (x, y) of a w x h image of straight alpha, as the head blends it: premultiplied (NEG_K1_TIMES_SRC);
-// clear outside the image
+// straight alpha premultiplied, as the head blends it (NEG_K1_TIMES_SRC); clear outside the image
 static inline uint32_t cursor_pixel(const uint32_t *argb, uint32_t w, uint32_t h, uint32_t x, uint32_t y)
 {
     if (x >= w || y >= h)
@@ -35,8 +33,7 @@ static inline uint32_t cursor_pixel(const uint32_t *argb, uint32_t w, uint32_t h
 
 typedef void (*cursor_put)(void *ctx, uint32_t index, uint32_t px);
 
-// The image into a plane of dim x dim pixels, rows of dim. Only the corner the image or what the plane held before
-// (old_w x old_h) covers is written: the rest is clear already.
+// into a dim x dim plane; only the corner the new or old (old_w x old_h) image covers is written, the rest is clear
 static inline void cursor_pack(cursor_put put, void *ctx, uint32_t dim, uint32_t old_w, uint32_t old_h,
                                const uint32_t *argb, uint32_t w, uint32_t h)
 {

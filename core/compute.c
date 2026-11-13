@@ -81,8 +81,7 @@ static void qmd_set(uint32_t *qmd, unsigned hi, unsigned lo, uint64_t val)
 }
 #define QSET(qmd, field, val) qmd_set((qmd), field, (val))
 
-// The SM's shared-memory carve-out, in the QMD's (KB / 4) + 1 encoding: the smallest GA10x configuration
-// (0, 8, 16, 32, 64 or 100 KB) holding `bytes`, as nvk picks MIN_SM_CONFIG_SHARED_MEM_SIZE.
+// smallest GA10x shared-memory carve-out (0, 8, 16, 32, 64, 100 KB) holding bytes, in the QMD's KB / 4 + 1 form
 static uint32_t smem_config(uint32_t bytes)
 {
     static const uint32_t kb[] = { 0, 8, 16, 32, 64, 100 };

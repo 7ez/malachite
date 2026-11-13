@@ -24,8 +24,7 @@ struct gr_ctx {
 // before the first graphics-class object on a graphics channel
 int gr_promote(struct gsp *s, const struct rm_client *c, uint32_t channel, struct vmm *vm, int user, struct gr_ctx *ctx);
 void gr_ctx_free(struct gsp *s, struct gr_ctx *ctx);  // after GSP-RM freed the channel
-// the golden context's global buffers given up with the GSP-RM that had them; the next graphics channel makes them
-// again
+// drops the golden context's global buffers with their GSP-RM; the next graphics channel remakes them
 void gr_forget(struct gsp *s);
 // after GSP-RM resumed with its state: its golden context made again on the global buffers kept
 int gr_resume(struct gsp *s);

@@ -1,5 +1,5 @@
-// Channels: NVK's channel alloc rebuilt as the one kernel RM sends GSP-RM, the CPU-side context buffers for
-// graphics, and the controls whose answer lands in client memory (the work submit token)
+// Channels: the client's alloc rebuilt as the one kernel RM sends GSP-RM, graphics context buffers, and the
+// controls whose answer lands in client memory (the work submit token)
 #include "nvos.h"
 #include "nvgputypes.h"
 #include "alloc/alloc_channel.h"
@@ -85,8 +85,7 @@ static uint32_t pce_mask(struct rmfe *fe, const struct rm_client *rc, uint32_t e
     return m ? m->pceMask : 0;
 }
 
-// GSP-RM takes channels on a logical copy engine with no physical engines behind it (LCE4 on GA106), and
-// their work never runs; such a channel goes to an async copy engine that has some
+// GSP-RM takes channels on an LCE with no PCEs (LCE4 on GA106) but never runs them; use an async CE that has some
 static uint32_t copy_engine(struct rmfe *fe, const struct rm_client *rc, uint32_t engine)
 {
     if (engine < NV2080_ENGINE_TYPE_COPY0 || engine > NV2080_ENGINE_TYPE_COPY9 || pce_mask(fe, rc, engine))
@@ -190,7 +189,7 @@ static NvNotification *notifier(struct client *c, struct rmfe_chan *ch, uint32_t
     return (NvNotification *)((uint8_t *)mem->dma.cpu + off);
 }
 
-// RM writes the token into the channel's notifier as well; NVK reads it from there
+// RM also writes the token into the notifier, and clients read it there
 static void write_notifier(struct client *c, struct rmfe_chan *ch, uint32_t value)
 {
     NvNotification *n = notifier(c, ch, ch->token_index);
