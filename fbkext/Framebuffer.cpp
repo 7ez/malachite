@@ -20,14 +20,13 @@ static uint64_t prop(IOService *s, const char *key)
     return num(s->getProperty(key));
 }
 
-// Malachite's surfaces are 32 bpp with rows padded to 256 bytes (show and set_mode)
+// rows padded to 256 bytes, as Malachite lays its surfaces out
 static uint32_t pitch_of(uint32_t width)
 {
     return (width * 4 + 255) & ~255u;
 }
 
-// the modes, the lit one and the EDID; while dark, the one mode Malachite expects to light (WindowServer has crashed
-// on the geometry changing under it at the hotplug), or a placeholder
+// While dark, only the mode Malachite expects to light, as WindowServer has crashed on the geometry changing at hotplug.
 void Framebuffer::read_surface(IOService *nub)
 {
     online = nub->getProperty(SURFACE_ONLINE) == kOSBooleanTrue;
@@ -62,8 +61,8 @@ void Framebuffer::read_surface(IOService *nub)
         edid_size = e->getLength() < sizeof(edid) ? e->getLength() : sizeof(edid);
         memcpy(edid, e->getBytesNoCopy(), edid_size);
     }
-    // macOS works the DPI out from the image size: the preferred detailed timing's in mm,
-    // else the base block's in cm (one byte of which alone is an aspect ratio)
+    // for the DPI: the preferred detailed timing's size in mm, else the base block's in cm (a lone byte is an aspect
+    // ratio)
     image_w = image_h = 0;
     if (edid_size >= 128) {
         const uint8_t *d = edid + 54;
@@ -103,18 +102,17 @@ bool Framebuffer::start(IOService *provider)
     while (pci && !pci->metaCast("IOPCIDevice"))
         pci = pci->getProvider();
     setProperty(kIOFBDependentIDKey, (pci ? pci : provider)->getRegistryEntryID(), 64);
-    setProperty(kIOFBDependentIndexKey, prop(provider, SURFACE_SCREEN), 32);  // the GPU's framebuffers, told apart
-    // read at open: IOFramebuffer resamples every table to this before setGammaTable, the output LUT's 1024 steps
+    setProperty(kIOFBDependentIndexKey, prop(provider, SURFACE_SCREEN), 32);
+    // IOFramebuffer resamples every table to the LUT's 1024 steps before setGammaTable
     setProperty(kIOFBGammaWidthKey, 16ull, 32);
     setProperty(kIOFBGammaCountKey, SURFACE_GAMMA_ENTRIES - 1ull, 32);
     IOLog("fb: aperture %#llx, %s\n", (unsigned long long)base, online ? "lit" : "waiting for the head");
     if (!super::start(provider))
         return false;
-    // the GPU's memory, not the aperture's 16 MB, which WindowServer would take for the whole of it
+    // or WindowServer takes the 16 MB aperture for all of VRAM
     if (OSNumber *mb = pci ? OSDynamicCast(OSNumber, pci->getProperty("VRAM,totalMB")) : nullptr)
         setProperty(kIOFBMemorySizeKey, mb->unsigned64BitValue() << 20, 64);
-    // the power states IONDRVFramebuffer has (initForPM): IOFramebuffer turns changes between them into
-    // setAttribute(kIOPowerAttribute); display sleep is doze
+    // IONDRVFramebuffer's states; IOFramebuffer turns changes into setAttribute(kIOPowerAttribute), display sleep is doze
     static IOPMPowerState states[] = {
         { 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
         { 1, 0, 0, IOPMPowerOn, 0, 0, 0, 0, 0, 0, 0, 0 },
@@ -130,7 +128,7 @@ IOReturn Framebuffer::setAttribute(IOSelect attribute, uintptr_t value)
     if (attribute != kIOPowerAttribute)
         return super::setAttribute(attribute, value);
     IOReturn r = getProvider()->callPlatformFunction(SURFACE_FN_POWER, true, (void *)value, nullptr, nullptr, nullptr);
-    return r == kIOReturnNotReady ? kIOReturnSuccess : r;  // dark: nothing to power
+    return r == kIOReturnNotReady ? kIOReturnSuccess : r;  // dark
 }
 
 IOReturn Framebuffer::message(UInt32 type, IOService *provider, void *arg)
@@ -233,14 +231,13 @@ IOReturn Framebuffer::getInformationForDisplayMode(IODisplayModeID id, IODisplay
     info->nominalHeight = m->height;
     info->refreshRate = m->refresh;
     info->maxDepthIndex = 0;
-    // CoreDisplay gives a mode of at least 1440x900 a HiDPI twin at half its size, backed by the mode itself, only when
-    // the mode says ValidForHiRes, unless it takes the display for a Retina one (built in or 4K at over 160 dpi) or
-    // the DisplayResolutionEnabled preference is set
+    // On non-Retina displays CoreDisplay offers a half-size HiDPI twin of a mode of 1440x900 or more only if it is
+    // ValidForHiRes.
     info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (m == &modes[0] ? kDisplayModeDefaultFlag : 0);
-    // bigger than the panel is a desktop that size: macOS would only offer it as a twin at half the size
+    // a mode above the panel's would then only be offered as its half-size twin
     if (m->width <= modes[0].width)
         info->flags |= kDisplayModeValidForHiResFlag;
-    // the panel's own resolution: the size of the preferred mode (modes[0], which Malachite lists first)
+    // modes[0] is the preferred mode
     if (m->width == modes[0].width && m->height == modes[0].height)
         info->flags |= kDisplayModeNativeFlag;
     info->imageWidth = image_w;
@@ -323,14 +320,13 @@ IOReturn Framebuffer::getStartupDisplayMode(IODisplayModeID *id, IOIndex *depth)
 
 IOReturn Framebuffer::getAttribute(IOSelect attribute, uintptr_t *value)
 {
-    // IOFramebuffer::open() asks this last and, with the connection offline, returns its answer: "unsupported"
-    // would fail every open of a dark framebuffer
+    // open() returns this answer while offline, so "unsupported" would fail every open of a dark framebuffer
     if (attribute == kIOHardwareCursorAttribute) {
         if (value)
             *value = hw_cursor ? 1 : 0;  // kIOFBHWCursorSupported
         return kIOReturnSuccess;
     }
-    // VRAM doesn't survive sleep: IOFramebuffer then keeps a copy of the screen and puts it back at wake
+    // VRAM is lost in sleep, so IOFramebuffer saves and restores the screen
     if (attribute == kIOVRAMSaveAttribute) {
         if (value)
             *value = 1;
@@ -382,8 +378,7 @@ IOReturn Framebuffer::getDDCBlock(IOIndex connect, UInt32 block, IOSelect type, 
     return kIOReturnSuccess;
 }
 
-// Night Shift, colour calibration and fades: one table for all three channels or one each, one after another, of
-// bytes or 16-bit words; resampled to the head's output LUT
+// one table or three back to back, of bytes or 16-bit words; resampled to the head's LUT
 IOReturn Framebuffer::setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt32 dataWidth, void *data)
 {
     if ((channelCount != 1 && channelCount != 3) || dataCount < 2 || (dataWidth != 8 && dataWidth != 16) || !data)
@@ -403,9 +398,8 @@ IOReturn Framebuffer::setGammaTable(UInt32 channelCount, UInt32 dataCount, UInt3
     return getProvider()->callPlatformFunction(SURFACE_FN_GAMMA, true, gamma, nullptr, nullptr, nullptr);
 }
 
-// IOFramebuffer also calls this while finding out what cursors the driver takes, so it always converts with the
-// one descriptor Malachite's head supports: 32-bit ARGB (straight alpha, which Malachite premultiplies) up to CURS_MAX
-// square
+// IOFramebuffer also calls this to probe cursor support, so it always converts to the head's one format: 32-bit
+// straight-alpha ARGB up to CURS_MAX square (Malachite premultiplies)
 IOReturn Framebuffer::setCursorImage(void *cursorImage)
 {
     if (!cursor)
@@ -419,7 +413,7 @@ IOReturn Framebuffer::setCursorImage(void *cursorImage)
     info.majorVersion = kHardwareCursorInfoMajorVersion;
     info.minorVersion = kHardwareCursorInfoMinorVersion;
     info.hardwareCursorData = (UInt8 *)cursor;
-    // cleared, so that cursor_unpad can tell rows the converter spaced as the descriptor's width from tight ones
+    // cleared so cursor_unpad can tell rows padded to CURS_MAX from tight ones
     bzero(cursor, CURS_MAX * CURS_MAX * 4);
     if (!convertCursorImage(cursorImage, &desc, &info))
         return kIOReturnUnsupported;
@@ -432,7 +426,7 @@ IOReturn Framebuffer::setCursorImage(void *cursorImage)
                                                (void *)(uintptr_t)info.cursorHeight, (void *)(uintptr_t)padded);
 }
 
-// x, y: the image's top left (IOFramebuffer has taken the hot spot off)
+// x, y: the image's top left, hot spot already taken off
 IOReturn Framebuffer::setCursorState(SInt32 x, SInt32 y, bool visible)
 {
     if (!hw_cursor)
