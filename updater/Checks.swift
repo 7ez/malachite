@@ -51,7 +51,7 @@ func checkMac(setsVariableWriteOff: Bool, _ o: InstallOptions, say: Say, ask: As
     // an NVIDIA GA10x (RTX 30) display controller: vendor 0x10de, device 0x22xx-0x25xx
     var vendor = false
     var gpu: String?
-    for line in lines(capture("/usr/sbin/ioreg", ["-r", "-c", "IOPCIDevice", "-d", "1", "-l"])) {
+    for line in lines(capture("/usr/sbin/ioreg", ["-r", "-c", "IOPCIDevice", "-d", "1", "-l"], timeout: 60)) {
         if line.contains("\"vendor-id\" = <de100000>") {
             vendor = true
         }
@@ -105,7 +105,12 @@ func runChecks(say: Say) -> Bool {
     }
     say("Metal device:")
     let shown = ["Chipset Model", "VRAM", "Metal", "Resolution", "UI Looks like"]
-    for line in keep(capture("/usr/sbin/system_profiler", ["SPDisplaysDataType"]).text, containing: shown) {
+    // a wedged GPU can leave system_profiler waiting for good
+    let displays = capture("/usr/sbin/system_profiler", ["SPDisplaysDataType"], timeout: 60)
+    if displays.status != 0 {
+        say("system_profiler failed or took over a minute, the GPU may be stuck: send logs, then restart")
+    }
+    for line in keep(displays.text, containing: shown) {
         say(line)
     }
     say(rootPatchSummary())
