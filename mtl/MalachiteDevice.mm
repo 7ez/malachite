@@ -7430,7 +7430,7 @@ static struct malachite_layout malachite_layout_of(MTLTextureDescriptor *descrip
                (unsigned long)descriptor.sAddressMode, (unsigned long)descriptor.tAddressMode,
                descriptor.normalizedCoordinates, descriptor.lodMinClamp, descriptor.lodMaxClamp,
                (unsigned long)descriptor.maxAnisotropy);
-    // MTLSamplerAddressMode: clamp to edge, mirror clamp to edge, repeat, mirror repeat, clamp to zero, border
+    // in MTLSamplerAddressMode order
     static const enum tex_address address[] = { TEX_CLAMP_TO_EDGE, TEX_MIRROR_ONCE_CLAMP_TO_EDGE, TEX_WRAP,
                                                 TEX_MIRROR,        TEX_BORDER,                    TEX_BORDER };
     struct samp_desc *d = &s->_desc;
@@ -7453,10 +7453,8 @@ static struct malachite_layout malachite_layout_of(MTLTextureDescriptor *descrip
     return s;
 }
 
-// OpenGL's shaders, which Apple's GL renderer hands over as GL core IR (bitcodeType 1) with its pipeline key as the
-// plugin data, made AIR by the plugin Apple's compiler service uses for them, from the shared cache, with the LLVM
-// it's built against. The plugin's return data (where the program's buffers, textures and samplers went) comes
-// back in *ret. nil if the plugin isn't there or fails.
+// Apple's GL renderer hands over GL core IR (bitcodeType 1) with its pipeline key; the compiler service's plugin from
+// the shared cache makes it AIR, and *ret says where the program's resources went.
 static NSData *malachite_glir_to_air(NSData *glir, NSData *key, NSData **ret)
 {
     typedef void *(*gen_fn)(void *, const void *, size_t, const void *, size_t, void **, size_t *);
@@ -7509,10 +7507,8 @@ static NSData *malachite_glir_to_air(NSData *glir, NSData *key, NSData **ret)
     return air;
 }
 
-// Compiled shaders, kept in memory and in the user's cache directory, so a pipeline made again (in this process, or
-// in the next: WindowServer's at every login) isn't compiled again. An entry's key is a SHA-256 of everything the
-// compile reads, this build of the plugin (its LC_UUID) among it, so an update leaves the old entries unused.
-// MALACHITE_NO_CACHE turns it off.
+// WindowServer recompiles at every login otherwise. Keys hash the plugin's LC_UUID too, so an update leaves old
+// entries unused. MALACHITE_NO_CACHE turns it off.
 enum {
     MALACHITE_CACHE_MAGIC = 0x434d564e,  // "NVMC"
     MALACHITE_CACHE_VERSION = 1,
@@ -7524,17 +7520,17 @@ struct malachite_cache_file {
     uint32_t magic, version;
     uint8_t identity[16];
     uint8_t key[CC_SHA256_DIGEST_LENGTH];
-    uint64_t size;  // of the entry after this header
-    uint8_t sum[CC_SHA256_DIGEST_LENGTH];  // the entry's SHA-256
+    uint64_t size;  // after this header
+    uint8_t sum[CC_SHA256_DIGEST_LENGTH];
 };
 
 static struct {
     bool on;
     uint8_t identity[16];
     NSCache<NSData *, NSData *> *memory;
-    int dir;  // the directory, or -1 (a sandbox that won't have it) to keep entries in memory only
+    int dir;  // -1 in a sandbox that won't have it
     os_unfair_lock disk_lock;
-    long long disk_bytes;  // what the directory holds as far as this process knows, -1 before it's looked
+    long long disk_bytes;  // as far as this process knows, -1 before it's looked
     unsigned memory_hits, disk_hits, misses;
 } malachite_cache;
 
@@ -7564,7 +7560,7 @@ static bool malachite_cache_init(void)
             return;
         malachite_cache.memory = [NSCache new];
         malachite_cache.memory.totalCostLimit = MALACHITE_CACHE_MEMORY;
-        // confstr's is per user and there for daemons (WindowServer's _windowserver) and sandboxed apps as well
+        // confstr's is per user and exists for daemons (_windowserver) and sandboxed apps too
         char base[PATH_MAX];
         size_t n = confstr(_CS_DARWIN_USER_CACHE_DIR, base, sizeof(base));
         NSString *path = n && n <= sizeof(base) ? @(base)
@@ -7584,7 +7580,7 @@ static bool malachite_cache_init(void)
     return malachite_cache.on;
 }
 
-// lengths go in ahead of what's variable, so two different sets of inputs can't run together into the same bytes
+// lengths first, so different inputs can't run together into the same bytes
 static void malachite_cache_hash(CC_SHA256_CTX *c, const void *p, size_t n)
 {
     uint64_t len = n;
@@ -7621,7 +7617,7 @@ static void malachite_cache_name(char name[2 * CC_SHA256_DIGEST_LENGTH + 1], con
         snprintf(name + 2 * i, 3, "%02x", key[i]);
 }
 
-// for the kernel's log of a fault (gpu_bridge.h); it fits in the page of slack after the data
+// for the kernel's fault log (gpu_bridge.h); fits in the page of slack after the data
 static void malachite_tag_program(id<MTLBuffer> code, const struct nvk_header *h, NSString *name)
 {
     struct nvgpu_program_tag t = { NVGPU_PROGRAM_TAG };
@@ -7637,7 +7633,6 @@ static void malachite_tag_program(id<MTLBuffer> code, const struct nvk_header *h
     memcpy((uint8_t *)code.contents + ((h->sass_size + h->data_size + 255) & ~255u), &t, sizeof(t));
 }
 
-// a compile as the cache keeps it
 static NSData *malachite_cache_entry(const struct airc_kernel *k)
 {
     size_t bytes = (size_t)k->h.sass_size + k->h.data_size;
@@ -7650,7 +7645,7 @@ static NSData *malachite_cache_entry(const struct airc_kernel *k)
     return entry;
 }
 
-// an entry read back, checked as far as anything indexes or reads strings with what's in it
+// checked as far as anything indexes or reads strings with its contents
 static bool malachite_cache_entry_ok(NSData *entry)
 {
     const struct malachite_compiled *c = (const struct malachite_compiled *)entry.bytes;
@@ -7668,7 +7663,7 @@ static bool malachite_cache_entry_ok(NSData *entry)
     return true;
 }
 
-// an entry from the directory: anything that isn't exactly what this build wrote under that key is a miss
+// anything but exactly what this build wrote under the key is a miss
 static NSData *malachite_cache_read(const uint8_t key[CC_SHA256_DIGEST_LENGTH])
 {
     char name[2 * CC_SHA256_DIGEST_LENGTH + 1];
@@ -7716,8 +7711,7 @@ static int malachite_cache_older(const void *a, const void *b)
     return (x->tv_nsec > y->tv_nsec) - (x->tv_nsec < y->tv_nsec);
 }
 
-// the directory past its cap loses its least recently used entries, down to 3/4 of the cap so the next store doesn't
-// do it again; the bytes left in it. Its own fd: readdir moves an offset malachite_cache.dir's other users share.
+// Down to 3/4 of the cap so the next store doesn't evict again. Its own fd, as readdir moves a shared offset.
 static long long malachite_cache_evict(void)
 {
     int fd = openat(malachite_cache.dir, ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -7760,7 +7754,7 @@ static long long malachite_cache_evict(void)
     return total;
 }
 
-// written whole under a name of its own first, so a reader never sees half an entry
+// written under a temporary name first, so a reader never sees half an entry
 static void malachite_cache_write(const uint8_t key[CC_SHA256_DIGEST_LENGTH], NSData *entry)
 {
     if (malachite_cache.dir < 0)
@@ -7814,17 +7808,14 @@ static void malachite_cache_store(const uint8_t key[CC_SHA256_DIGEST_LENGTH], NS
     malachite_cache_write(key, entry);
 }
 
-static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has global state; one compile at a time
+static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has global state
 
 - (id<MTLBuffer>)compile:(id<MTLFunction>)function header:(struct nvk_header *)h error:(NSError **)error
 {
     return [self compile:function linked:nil vertex:NULL stageIn:NULL samples:1 outputs:NULL header:h error:error];
 }
 
-// Compile a function's AIR to SASS with airc, in process, into a GPU-mapped buffer. nil (and *error) on failure.
-// The pipeline's linked functions are what the function's visible-function calls resolve to; a fragment function's
-// inputs are paired with the vertex function's outputs (vertex) by name, and a vertex function's are given back;
-// a kernel's stage input is fetched as stageIn lays it out. samples is the pipeline's raster sample count.
+// Linked functions resolve visible-function calls; fragment inputs pair with vertex's outputs by name.
 - (id<MTLBuffer>)compile:(id<MTLFunction>)function
                   linked:(MTLLinkedFunctions *)linked
                   vertex:(const struct airc_varyings *)vertex
@@ -7844,8 +7835,7 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
         NSData *converted = malachite_glir_to_air(air, key, &ret);
         if (converted)
             air = converted;
-        // a vertex function with a uniform block comes back with no return data, and is as much a GL one: without
-        // its arguments the renderer finds no uniform buffer to bind
+        // a vertex function with a uniform block has no return data, yet the renderer needs its arguments
         objc_setAssociatedObject(function, &malachite_return_key, ret, OBJC_ASSOCIATION_RETAIN);
         if (malachite_trace)
             os_log(OS_LOG_DEFAULT, "Malachite trace: GL function: %lu bytes of IR, key %lu bytes, converted %d, return data %lu",
@@ -7862,9 +7852,7 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
             [names addObject:fn.name ?: @""];
         }
     }
-    // with the trace on, /tmp/malachite-override-<name>.air stands in for the function's own bitcode: another app's
-    // shader replayed under a stand-in function of its name (tools/mtl/mtlreplay), and <name>.linked<i>.air for
-    // its i-th linked function's, as the dump names them
+    // with the trace on, /tmp/malachite-override-<name>.air (and .linked<i>.air) replace the bitcode, for mtlreplay
     NSString *over_path = [NSString stringWithFormat:@"/tmp/malachite-override-%@.air", function.name];
     NSData *over = malachite_trace && malachite_trusted_file(over_path.fileSystemRepresentation, true)
                        ? [NSData dataWithContentsOfFile:over_path]
@@ -7883,7 +7871,7 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
     if (malachite_rec_only && air)
         objc_setAssociatedObject(function, &malachite_air_key, @[ air, [bitcode copy], [names copy] ],
                                  OBJC_ASSOCIATION_RETAIN);
-    // an override is always compiled: it's there because the compiler is being worked on
+    // overrides skip the cache, as the compiler is being worked on
     bool cached = !over && malachite_cache_init();
     uint8_t key[CC_SHA256_DIGEST_LENGTH];
     if (cached)
@@ -7909,9 +7897,7 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
     const struct malachite_compiled *c = (const struct malachite_compiled *)entry.bytes;
     if (!failed && outputs)
         *outputs = c->outputs;
-    // reflection for the ones that read it: OpenGL's renderer, and OpenCL, whose kernels come as __entry_<name> and
-    // which takes its arguments' indices from it (without, clSetKernelArg says there's no such argument), and counts
-    // them from the function's own reflection (malachite_cl_reflection)
+    // OpenCL takes argument indices from this, or clSetKernelArg finds no such argument
     bool cl = !gl && [function.name hasPrefix:@"__entry_"];
     if (!failed && (gl || cl))
         objc_setAssociatedObject(function, &malachite_arguments_key,
@@ -7921,19 +7907,15 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
         objc_setAssociatedObject(function, &malachite_cl_program_key, malachite_cl_program_arguments(c),
                                  OBJC_ASSOCIATION_RETAIN);
     *h = failed ? (struct nvk_header){} : c->h;
-    // the SMs prefetch instructions past a program's end: a page of slack keeps that inside the buffer (with none it
-    // reads the next mapping, and faults once that one is freed). The constant data goes between the two.
+    // SMs prefetch past a program's end and fault once the next mapping is freed, so a page of slack follows
     id<MTLBuffer> code = failed ? nil : [self newBufferWithLength:h->sass_size + h->data_size + 4096 options:0];
     if (code) {
         memcpy(code.contents, c + 1, h->sass_size + h->data_size);
         malachite_tag_program(code, h, function.name);
     }
 
-    // the AIR, for build/airc to reproduce a failure with; with the trace on, every shader's (not an override)
-    // (in /tmp, or for a sandboxed process that can't write there, its own temporary directory)
-    // (GL programs are all __main: numbered)
-    // (GL programs are all __main, and Unity's translated shaders all xlatMtlMain: numbered, and the code each one
-    // compiled to logged, so kern.malachite_prof's addresses lead to their AIR)
+    // for build/airc to reproduce failures; numbered as GL programs are all __main, and the code address logged
+    // so kern.malachite_prof's addresses lead to their AIR
     NSString *dump = nil, *file = function.name;
     bool numbered = gl || malachite_trace || malachite_dump;
     if (numbered) {
@@ -7941,8 +7923,7 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
         file = [NSString stringWithFormat:@"%@-%d", function.name, __sync_fetch_and_add(&programs, 1)];
     }
     if (failed || ((malachite_trace || malachite_dump) && !over)) {
-        // not atomically: where the sandbox refuses the file, an atomic write leaves its temporary folder behind,
-        // one for each failed compile
+        // an atomic write the sandbox refuses leaves a temporary folder behind per compile
         dump = [NSString stringWithFormat:@"/tmp/malachite-%@.air", file];
         if (![air writeToFile:dump atomically:NO]) {
             dump = [NSTemporaryDirectory() stringByAppendingFormat:@"malachite-%@.air", file];
@@ -7965,8 +7946,7 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
     return code;
 }
 
-// a tessellated draw's vertex stage (d NULL) or the tessellation init stage of d, generated into a GPU-mapped buffer as
-// compile: does a function; nil, and *why, on failure
+// the vertex stage when d is NULL
 static id<MTLBuffer> malachite_tess_stage(id<MTLDevice> device, const struct airc_tess_desc *d, struct nvk_header *h,
                                       NSString **why)
 {
@@ -7984,8 +7964,7 @@ static id<MTLBuffer> malachite_tess_stage(id<MTLDevice> device, const struct air
     return code;
 }
 
-// A compute pipeline's stage input as airc takes it, in out: NULL for one that describes no attribute, and NULL with
-// *why for one airc can't fetch. MTLAttributeFormat has MTLVertexFormat's values.
+// MTLAttributeFormat has MTLVertexFormat's values
 static const struct airc_stage_in *malachite_stage_in(MTLStageInputOutputDescriptor *sd, struct airc_stage_in *out,
                                                   NSString **why)
 {
@@ -8014,7 +7993,7 @@ static const struct airc_stage_in *malachite_stage_in(MTLStageInputOutputDescrip
     return any ? out : NULL;
 }
 
-// a kernel with the functions its visible-function calls resolve to (MPS's stitched ones), and its stage input
+// linked resolves visible-function calls (MPS's stitched kernels)
 - (id)computePipeline:(id<MTLFunction>)function
                linked:(MTLLinkedFunctions *)linked
               stageIn:(MTLStageInputOutputDescriptor *)stageIn
