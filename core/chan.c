@@ -400,7 +400,7 @@ void chan_release_queue(struct chan *ch, uint64_t semva, uint32_t payload)
 #define MEM_OP_L2_SYSMEM_INVALIDATE (0xeu << 27)
 #define MEM_OP_L2_FLUSH_DIRTY (0x10u << 27)
 
-void chan_l2_sysmem(struct chan *ch, int invalidate)
+void chan_l2_sysmem(struct chan *ch)
 {
     uint32_t push[] = {
         MTHD(0, MEM_OP_A, 4), 0, 0, 0, MEM_OP_MEMBAR,
@@ -409,7 +409,7 @@ void chan_l2_sysmem(struct chan *ch, int invalidate)
         MTHD(0, MEM_OP_A, 4), 0, 0, 0, MEM_OP_L2_SYSMEM_INVALIDATE,
         MTHD(0, MEM_OP_A, 4), 0, 0, 0, MEM_OP_MEMBAR,
     };
-    chan_push(ch, push, invalidate ? sizeof(push) / 4 : 15);
+    chan_push(ch, push, sizeof(push) / 4);
 }
 
 void chan_acquire_queue_switch(struct chan *ch, uint64_t semva, uint32_t payload)

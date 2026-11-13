@@ -106,9 +106,9 @@ void chan_copy_surface_queue(struct chan *ch, const struct copy_surface *src, co
                              uint32_t bytes, uint32_t lines, uint32_t remap, uint64_t semva, uint32_t payload);
 // a copy channel writing payload to the word at semva once the work queued before it is done
 void chan_release_queue(struct chan *ch, uint64_t semva, uint32_t payload);
-// queued on an admin channel: L2's dirty lines written back, and with invalidate its lines of system memory dropped
-// too, so VMM_CACHED memory the CPU wrote is read afresh
-void chan_l2_sysmem(struct chan *ch, int invalidate);
+// queued on an admin channel: L2's dirty lines written back, then its lines of system memory dropped, so
+// VMM_CACHED memory the CPU writes next is read afresh
+void chan_l2_sysmem(struct chan *ch);
 // the channel's later work waits until the word at semva has reached payload (a release by another channel)
 void chan_acquire_queue(struct chan *ch, uint64_t semva, uint32_t payload);
 // likewise, but giving the engine to other channels while it waits (ACQUIRE_SWITCH_TSG): a wait that may never end

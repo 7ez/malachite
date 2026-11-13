@@ -303,8 +303,8 @@ struct gpu_ctx {
     unsigned draw_next;
     uint32_t draw_pending;  // the last unwaited payload, 0 for none
     uint32_t draws_queued;  // draws the GPU hasn't been told of
-    // an app's system memory is VMM_CACHED: a command buffer starts by dropping L2's stale lines of it and ends by
-    // writing L2's dirty ones back (l2_sysmem), so the CPU and WindowServer's uncached mappings see them
+    // an app's system memory is VMM_CACHED: a command buffer ends by writing L2's dirty lines of it back and dropping
+    // the rest (l2_sysmem), so the CPU and WindowServer's uncached mappings see them and the CPU's next writes are read
     bool cached_sys;
     uint64_t methods_va;  // the mapping push_run last found a run in
     gsp_fault fault;      // GSP-RM's word of the last MMU fault, for recover()'s log; type NULL for none
@@ -320,7 +320,9 @@ struct gpu_ctx {
     // told to wait for, ce_last the last one queued, and ce_half_seq what the copy pushbuffer's halves last held.
     uint32_t ce_pending, ce_last, ce_half_seq[2];
     int ce_half;
-    uint32_t l2_seq;  // the payload of the last L2 flush (l2_sysmem): with nothing queued since, L2 is clean already
+    // the payload of the last L2 flush (l2_sysmem) and copy_seq then: with nothing queued since, L2 is clean already.
+    // l2_seq is 0 after a new mapping. l2_begun: Gpu::cached_begins at its last command buffer.
+    uint32_t l2_seq, l2_copy_seq, l2_begun;
     // the latest launches, their last payload and the GPFIFO entry after them: on a new channel, the ones a fault
     // lost run again (the first of them only once, as it may be what faulted)
     struct {
@@ -934,6 +936,7 @@ class Gpu : public IOService
         return __atomic_exchange_n(&c->busy_unbilled, 0, __ATOMIC_RELAXED);
     }
     uint64_t recoveries = 0;
+    uint32_t cached_begins = 0;  // command buffers begun by contexts with VMM_CACHED memory
     IOReturn gpu_stats(struct nvgpu_stats *out);
 
     static const uint32_t TEX_HEADER_POOL = 0x400, TEX_SAMPLER_POOL = 0x800;  // offsets in kctx.compute_cbuf
@@ -988,24 +991,31 @@ class Gpu : public IOService
             c->draws_queued = 0;
         }
     }
-    // A command buffer of a context with VMM_CACHED memory: before its work L2 drops its lines of system memory, which
-    // the CPU may have written since (or another app, before the pages were this one's); after it, L2's dirty lines
-    // go back, and the release its completion waits for comes after that. On the copy channel, an admin one (user
-    // channels may not run MEM_OP's L2 operations), once the work before is done; the next draw or dispatch waits
-    // for it (after_copies).
+    // A command buffer of a context with VMM_CACHED memory: after its work L2's dirty lines of system memory go back
+    // and the rest are dropped, and the release its completion waits for comes after that. The next one then reads
+    // afresh what the CPU wrote meanwhile; it drops them itself first only when lines may have come in since: its own
+    // work between, another app's command buffer (L2 is the whole GPU's, and pages may be shared) or a new mapping
+    // (pages another app had). On the copy channel, an admin one (user channels may not run MEM_OP's L2
+    // operations), once the work before is done; the next draw or dispatch waits for it (after_copies).
     void l2_sysmem(gpu_ctx *c, bool begin)
     {
-        if (!c->cached_sys || (!begin && !c->draw_pending) || !compute_bridge_init(c) || c->copy_faulted ||
-            ce_room(c, 0x200) != kIOReturnSuccess)
+        if (!c->cached_sys)
+            return;
+        bool clean = c->l2_seq == c->compute_seq && c->l2_copy_seq == c->copy_seq;
+        if (begin) {
+            clean = clean && c->l2_seq && c->l2_begun == cached_begins;
+            c->l2_begun = ++cached_begins;
+        }
+        // room for three entries: the wait, the L2 operations and the release
+        if (clean || !compute_bridge_init(c) || c->copy_faulted || ce_room(c, 0x300) != kIOReturnSuccess)
             return;
         kick_draws(c);
-        if (!begin && c->draw_pending == c->l2_seq)
-            return;
-        // the copy channel's own work is done in order: only the graphics channel's is waited for
-        if (c->draw_pending && c->draw_pending != c->ce_last)
+        // the copy channel's own work is done in order: only the graphics channel's is waited for, if still going
+        if (c->draw_pending && c->draw_pending != c->ce_last && (int32_t)(*c->compute_sem - c->draw_pending) < 0)
             chan_acquire_queue_switch(&c->copy_ch, c->compute_semva, c->draw_pending);
-        chan_l2_sysmem(&c->copy_ch, begin);
+        chan_l2_sysmem(&c->copy_ch);
         c->ce_pending = c->ce_last = c->draw_pending = c->l2_seq = ++c->compute_seq;
+        c->l2_copy_seq = c->copy_seq;
         chan_release_queue(&c->copy_ch, c->compute_semva, c->compute_seq);
     }
     // A kick is the slowest part of a draw: a read across the bus and a doorbell. Draws share one, a few at a time so
@@ -2417,6 +2427,8 @@ IOReturn Gpu::gpu_map(gpu_ctx *c, IOMemoryDescriptor *md, uint64_t *outva)
     // through L2 for an app (a BVH in a shared buffer read over the bus line by line ran ~15 times slower)
     unsigned flags = c != &kctx && strcmp(c->owner, "WindowServer") ? VMM_CACHED : 0;
     c->cached_sys |= flags != 0;
+    if (flags)
+        c->l2_seq = 0;  // L2 may still hold lines of these pages from whoever had them last
     if (!va || (copy ? vmm_map_vram(&c->vm, va, copy, size, 0) : vmm_map_sys(&c->vm, va, d, 0, size, flags))) {
         if (va)
             map_va_free(c, va, size, false);
@@ -4182,19 +4194,21 @@ IOReturn Gpu::drain(gpu_ctx *c, int ms)
 // An app's frame finishing: the wait is the length of its GPU work, and held under the lock it would stop everyone
 // else's, WindowServer's composite with them, and the submissions that bring a switched-out channel back. So the
 // lock is only taken to look, a fault is mended as drain would, and drain finishes up once the work is done or 2 s
-// have gone. A long wait sleeps rather than spins.
+// have gone. A long wait sleeps rather than spins. L2's write-back is queued once the work is done, so the copy
+// channel has nothing to wait for switched out; OpenCL waits for each kernel, so a short wait is polled closely.
 IOReturn Gpu::sync_ctx(uintptr_t handle)
 {
     uint64_t t0 = time_us();
-    for (bool ended = false;; ended = true) {
+    auto done = [](const gpu_ctx *c) {
+        return !c->draw_pending || !c->compute_sem || (int32_t)(*c->compute_sem - c->draw_pending) >= 0;
+    };
+    for (bool flushed = false;;) {
         take();
         gpu_ctx *c = ctx_of(handle);
         if (!c || c->refused_until > time_us()) {
             give();
             return !c ? kIOReturnNotReady : kIOReturnNotPermitted;
         }
-        if (!ended)
-            l2_sysmem(c, false);
         kick_draws(c);
         if (gsp && (gsp_pending(gsp) || c->compute_faulted || c->copy_faulted)) {
             gsp_poll(gsp);
@@ -4202,8 +4216,11 @@ IOReturn Gpu::sync_ctx(uintptr_t handle)
                 recover(c);
         }
         uint64_t waited = time_us() - t0;
-        if (!c->draw_pending || !c->compute_sem || (int32_t)(*c->compute_sem - c->draw_pending) >= 0 ||
-            waited > 2000000) {
+        if (!flushed && done(c)) {
+            l2_sysmem(c, false);
+            flushed = true;
+        }
+        if ((flushed && done(c)) || waited > 2000000) {
             stats[ST_SYNC]++;
             IOReturn r = settle(drain(c, 10));
             stats[ST_SYNC_US] += time_us() - t0;
@@ -4211,7 +4228,7 @@ IOReturn Gpu::sync_ctx(uintptr_t handle)
             return r;
         }
         give();
-        delay_us(waited < 10000 ? 20 : 1000);
+        delay_us(waited < 1000 ? 2 : waited < 10000 ? 20 : 1000);
     }
 }
 
