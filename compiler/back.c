@@ -1176,6 +1176,21 @@ static struct offset {
 } g_offsets[32];
 static int g_noffsets;
 
+// the operand vectors the block's texture ops have gathered, by their values: a later op on the same handle and
+// LOD (or coordinates) reads the same registers rather than copying them in again
+static struct texvec {
+    int block, n;
+    struct ir_val *val[4];
+    int vreg;
+} g_texvecs[8];
+static int g_ntexvecs;
+int airc_no_texvec, airc_texvec_shared;
+
+static int same_value(const struct ir_val *a, const struct ir_val *b)
+{
+    return a == b || (a->op == IR_CONST && b->op == IR_CONST && a->imm == b->imm && a->type == b->type);
+}
+
 static int address_use(const struct ir_val *u, unsigned i)
 {
     return i == 0 && (u->op == IR_LDG || u->op == IR_STG || (u->op == IR_ADDR && g_ur[u->id]));
@@ -1958,12 +1973,32 @@ static void lower_value(struct ir_val *v)
         int k[2] = { n0 + txd, nsrc - n0 + !txd }, vec[2], c[2][4], q[4];
         if (k[0] > 4 || k[1] > 4)
             airc_fail("a texture op with too many operands");
-        for (int j = 0; j < 2; j++)
-            vec[j] = new_cluster(k[j], k[j] > 2 ? 4 : k[j], c[j]);
-        mov_into(c[!txd][0], v->src[nsrc]);
+        struct ir_val *val[2][4];
+        val[!txd][0] = v->src[nsrc];
         for (int i = 0; i < nsrc; i++) {
             int j = i >= n0;
-            mov_into(c[j][i - (j ? n0 : 0) + (j != txd)], v->src[i]);
+            val[j][i - (j ? n0 : 0) + (j != txd)] = v->src[i];
+        }
+        if (g_ntexvecs && g_texvecs[0].block != g_block)
+            g_ntexvecs = 0;
+        for (int j = 0; j < 2; j++) {
+            vec[j] = -1;
+            for (int t = 0; t < g_ntexvecs && vec[j] < 0; t++) {
+                int same = !airc_no_texvec && g_texvecs[t].n == k[j];
+                for (int i = 0; i < k[j] && same; i++)
+                    same = same_value(g_texvecs[t].val[i], val[j][i]);
+                if (same)
+                    vec[j] = g_texvecs[t].vreg;
+            }
+            airc_texvec_shared |= vec[j] >= 0;
+            if (vec[j] >= 0)
+                continue;
+            vec[j] = new_cluster(k[j], k[j] > 2 ? 4 : k[j], c[j]);
+            for (int i = 0; i < k[j]; i++)
+                mov_into(c[j][i], val[j][i]);
+            struct texvec *t = &g_texvecs[g_ntexvecs < 8 ? g_ntexvecs++ : 7];
+            *t = (struct texvec){ g_block, k[j], { 0 }, vec[j] };
+            memcpy(t->val, val[j], k[j] * sizeof(*val[j]));
         }
         v->vreg = new_cluster(4, 2, q);  // R,G in the first pair, B,A in the second, an even base
         struct mop *m = emit_mop(MK_TEX);
@@ -5216,6 +5251,7 @@ unsigned char *airc_back(struct ir_func *f, const struct airc_info *info, unsign
     find_lop3(f);
     find_uniform_bases(f);
     g_noffsets = 0;
+    g_ntexvecs = 0;
     memset(g_region_start, 0, sizeof(g_region_start));
     memset(g_region_end, 0, sizeof(g_region_end));
     for (struct ir_block *b = f->entry, *prev = NULL; b; b = b->next)

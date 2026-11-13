@@ -66,6 +66,8 @@ struct ir_val *airc_udiv(struct ir_block *b, struct ir_val *n, uint32_t d);
 void airc_opt(struct ir_func *f);
 // airc_opt unrolls small loops unless airc_no_unroll is set, and sets airc_unrolled when it does
 extern int airc_no_unroll, airc_unrolled;
+// texture ops share operand registers (airc_back) unless airc_no_texvec is set; airc_texvec_shared says one did
+extern int airc_no_texvec, airc_texvec_shared;
 // the raster sample count of the pipeline a fragment function is compiled for
 extern unsigned airc_samples;
 // a local array that is only a copy of read-only memory, read from that memory instead; 1 if it changed f (which

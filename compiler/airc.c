@@ -197,6 +197,7 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
             return -1;
         }
     airc_no_unroll = airc_unrolled = 0;
+    airc_no_texvec = airc_texvec_shared = 0;
     airc_samples = samples;
     int ret = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, print_ir, 0, k);
     // an unrolled loop's copies hold more values at once: compiled again with its loops as they were, that is kept
@@ -240,7 +241,27 @@ int airc_compile_linked(const void *air, size_t len, const struct airc_source *l
         }
         free(r);
     }
-    airc_no_unroll = 0;
+    // texture ops sharing operand registers hold them longer, which can cost a register granule: compiled again
+    // with copies, both with and without remat, and kept if that runs more warps (40 registers or fewer run all 48)
+    for (int again_remat = 0; again_remat < 2 && !ret && airc_texvec_shared && k->h.reg_count > 40; again_remat++) {
+        struct airc_kernel *r = calloc(1, sizeof(*r));
+        char *error = g_error;
+        g_error = r->error;
+        g_error_size = sizeof(r->error);
+        airc_no_texvec = 1;
+        int again = compile_stage(mod, lmod, linked, nlinked, vertex, stage_in, fc, nfc, 0, again_remat, r);
+        airc_no_texvec = 0;
+        g_error = error;
+        g_error_size = sizeof(k->error);
+        if (!again && warps(r->h.reg_count) > warps(k->h.reg_count)) {
+            free(k->sass);
+            *k = *r;
+        } else {
+            free(r->sass);
+        }
+        free(r);
+    }
+    airc_no_unroll = airc_no_texvec = 0;
     for (unsigned i = 0; i < nlinked; i++) {
         LLVMDisposeModule(lmod[i]);
         LLVMDisposeMemoryBuffer(lmb[i]);
