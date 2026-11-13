@@ -9,6 +9,17 @@ private let kextID = "pl.aochi.malachite"
 private let policyDB = "/var/db/SystemPolicyConfiguration/KextPolicy"
 private let sqlite = "/usr/bin/sqlite3"
 
+// read from the file each time: Bundle caches what it read first
+func bundleID(_ path: String) -> String? {
+    NSDictionary(contentsOfFile: "\(path)/Contents/Info.plist")?["CFBundleIdentifier"] as? String
+}
+
+// a kext or bundle of this driver, from any build, not another driver's of the same name
+func ours(_ path: String) -> Bool {
+    let id = bundleID(path) ?? ""
+    return id.hasPrefix("pl.aochi.") || id.hasPrefix("uk.aochi.")
+}
+
 // the driver itself, not just its app
 func oldDriverInstalled() -> Bool {
     let paths = ["/Library/GPUBundles/NVMTLDriver.bundle", oldSupportDir] + oldKexts.map { "/Library/Extensions/\($0).kext" }

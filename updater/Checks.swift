@@ -14,6 +14,18 @@ private func keep(_ text: String, containing words: [String]) -> [String] {
     }
 }
 
+// its kexts or Metal plugin, installed or loaded: its uninstaller leaves its folder in /Library behind
+private func otherDriver() -> Bool {
+    let ext = "/Library/Extensions"
+    let kexts = (try? FileManager.default.contentsOfDirectory(atPath: ext)) ?? []
+    let ids = kexts.compactMap { bundleID("\(ext)/\($0)")?.lowercased() }
+    let loaded = capture("/usr/sbin/kextstat", []).text.lowercased()
+    let metal = "/Library/GPUBundles/NVMTLDriver.bundle"
+    return kexts.contains("NVDAStartup.kext") || loaded.contains("com.nvidia.web")
+        || ids.contains { $0.hasPrefix("com.nullmoth.") } || loaded.contains("com.nullmoth.")
+        || exists("/Library/GPUBundles/nvmtl") || (exists(metal) && !ours(metal))
+}
+
 // the checks before installing: false when it can't go on or the user declines
 func checkMac(setsVariableWriteOff: Bool, _ o: InstallOptions, say: Say, ask: Ask) -> Bool {
     var warned = false
@@ -75,10 +87,7 @@ func checkMac(setsVariableWriteOff: Bool, _ o: InstallOptions, say: Say, ask: As
             return false
         }
     }
-    let loaded = capture("/usr/sbin/kextstat", []).text.lowercased()
-    if FileManager.default.fileExists(atPath: "/Library/Extensions/NVDAStartup.kext") ||
-        FileManager.default.fileExists(atPath: "/Library/NullMoth") || loaded.contains("nullmoth")
-        || loaded.contains("com.nvidia.web") {
+    if otherDriver() {
         note("another NVIDIA driver is installed; remove it first")
     }
     if warned, !o.yes {
