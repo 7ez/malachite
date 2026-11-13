@@ -7,11 +7,11 @@ struct InstallOptions {
     var fullBar = false
     var yes = false
     var dryRun = false
-    // the GUI has asked about DisableVariableWrite itself, as it has no terminal to ask on
+    // the GUI asks about DisableVariableWrite itself, as it has no terminal to ask on
     var variableWriteOff = false
 }
 
-// stopped: nothing is broken, and running it again later finishes the job
+// stopped leaves nothing broken, and a rerun finishes the job
 enum Outcome {
     case done, stopped, failed
 }
@@ -28,7 +28,7 @@ let kmutilArgs = [
 ]
 let configBackup = "\(supportDir)/config.plist.backup"
 
-// every change goes through here, so a dry run prints each one instead of making it
+// every change goes through here so a dry run can print it instead
 final class Steps {
     let dry: Bool
     let say: Say
@@ -45,7 +45,7 @@ final class Steps {
         return ([URL(fileURLWithPath: path).lastPathComponent] + words).joined(separator: " ")
     }
 
-    // a log is opened fresh, never through a link left at its path: this runs as root and the path is in /tmp
+    // never through a link left at the path, as this runs as root and the log is in /tmp
     private func openLog(_ path: String) -> FileHandle? {
         unlink(path)
         let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o644)
@@ -92,12 +92,12 @@ final class Steps {
         }
     }
 
-    // a fresh copy beside the old one, then a rename, so a running process never sees a half-written file
+    // copy beside, then rename, so a running process never sees a half-written file
     func put(_ src: String, _ dst: String, sign: Bool = false, fat: Bool = false) throws {
         let new = dst + ".new"
         try remove(new)
         try must("/bin/cp", ["-R", src, new])
-        // FAT has no owners, and a chown failing there mustn't stop an install halfway
+        // FAT has no owners, and a failed chown there mustn't stop an install halfway
         if !fat {
             try must("/usr/sbin/chown", ["-R", "root:wheel", new])
         }
@@ -118,14 +118,13 @@ func exists(_ path: String) -> Bool {
     (try? FileManager.default.attributesOfItem(atPath: path)) != nil
 }
 
-// the first file or folder a package needs that isn't there
 func payloadMissing(_ pkg: String) -> String? {
     let need = ["Kexts/Malachite.kext", "Bundles/MalachiteMetal.bundle", "Bundles/NVVideo.bundle", "bin/malachitectl", "tests",
                 "firmware/570"]
     return need.first { !exists("\(pkg)/\($0)") }
 }
 
-// the folder the unpacked zip has this app in: App/Malachite.app beside the payload
+// the unpacked zip has App/Malachite.app beside the payload
 func defaultPackage() -> String {
     Bundle.main.bundleURL.deletingLastPathComponent().deletingLastPathComponent().path
 }
@@ -150,8 +149,7 @@ func install(_ opts: InstallOptions, say: @escaping Say, ask: @escaping Ask) -> 
     if saved["variable-write-off"] == "1" {
         o.variableWriteOff = true
     }
-    // the EFI is opened for the options asked for, and to turn off (and clear out) the NVBring.kext an older install
-    // put in OpenCore; every other install and update leaves it alone
+    // the EFI is only opened for --efi options or to remove an older install's NVBring.kext from OpenCore
     let legacy = oldDriverInstalled()
     let found = o.editEFI || legacy ? findEFI(o.efiPath ?? saved["efi"], say: say) : nil
     defer { found?.release() }
@@ -176,7 +174,7 @@ private func copyPayload(_ pkg: String, efi: String?, legacy: Bool, saved: [Stri
     let fm = FileManager.default
     say("Installing")
     try steps.mkdir("\(supportDir)/570")
-    // gsp.bin and GA10x's set, then a folder for each other family's (570/ad10x)
+    // GA10x's files sit at the top, each other family's in a folder (570/ad10x)
     let firmware = (try? fm.contentsOfDirectory(atPath: "\(pkg)/firmware/570").sorted()) ?? []
     for f in firmware {
         var dir: ObjCBool = false
@@ -196,7 +194,7 @@ private func copyPayload(_ pkg: String, efi: String?, legacy: Bool, saved: [Stri
 
     try steps.mkdir("/usr/local/bin")
     try steps.put("\(pkg)/bin/malachitectl", "/usr/local/bin/malachitectl")
-    // on a move from the old driver it goes with the rest of that, once Malachite is known to be in the collection
+    // a move from the old driver removes it later, once Malachite is known to be in the collection
     if !legacy {
         try steps.remove(oldCtl)
     }
@@ -204,13 +202,13 @@ private func copyPayload(_ pkg: String, efi: String?, legacy: Bool, saved: [Stri
 
     try steps.put("\(pkg)/bin", "\(supportDir)/bin")
     try steps.put("\(pkg)/tests", "\(supportDir)/tests")
-    // the scripts older packages put here
+    // left by older packages
     for old in ["check.sh", "collect-logs.sh"] where exists("\(supportDir)/\(old)") {
         try steps.remove("\(supportDir)/\(old)")
     }
     say("  test programs")
 
-    // the app changes the extra resolutions as the user, without asking for a password
+    // so the app can change the extra resolutions as the user, without a password
     if !exists(scaledFile) {
         try steps.write("", to: scaledFile)
     }
@@ -240,7 +238,7 @@ private func copyPayload(_ pkg: String, efi: String?, legacy: Bool, saved: [Stri
     }
 
     if !steps.dry, !kextApproved() {
-        // asks macOS to show its approval prompt, which a load attempt raises
+        // a load attempt makes macOS show its approval prompt
         steps.tool(kmutil, ["load", "-p", "/Library/Extensions/Malachite.kext"])
         say("Allow Malachite in System Settings > Privacy & Security, then restart if asked.")
         if legacy {
@@ -249,7 +247,7 @@ private func copyPayload(_ pkg: String, efi: String?, legacy: Bool, saved: [Stri
         }
     }
 
-    // before the old support folder, where they were, goes
+    // before the old support folder that held them goes
     try writeOptions(efi: efi, o, saved: saved, steps: steps)
     if legacy {
         try moveToMalachite(efi: efi, steps: steps, say: say)
@@ -281,11 +279,11 @@ private func installApp(_ pkg: String, steps: Steps, say: Say) throws {
         try steps.must("/usr/bin/xattr", ["-cr", app])
         say("  Malachite app")
     }
-    // the app this one replaces: it may be the one running, which keeps going on its open files
+    // the old app may be the one running, which is fine as it keeps its open files
     try steps.remove("/Applications/NVIDIA Driver.app")
 }
 
-// what the app reads on the next update
+// read by the next update
 private func writeOptions(efi: String?, _ o: InstallOptions, saved: [String: String], steps: Steps) throws {
     let path = efi ?? saved["efi"] ?? ""
     let bar = o.fullBar || saved["full-bar"] == "1"
@@ -293,7 +291,7 @@ private func writeOptions(efi: String?, _ o: InstallOptions, saved: [String: Str
     try steps.write("efi=\(path)\nfull-bar=\(bar ? 1 : 0)\nvariable-write-off=\(off ? 1 : 0)\n", to: "\(supportDir)/install-options")
 }
 
-// the edits to OpenCore's config.plist, the first of which copies the file aside (one copy, outside the small EFI)
+// the first edit backs config.plist up once, outside the small EFI
 private final class ConfigEdit {
     let cfg: String
     let steps: Steps
@@ -313,15 +311,13 @@ private final class ConfigEdit {
     }
 }
 
-// the options asked for with --efi: the BAR quirk, and DisableVariableWrite on AMD. A move from the old install keeps
-// the quirk: it may have been set by hand, which install-options doesn't know about
+// a move from the old install keeps the BAR quirk, as it may have been set by hand and install-options won't know
 private func editOpenCore(efi: String, _ o: InstallOptions, keepBar: Bool, steps: Steps, say: Say) throws {
     let cfg = "\(efi)/EFI/OC/config.plist"
     let edit = ConfigEdit(cfg: cfg, steps: steps)
 
-    // macOS leaves a GPU BAR over 1 GB unassigned. The driver then places BAR1 itself at full size (all of VRAM
-    // CPU-visible); ResizeAppleGpuBars 8 instead has OpenCore shrink it to 256 MB for macOS alone (Windows keeps
-    // Resizable BAR). --full-bar takes the quirk away again.
+    // macOS leaves a BAR over 1 GB unassigned and the driver then places BAR1 at full size itself; ResizeAppleGpuBars 8
+    // has OpenCore shrink it to 256 MB for macOS only, so Windows keeps Resizable BAR
     let key = ":Booter:Quirks:ResizeAppleGpuBars"
     let bars = plistValue(key, cfg) ?? ""
     if keepBar {
@@ -374,7 +370,7 @@ func uninstall(_ o: UninstallOptions, say: @escaping Say) -> Bool {
             "/Library/Video/Plug-Ins/NVVideo.bundle", "/Library/Video/Plug-Ins/NVVideo.bundle.new",
             supportDir, "/usr/local/bin/malachitectl", oldCtl, "/Applications/Malachite.app", "/Library/Extensions/Malachite.kext",
         ]
-        // an install from before the rename, if the move to Malachite never finished
+        // left by a move to Malachite that never finished
         let old = oldDriverInstalled()
         if old {
             paths += [oldSupportDir, "/Applications/NVIDIA Driver.app"] + oldBundles()

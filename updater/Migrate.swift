@@ -1,8 +1,8 @@
 import Foundation
 
-// The install from before the rename: NVBring.kext in OpenCore, NVFB.kext and NVAccel.kext in /Library/Extensions
+// the install from before the rename had NVBring.kext in OpenCore and NVFB/NVAccel.kext in /Library/Extensions
 let oldSupportDir = "/Library/Application Support/NVBring"
-// the control tool of the Malachite builds before malachitectl, and of the old driver
+// used by the old driver and by Malachite builds before malachitectl
 let oldCtl = "/usr/local/bin/nvbringctl"
 let oldKexts = ["NVFB", "NVAccel", "NVBring"]
 private let kextID = "pl.aochi.malachite"
@@ -14,7 +14,7 @@ func bundleID(_ path: String) -> String? {
     NSDictionary(contentsOfFile: "\(path)/Contents/Info.plist")?["CFBundleIdentifier"] as? String
 }
 
-// a kext or bundle of this driver, from any build, not another driver's of the same name
+// any build of ours, not another driver's bundle of the same name
 func ours(_ path: String) -> Bool {
     let id = bundleID(path) ?? ""
     return id.hasPrefix("pl.aochi.") || id.hasPrefix("uk.aochi.")
@@ -25,17 +25,17 @@ func oldDriverInstalled() -> Bool {
     exists(oldSupportDir) || oldBundles().contains(where: exists)
 }
 
-// the old install's kexts and Metal driver; another driver uses some of the same names
+// another driver uses some of the same names
 func oldBundles() -> [String] {
     (["/Library/GPUBundles/NVMTLDriver.bundle"] + oldKexts.map { "/Library/Extensions/\($0).kext" }).filter(ours)
 }
 
-// NVBring.kext is turned off in OpenCore; set once that is done, so a rerun doesn't need the EFI again for it
+// set once NVBring.kext is off in OpenCore, so a rerun doesn't need the EFI for it
 func ocEntryOff() -> Bool {
     exists("\(supportDir)/oc-off")
 }
 
-// the choices of the last install, from the support folder or, before the move, the old one
+// before the move they are in the old support folder
 func installOptions() -> [String: String] {
     parseFields([supportDir, oldSupportDir].lazy.compactMap {
         try? String(contentsOfFile: "\($0)/install-options", encoding: .utf8)
@@ -49,7 +49,7 @@ func parseFields(_ text: String) -> [String: String] {
     }, uniquingKeysWith: { _, last in last })
 }
 
-// what System Settings > Privacy & Security records when the user presses Allow
+// what Privacy & Security records when the user presses Allow
 func kextApproved() -> Bool {
     // nothing is recorded when consent is off, as it is on some Hackintoshes
     if capture("/usr/sbin/spctl", ["kext-consent", "status"]).text.contains("DISABLED") {
@@ -57,7 +57,7 @@ func kextApproved() -> Bool {
     }
     let query = "select count(*) from kext_policy where bundle_id = '\(kextID)' and allowed = 1"
     let out = capture(sqlite, [policyDB, query])
-    // an unreadable database isn't a refusal, and would stop a move for good; the collection check still has its say
+    // an unreadable database isn't a refusal and would block a move for good; the collection check still runs
     return out.status != 0 || Int(out.text.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0 > 0
 }
 
@@ -66,9 +66,8 @@ private func inCollection() -> Bool {
         .contains(kextID)
 }
 
-// Called with Malachite installed and the collection rebuilt, the old driver still in place. Nothing of the old
-// driver goes before the new kext is approved and in the collection, and the old OpenCore entry goes off before the
-// old kexts do, so a restart in between loads one driver or the other, never both.
+// nothing old goes before the new kext is approved and in the collection, and NVBring goes off in OpenCore before
+// the old kexts go, so a restart in between loads one driver, never both
 func moveToMalachite(efi: String?, steps: Steps, say: Say) throws {
     if !steps.dry, !inCollection() {
         throw Failure(message: "Malachite.kext isn't in the kext collection, see \(kmutilLog). Old driver untouched.")
@@ -79,7 +78,7 @@ func moveToMalachite(efi: String?, steps: Steps, say: Say) throws {
         let cfg = "\(efi)/EFI/OC/config.plist"
         let entries = kextEntries(cfg).nvbring
         if !entries.isEmpty {
-            // a rerun, or this install's own OpenCore edit, already has the untouched file there
+            // a rerun or this install's own OpenCore edit has saved the untouched file already
             if !exists(configBackup) {
                 try steps.must("/bin/cp", [cfg, configBackup])
             }
@@ -107,7 +106,7 @@ func moveToMalachite(efi: String?, steps: Steps, say: Say) throws {
     try rebuildCollection(steps, say: say)
 
     if exists(oldSupportDir) {
-        // the firmware is in the new folder already, from this package, and the install options are written to it
+        // this package's firmware and the install options are in the new folder already
         try steps.remove(oldSupportDir)
     }
 }

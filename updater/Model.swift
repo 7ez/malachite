@@ -24,12 +24,12 @@ final class Model: ObservableObject {
     @Published var status = ""
     @Published var busy: String?
     @Published var report = Report(title: "", text: "")
-    // a first install's choices
+    // used by a first install only
     @Published var useEFI = true
     @Published var fullBar = false
-    // an install from before the name Malachite, which the next install moves over
+    // an install from before the rename, which the next install moves over
     @Published var legacy = false
-    // the system volume's Metal driver is gone, as after a macOS update
+    // a macOS update took the system volume's Metal driver away
     @Published var repatch = false
     @Published var startAtLogin = UserDefaults.standard.object(forKey: "startAtLogin") as? Bool ?? true {
         didSet {
@@ -86,7 +86,7 @@ final class Model: ObservableObject {
                 status = exists("\(supportDir)/migrating") ? "Finish the move to Malachite \(update.version)"
                     : "Move to Malachite \(update.version)"
             }
-            // not waited for: the first time, it sits there until the user answers macOS's permission prompt
+            // not awaited, as the first time it waits on macOS's permission prompt
             if let update, installed != nil || legacy {
                 Task { await announce(update) }
             }
@@ -98,7 +98,7 @@ final class Model: ObservableObject {
         }
     }
 
-    // one notification per version; if it can't be shown, the menu bar item still says an update is there
+    // once per version; if it can't be shown, the menu bar item still says there is an update
     private func announce(_ m: Manifest) async {
         guard UserDefaults.standard.integer(forKey: "notifiedBuild") < m.build else { return }
         let center = UNUserNotificationCenter.current()
@@ -111,7 +111,7 @@ final class Model: ObservableObject {
         }
     }
 
-    // from /Applications only: a copy run from Downloads would register a path that goes away
+    // a copy run from Downloads would register a path that goes away
     func applyLoginItem() {
         guard Bundle.main.bundlePath.hasPrefix("/Applications/") else { return }
         let service = SMAppService.mainApp
@@ -136,7 +136,7 @@ final class Model: ObservableObject {
     func install() {
         guard let m = update, busy == nil else { return }
         var args = installArgs()
-        // the installer has no terminal here to ask on, so the app asks and says so
+        // the installer has no terminal to ask on here
         if !args.contains("--efi"), isAMD(), installOptions()["variable-write-off"] != "1" {
             guard confirm("Is DisableVariableWrite on?",
                           "On AMD, a kernel panic can write to NVRAM and leave the board unable to start. Set Booter > Quirks > DisableVariableWrite to true in config.plist and restart first.",
@@ -191,7 +191,7 @@ final class Model: ObservableObject {
             }
             step("Running the installer\n")
             let head = log
-            // the package is only data: the one program that runs is this app's own
+            // the package is only data; the program that runs as root is this app
             let command = [quote(selfPath), "--install", "--package", quote(pkg.path), "--yes"] + args.map(quote)
             let out = await admin(command.joined(separator: " ")) { text in
                 self.report.text = head + text
@@ -208,8 +208,7 @@ final class Model: ObservableObject {
         }
     }
 
-    // a first install's choices. An update leaves OpenCore alone, except to finish moving an older install over:
-    // that needs the EFI the last install used
+    // an update leaves OpenCore alone, except to finish moving an older install, which needs its EFI
     private func installArgs() -> [String] {
         var args: [String] = []
         if legacy {
@@ -231,7 +230,7 @@ final class Model: ObservableObject {
         guard confirm("Uninstall Malachite?", "Removes the driver and this app.", yes: "Uninstall") else { return }
         start("Uninstalling") {
             var command = [quote(selfPath), "--uninstall"]
-            // the EFI an older install edited, to turn NVBring.kext off there
+            // to turn off the NVBring.kext an older install put there
             if self.legacy, let efi = installOptions()["efi"], !efi.isEmpty {
                 command += ["--efi", quote(efi)]
             }

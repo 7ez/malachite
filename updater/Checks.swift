@@ -14,7 +14,7 @@ private func keep(_ text: String, containing words: [String]) -> [String] {
     }
 }
 
-// its kexts or Metal plugin, installed or loaded: its uninstaller leaves its folder in /Library behind
+// installed or loaded, as another driver's uninstaller leaves its folder in /Library behind
 private func otherDriver() -> Bool {
     let ext = "/Library/Extensions"
     let kexts = (try? FileManager.default.contentsOfDirectory(atPath: ext)) ?? []
@@ -26,7 +26,7 @@ private func otherDriver() -> Bool {
         || exists("/Library/GPUBundles/nvmtl") || (exists(metal) && !ours(metal))
 }
 
-// the checks before installing: false when it can't go on or the user declines
+// false when the install can't go on or the user declines
 func checkMac(setsVariableWriteOff: Bool, _ o: InstallOptions, say: Say, ask: Ask) -> Bool {
     var warned = false
     func note(_ text: String) {
@@ -48,7 +48,6 @@ func checkMac(setsVariableWriteOff: Bool, _ o: InstallOptions, say: Say, ask: As
         say("  \(arch) isn't supported, needs x86_64")
         return false
     }
-    // an NVIDIA GA10x (RTX 30) display controller: vendor 0x10de, device 0x22xx-0x25xx
     var vendor = false
     var gpu: String?
     for line in lines(capture("/usr/sbin/ioreg", ["-r", "-c", "IOPCIDevice", "-d", "1", "-l"], timeout: 60)) {
@@ -76,10 +75,8 @@ func checkMac(setsVariableWriteOff: Bool, _ o: InstallOptions, say: Say, ask: As
     for want in ["amfi_get_out_of_my_way=1", "-amfipassbeta"] where !" \(args) ".contains(" \(want) ") {
         note("boot-args are missing \(want)")
     }
-    // On AMD boards (AM4/AM5) whose OpenCore config rewrites the firmware memory map, a write to NVRAM from macOS (a
-    // kernel panic report is one, and an experimental driver may panic) can corrupt the firmware's variables until the
-    // board no longer starts. OpenCore's DisableVariableWrite stops macOS writing NVRAM at all. Neither --yes nor a
-    // missing terminal answers for the user here.
+    // on AMD boards whose OpenCore config rewrites the memory map, an NVRAM write such as a panic report can leave the
+    // board unable to start; neither --yes nor a missing terminal answers for the user here
     if isAMD(), !setsVariableWriteOff, !o.variableWriteOff {
         say("  On AMD, a kernel panic can write to NVRAM and leave the board unable to start.")
         say("  Set Booter > Quirks > DisableVariableWrite to true in config.plist and restart first, or use --efi.")
@@ -96,7 +93,6 @@ func checkMac(setsVariableWriteOff: Bool, _ o: InstallOptions, say: Say, ask: As
     return true
 }
 
-// a quick look at whether the driver is up: the GPU Metal sees, and a few of the driver's own tests on it
 func runChecks(say: Say) -> Bool {
     let bin = "\(supportDir)/bin"
     guard FileManager.default.fileExists(atPath: bin) else {

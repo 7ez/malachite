@@ -1,20 +1,18 @@
 import Foundation
 
-// A second copy of the Metal driver, on the system volume, for the sandboxed GPU processes of browsers: they may map
-// code from there but not from /Library/GPUBundles. As other root patchers do, it is copied onto the volume under the
-// sealed snapshot macOS boots from, and a new snapshot of that is booted from then on. A macOS update boots a fresh
-// sealed snapshot without it. The kext names this copy to Metal only when it is the same build as the one in
-// /Library/GPUBundles.
+// browsers' sandboxed GPU processes may map code from the system volume but not /Library/GPUBundles, so a copy goes
+// there and a new snapshot is booted; a macOS update boots a fresh sealed snapshot without it, and the kext names
+// this copy to Metal only when it is the same build as /Library/GPUBundles's
 let gpuBundle = "/Library/GPUBundles/MalachiteMetal.bundle"
 let systemBundle = "/System/Library/Extensions/MalachiteMetal.bundle"
 let rootPatchFile = "\(supportDir)/root-patch"
 private let bless = "/usr/sbin/bless"
-// left on the volume by OpenCore Legacy Patcher's own root patches
+// left by OpenCore Legacy Patcher's root patches
 private let oclpMarker = "/System/Library/CoreServices/OpenCore-Legacy-Patcher.plist"
 
-// on=0: turned off with --remove-root-patch. sealed=1: macOS's sealed snapshot was booted when the copy first went on,
-// so going back to it loses nothing. patched: the booted snapshot when the last patch was made, which tells a patch
-// waiting for a restart from one a macOS update took away. made: the snapshots bless made for the patches, by UUID
+// on=0 after --remove-root-patch; sealed=1 if the sealed snapshot was booted at the first patch, so going back loses
+// nothing; patched is the snapshot booted at the last patch, telling a pending patch from one an update took away;
+// made lists the UUIDs of the snapshots bless made
 func rootPatchState() -> [String: String] {
     parseFields((try? String(contentsOfFile: rootPatchFile, encoding: .utf8)) ?? "")
 }
@@ -23,7 +21,7 @@ func authenticatedRootOff() -> Bool {
     capture("/usr/bin/csrutil", ["authenticated-root", "status"]).text.contains("disabled")
 }
 
-// the booted snapshot, and the volume it was taken of
+// device is the volume the booted snapshot was taken of
 struct RootVolume {
     let device: String
     let snapshot: String
@@ -39,7 +37,7 @@ func rootVolume() -> RootVolume? {
                       sealed: info["Sealed"] as? String == "Yes")
 }
 
-// name by UUID, of the volume's snapshots
+// snapshot names by UUID
 private func snapshots(_ device: String) -> [String: String] {
     let out = capture("/usr/sbin/diskutil", ["apfs", "listSnapshots", "-plist", device], timeout: 60)
     let info = try? PropertyListSerialization.propertyList(from: out.data, format: nil) as? [String: Any]
@@ -52,17 +50,16 @@ private func snapshots(_ device: String) -> [String: String] {
     return names
 }
 
-// bless with a new snapshot to boot from; returns the UUIDs of the snapshots that made
+// returns the UUIDs of the snapshots bless made
 private func blessSnapshot(_ root: RootVolume, mnt: String, steps: Steps) throws -> [String] {
     let before = snapshots(root.device)
     try steps.must(bless, ["--mount", mnt, "--bootefi", "--create-snapshot"])
-    // the booted snapshot is always listed: an empty list failed, and every snapshot would pass for ours
+    // the booted snapshot is always listed, so an empty list failed and every snapshot would pass for ours
     guard !before.isEmpty else { return [] }
     return snapshots(root.device).keys.filter { before[$0] == nil }.sorted()
 }
 
-// each patch leaves the snapshot before it behind: deletes those of ours that are neither booted nor to be booted next,
-// never macOS's sealed one; returns the ones still there
+// each patch leaves the snapshot before it behind; macOS's sealed one is never deleted
 private func dropOldSnapshots(_ root: RootVolume, made: [String], keep: Set<String>, steps: Steps, say: Say) -> [String] {
     let names = snapshots(root.device)
     guard !names.isEmpty else { return made }
@@ -98,7 +95,7 @@ private func sameBundle(_ a: String, _ b: String) -> Bool {
     capture("/usr/bin/diff", ["-rq", a, b]).status == 0
 }
 
-// the volume under the booted snapshot, mounted writable for `body`
+// the volume under the booted snapshot, as the snapshot itself is read-only
 private func onSystemVolume(_ root: RootVolume, steps: Steps, _ body: (String) throws -> Void) throws {
     var template = Array("/private/tmp/malachite-root.XXXXXX".utf8CString)
     guard steps.dry || mkdtemp(&template) != nil else {
@@ -115,8 +112,7 @@ private func onSystemVolume(_ root: RootVolume, steps: Steps, _ body: (String) t
     try body(mnt)
 }
 
-// copies /Library/GPUBundles's Metal driver onto the system volume, unless it's there already; true when a restart
-// is needed for it
+// true when a restart is needed
 @discardableResult
 func patchRoot(steps: Steps, say: Say) throws -> Bool {
     guard authenticatedRootOff() else {
@@ -141,7 +137,7 @@ func patchRoot(steps: Steps, say: Say) throws -> Bool {
         let new = try blessSnapshot(root, mnt: mnt, steps: steps)
         let made = dropOldSnapshots(root, made: madeList(state) + new, keep: Set(new + [root.snapshot]), steps: steps,
                                     say: say)
-        // the seal is ours to have broken if the booted snapshot has our copy, or our patch of it waits for a restart
+        // we broke the seal if the booted snapshot has our copy or our patch of it awaits a restart
         let ours = exists(systemBundle) || state["patched"] == root.snapshot
         let sealed = root.sealed || (ours && state["sealed"] == "1")
         try steps.write("on=1\nsealed=\(sealed ? 1 : 0)\npatched=\(root.snapshot)\nmade=\(made.joined(separator: ","))\n",
@@ -152,8 +148,7 @@ func patchRoot(steps: Steps, say: Say) throws -> Bool {
     return changed
 }
 
-// takes the system volume's copy away again: back to macOS's sealed snapshot when nothing else could be on the volume,
-// otherwise a new snapshot without it, which keeps other patchers' changes
+// back to the sealed snapshot only when nothing else could be on the volume, to keep other patchers' changes
 @discardableResult
 func unpatchRoot(steps: Steps, say: Say) throws -> Bool {
     let state = rootPatchState()
@@ -188,8 +183,7 @@ func unpatchRoot(steps: Steps, say: Say) throws -> Bool {
     return changed
 }
 
-// wanted and possible, but not in the booted snapshot, and not just made and waiting for a restart: what a macOS
-// update leaves
+// wanted and possible but missing from the booted snapshot and not awaiting a restart, as after a macOS update
 func rootPatchLost() -> Bool {
     let state = rootPatchState()
     guard state["on"] != "0", exists(gpuBundle), !exists(systemBundle), authenticatedRootOff(),
