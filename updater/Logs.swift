@@ -91,6 +91,21 @@ func collectLogs(into dir: String, say: Say) throws -> String {
     let out = "\(dest)/\(name)"
     try fm.createDirectory(atPath: out, withIntermediateDirectories: true)
 
+    // everything the driver logged since it loaded, from its own buffer (macOS's logs keep little of it); first, as
+    // it's what a report needs most and it's quick
+    // the old driver's sysctl has its old name
+    say("Reading the driver's log")
+    var driverLog = capture("/usr/sbin/sysctl", ["-b", "kern.malachite_log"])
+    if driverLog.data.isEmpty {
+        driverLog = capture("/usr/sbin/sysctl", ["-b", "kern.nvrm_log"])
+    }
+    try driverLog.data.write(to: URL(fileURLWithPath: "\(out)/driver.txt"))
+    // what the GPU spent its time on, which a report of "runs badly" needs
+    for name in ["stats", "power"] {
+        try capture("/usr/sbin/sysctl", ["-b", "kern.malachite_\(name)"]).data.write(to: URL(fileURLWithPath: "\(out)/\(name).txt"))
+    }
+
+    say("Reading system details")
     var system = ""
     system += logText("/usr/bin/sw_vers", [])
     system += logText("/usr/bin/uname", ["-m"])
@@ -118,13 +133,7 @@ func collectLogs(into dir: String, say: Say) throws -> String {
     system += keep(logText("/usr/sbin/ioreg", ["-l", "-w0"]), containing: ["acpi-address-spaces"])
     try Data(system.utf8).write(to: URL(fileURLWithPath: "\(out)/system.txt"))
 
-    // everything the driver logged since it loaded, from its own buffer (macOS's logs keep little of it)
-    // the old driver's sysctl has its old name
-    var driverLog = capture("/usr/sbin/sysctl", ["-b", "kern.malachite_log"])
-    if driverLog.data.isEmpty {
-        driverLog = capture("/usr/sbin/sysctl", ["-b", "kern.nvrm_log"])
-    }
-    try driverLog.data.write(to: URL(fileURLWithPath: "\(out)/driver.txt"))
+    say("Searching the system log, a few minutes at most")
     // the driver's lines (Malachite:, gsp:, disp:, video:, fb:, accel:...), the old driver's (NVRM:, NVFB:...) and
     // WindowServer's view of the plugin
     let words = ["Malachite", "gsp:", "disp:", "video:", "fb:", "accel:", "queue:", "pipe:", "agdc:", "NVRM", "NVFB", "NVAccel",
@@ -137,14 +146,11 @@ func collectLogs(into dir: String, say: Say) throws -> String {
     kernelLog("eventMessage CONTAINS \"Malachite trace\"", to: "\(out)/traces.tmp")
     splitTraces("\(out)/traces.tmp", into: out)
     try? fm.removeItem(atPath: "\(out)/traces.tmp")
-    // what the GPU spent its time on, which a report of "runs badly" needs
-    for name in ["stats", "power"] {
-        try capture("/usr/sbin/sysctl", ["-b", "kern.malachite_\(name)"]).data.write(to: URL(fileURLWithPath: "\(out)/\(name).txt"))
-    }
     // why a kext of the driver's did or didn't load (the auxiliary collection's policy, missing approval, dependencies)
     kernelLog("eventMessage CONTAINS \"pl.aochi\" OR eventMessage CONTAINS \"AuxKC\" OR eventMessage CONTAINS \"NVFB\" "
               + "OR (process == \"kernelmanagerd\" AND eventMessage CONTAINS[c] \"aochi\")", to: "\(out)/kexts.txt")
     // a boot that failed is over by the time someone can send logs
+    say("Searching the last three days' boots")
     kernelLog("process == \"kernel\" AND eventMessage CONTAINS \"Malachite: \"", to: "\(out)/earlier-boots.txt", last: "3d")
     if fm.fileExists(atPath: kmutilLog) {
         try? fm.copyItem(atPath: kmutilLog, toPath: "\(out)/malachite-kmutil.log")
@@ -152,6 +158,7 @@ func collectLogs(into dir: String, say: Say) throws -> String {
     try trim("\(out)/metal.txt", to: 20_000_000)
     try trim("\(out)/earlier-boots.txt", to: 5_000_000)
 
+    say("Copying crash reports")
     try fm.createDirectory(atPath: "\(out)/reports", withIntermediateDirectories: true)
     let home = ProcessInfo.processInfo.environment["HOME"] ?? ""
     let reports = [
@@ -173,11 +180,13 @@ func collectLogs(into dir: String, say: Say) throws -> String {
     }
 
     if fm.fileExists(atPath: "\(supportDir)/bin/mtldraw") {
+        say("Running the driver's checks")
         var check = ""
         _ = runChecks { check += $0 + "\n" }
         try Data(check.utf8).write(to: URL(fileURLWithPath: "\(out)/check.txt"))
     }
 
+    say("Packing")
     let archive = "\(out).tar.gz"
     let tar = capture("/usr/bin/tar", ["czf", archive, "-C", dest, name])
     guard tar.status == 0 else { throw Failure(message: "tar failed:\n\(tar.text)") }

@@ -269,6 +269,7 @@ final class Model: ObservableObject {
         start("Send logs") {
             do {
                 let file = try await self.collectLogs()
+                self.report.text += "Uploading\n"
                 do {
                     let id = try await uploadLogs(file)
                     return Report(title: "Send logs", text: "Uploaded. Log ID:\n\n\(id)\n", logID: id, logFile: file)
@@ -304,7 +305,7 @@ final class Model: ObservableObject {
     private func collectLogs() async throws -> URL {
         let dir = FileManager.default.temporaryDirectory.appending(path: "nvlogs-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let out = await admin("\(quote(selfPath)) --collect-logs \(quote(dir.path))")
+        let out = await admin("\(quote(selfPath)) --collect-logs \(quote(dir.path))") { self.report.text = $0 }
         guard out.status == 0, let line = out.text.split(separator: "\n").last(where: { $0.hasPrefix("Send back: ") }) else {
             throw UpdateError.failed("Collecting logs failed:\n\(out.text)")
         }

@@ -119,7 +119,7 @@ private func sendMode() async -> Int32 {
     defer { try? FileManager.default.removeItem(at: dir) }
     do {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let archive = try collectLogs(into: dir.path, say: { _ in })
+        let archive = try collectLogs(into: dir.path, say: say)
         say("Uploading")
         let id = try await uploadLogs(URL(fileURLWithPath: archive))
         say("Uploaded. Log ID:\n\n\(id)")
