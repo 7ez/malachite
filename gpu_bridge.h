@@ -127,6 +127,20 @@ struct nvgpu_dispatch {
     unsigned long long indirect;
 };
 
+// Left by the plugin 256-aligned after a program's code and constant data, so a fault's log can name the function
+// and its bound buffers
+#define NVGPU_PROGRAM_TAG 0x7f3a5c9e2b6d41c8ull
+#define NVGPU_PROGRAM_TAG_BUFFERS 45
+struct nvgpu_program_tag {
+    unsigned long long magic;
+    char name[64];
+    unsigned int nbuffers;
+    struct {
+        unsigned char index, pad;
+        unsigned short cbuf_off;
+    } buffers[NVGPU_PROGRAM_TAG_BUFFERS];
+};
+
 // rm::queue_draw clears the colour target if asked, then draws on the context's channel. Each stage's code (SPH first)
 // must be NVGpuMap'd; its params go to its own const bank 0 at 0x160, as a compute kernel's do.
 

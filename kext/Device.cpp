@@ -349,6 +349,7 @@ struct gpu_ctx {
         uint64_t prog, vs;  // a draw's vs, and its ps in prog
         uint64_t params[4];  // its first two shader argument words, of the vs then the ps
         uint64_t target, zt;  // a draw's colour and depth targets
+        const uint8_t *cbuf;  // its ring slot's const bank 0 (a draw's ps one 0x1000 on), kept until it's done
         pe_state pe;  // what a draw's primitive engine fetches
         uint64_t run_va;  // a run of the plugin's: its methods, words and draws (run_words 0 for anything else)
         uint32_t run_words, run_draws;
@@ -579,6 +580,116 @@ class Gpu : public IOService
             }
             return;
         }
+    }
+    const gpu_mapping *mapping_of(gpu_ctx *c, uint64_t va)
+    {
+        for (int i = 0; i < gpu_maps_top; i++)
+            if (gpu_maps[i].ctx == c && gpu_maps[i].va && gpu_maps[i].va <= va && va < gpu_maps[i].va + gpu_maps[i].dma.size)
+                return &gpu_maps[i];
+        return nullptr;
+    }
+    // the plugin's tag (gpu_bridge.h), only looked for in a program's first 256 KB
+    bool program_tag(gpu_ctx *c, uint64_t va, nvgpu_program_tag *t)
+    {
+        const gpu_mapping *m = va ? mapping_of(c, va) : nullptr;
+        if (!m || !m->dma.handle || m->vram)
+            return false;
+        auto *md = (IOMemoryDescriptor *)m->dma.handle;
+        uint64_t words[0x80];
+        for (uint64_t at = va - m->va; at < va - m->va + 0x40000 && at + sizeof(words) <= m->dma.size;
+             at += sizeof(words)) {
+            if (md->readBytes(at, words, sizeof(words)) != sizeof(words))
+                return false;
+            for (unsigned k = 0; k < 0x80; k += 0x20) {
+                if (words[k] != NVGPU_PROGRAM_TAG || md->readBytes(at + k * 8, t, sizeof(*t)) != sizeof(*t))
+                    continue;
+                t->name[sizeof(t->name) - 1] = 0;
+                if (t->nbuffers > NVGPU_PROGRAM_TAG_BUFFERS)
+                    t->nbuffers = NVGPU_PROGRAM_TAG_BUFFERS;
+                return true;
+            }
+        }
+        return false;
+    }
+    struct bound_buffer {
+        const char *stage;
+        unsigned index;
+        uint64_t va;
+        const gpu_mapping *m;
+        uint64_t dist;  // from its mapping to the fault, 0 when the mapping holds it
+    };
+    // a stage's buffer arguments on a line, keeping the one nearest the fault in near
+    void log_buffers(gpu_ctx *c, const char *stage, const nvgpu_program_tag &t, const uint8_t *cbuf, uint64_t fva,
+                     bound_buffer &near)
+    {
+        if (!t.nbuffers)
+            return;
+        char line[400] = "";
+        size_t n = 0;
+        for (unsigned i = 0; i < t.nbuffers && n < sizeof(line); i++) {
+            unsigned index = t.buffers[i].index, off = t.buffers[i].cbuf_off;
+            if (off < 0x160 || off + 8 > COMPUTE_CBUF_BYTES)
+                continue;
+            uint64_t va;
+            memcpy(&va, cbuf + off, 8);
+            const gpu_mapping *m = va ? mapping_of(c, va) : nullptr;
+            if (!m) {
+                n += snprintf(line + n, sizeof(line) - n, ", %u at %#llx unmapped", index, (unsigned long long)va);
+                continue;
+            }
+            n += snprintf(line + n, sizeof(line) - n, ", %u at %#llx in %#llx+%#llx", index, (unsigned long long)va,
+                          (unsigned long long)m->va, (unsigned long long)m->dma.size);
+            uint64_t end = m->va + m->dma.size;
+            uint64_t dist = fva < m->va ? m->va - fva : fva >= end ? fva - end + 1 : 0;
+            if (!near.m || dist < near.dist)
+                near = { stage, index, va, m, dist };
+        }
+        log_msg("Malachite:     %s %s's buffers%s\n", stage, t.name, *line ? line + 1 : " not read");
+    }
+    // " (kernel name)", or a draw's " (ps name, vs name after)", from the programs' tags
+    void launch_names(gpu_ctx *c, const gpu_ctx::launch_log &l, char *out, size_t n)
+    {
+        char ps[64] = "unnamed", vs[64] = "unnamed";
+        nvgpu_program_tag tag;
+        bool named = program_tag(c, l.prog, &tag);
+        if (named)
+            strlcpy(ps, tag.name, sizeof(ps));
+        if (l.vs && program_tag(c, l.vs, &tag)) {
+            strlcpy(vs, tag.name, sizeof(vs));
+            named = true;
+        }
+        *out = 0;
+        if (l.vs && named)
+            snprintf(out, n, " (ps %s, vs %s after)", ps, vs);
+        else if (l.vs)
+            strlcpy(out, " (vs after)", n);
+        else if (named)
+            snprintf(out, n, " (kernel %s)", ps);
+    }
+    // a launch's bound buffers, and where the fault is from the nearest of them
+    void log_bound(gpu_ctx *c, const gpu_ctx::launch_log &l, bool have_fault, uint64_t fault_va)
+    {
+        if (!l.cbuf)
+            return;
+        bound_buffer near = {};
+        nvgpu_program_tag tag;
+        if (l.vs && program_tag(c, l.vs, &tag))
+            log_buffers(c, "vs", tag, l.cbuf, fault_va, near);
+        if (program_tag(c, l.prog, &tag))
+            log_buffers(c, l.vs ? "ps" : "kernel", tag, l.cbuf + (l.vs ? 0x1000 : 0), fault_va, near);
+        if (!have_fault || !near.m)
+            return;
+        uint64_t end = near.m->va + near.m->dma.size;
+        char where[64];
+        if (fault_va < near.m->va)
+            snprintf(where, sizeof(where), "%#llx before", (unsigned long long)(near.m->va - fault_va));
+        else if (fault_va >= end)
+            snprintf(where, sizeof(where), "%#llx past the end of", (unsigned long long)(fault_va - end));
+        else
+            snprintf(where, sizeof(where), "%#llx into", (unsigned long long)(fault_va - near.m->va));
+        log_msg("Malachite:     the fault at %#llx is %s %s buffer %u at %#llx (%#llx+%#llx)\n",
+                (unsigned long long)fault_va, where, near.stage, near.index, (unsigned long long)near.va,
+                (unsigned long long)near.m->va, (unsigned long long)near.m->dma.size);
     }
     // len bytes at va of c's system memory, as the GPU reads them; false when no mapping of its pages holds them all
     int read_slot = 0;  // the mapping the last read found, tried first
@@ -3287,6 +3398,9 @@ void Gpu::recover(gpu_ctx *c)
     }
     if (c->compute_faulted) {
         c->compute_faulted = false;
+        bool have_fault = c->fault.type && c->fault_chid == c->compute_ch.chid;
+        uint64_t fault_va = c->fault.va;
+        bool write_fault = have_fault && c->fault.access && !strcmp(c->fault.access, "write");
         log_fault(c, "graphics", c->compute_ch.chid);
         // which of a launch's addresses its context no longer maps
         auto mapped = [&](uint64_t va) {
@@ -3297,11 +3411,30 @@ void Gpu::recover(gpu_ctx *c)
                     return 'm';
             return 'X';
         };
+        const unsigned logged = gpu_ctx::LAUNCH_LOG;
+        // a write is posted: the launch that faulted may have finished already
+        unsigned from = c->launch_next > logged ? c->launch_next - logged : 0, last = c->launch_next;
+        for (unsigned k = from; k < c->launch_next; k++) {
+            const auto &l = c->launches[k % logged];
+            if (l.cbuf && (int32_t)(l.seq - *c->compute_sem) <= 0)
+                last = k;
+        }
+        if (write_fault && last < c->launch_next) {
+            const auto &l = c->launches[last % logged];
+            bool reused = false;
+            for (unsigned j = last + 1; j < c->launch_next; j++)
+                reused |= c->launches[j % logged].cbuf == l.cbuf;
+            char names[160];
+            launch_names(c, l, names, sizeof(names));
+            log_msg("Malachite:   the last one done: %s %u of program %#llx%s\n", l.vs ? "draw" : "dispatch", l.seq,
+                    (unsigned long long)l.prog, names);
+            if (!reused)
+                log_bound(c, l, have_fault, fault_va);
+        }
         // oldest first, with what the primitive engine fetches carried from each draw through the runs after it
         pe_state pe;
         pe_unknown(&pe);
-        const unsigned logged = gpu_ctx::LAUNCH_LOG;
-        for (unsigned k = c->launch_next > logged ? c->launch_next - logged : 0; k < c->launch_next; k++) {
+        for (unsigned k = from; k < c->launch_next; k++) {
             const auto &l = c->launches[k % logged];
             bool pending = l.seq && (int32_t)(l.seq - *c->compute_sem) > 0;
             char why[160];
@@ -3316,8 +3449,10 @@ void Gpu::recover(gpu_ctx *c)
                 pe = l.pe;
             if (!pending)
                 continue;
+            char names[160];
+            launch_names(c, l, names, sizeof(names));
             log_msg("Malachite:   not done: %s %u of program %#llx%s, %ux%ux%u groups of %ux%ux%u, %u regs\n",
-                        l.vs ? "draw" : "dispatch", l.seq, (unsigned long long)l.prog, l.vs ? " (vs after)" : "", l.groups[0],
+                        l.vs ? "draw" : "dispatch", l.seq, (unsigned long long)l.prog, names, l.groups[0],
                         l.groups[1], l.groups[2], l.block[0], l.block[1], l.block[2], l.regs);
             if (l.vs)
                 log_msg("Malachite:     vs args %#llx %#llx, ps args %#llx %#llx, target %#llx zt %#llx; mapped: ps %c "
@@ -3361,6 +3496,7 @@ void Gpu::recover(gpu_ctx *c)
                         wrong ? why : "");
             }
             if (l.seq == *c->compute_sem + 1) {
+                log_bound(c, l, have_fault, fault_va);
                 log_msg("Malachite:   the first one's code, ps or program then vs\n");
                 log_code(l.prog);
                 if (l.vs)
@@ -3614,8 +3750,9 @@ IOReturn Gpu::gpu_dispatch(gpu_ctx *c, const struct nvgpu_dispatch *d)
                                          0x80, 0, (uint16_t)block[0], (uint16_t)MIN(grid[0], 65535u) };
         compute_qmd_set_stamp((uint32_t *)(slot_cpu + 0x1000), c->prof_va + (i % PROF_RING) * 16, i + 1);
     }
-    c->launches[c->launch_next++ % gpu_ctx::LAUNCH_LOG] = { payload, { grid[0], grid[1], grid[2] },
-                                                            { block[0], block[1], block[2] }, d->reg_count, d->prog_va, 0 };
+    gpu_ctx::launch_log &l = c->launches[c->launch_next++ % gpu_ctx::LAUNCH_LOG];
+    l = { payload, { grid[0], grid[1], grid[2] }, { block[0], block[1], block[2] }, d->reg_count, d->prog_va, 0 };
+    l.cbuf = slot_cpu;
     compute_launch(&c->compute_ch, qmdva);
     issued(c);
     c->dispatch_slot_seq[slot] = c->draw_pending = payload;
@@ -3974,6 +4111,7 @@ IOReturn Gpu::gpu_draw(gpu_ctx *c, const struct nvgpu_draw *d, const void *queue
     __builtin_memcpy(l.params + 2, d->ps_params, 16);
     l.target = d->target;
     l.zt = d->zt;
+    l.cbuf = cb;
     pe_draw(&l.pe, &r);
     issued(c);
     c->draw_slot_seq[slot] = c->draw_pending = c->compute_seq;

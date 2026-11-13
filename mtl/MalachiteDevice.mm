@@ -7772,6 +7772,22 @@ static void malachite_cache_name(char name[2 * CC_SHA256_DIGEST_LENGTH + 1], con
         snprintf(name + 2 * i, 3, "%02x", key[i]);
 }
 
+// for the kernel's log of a fault (gpu_bridge.h); it fits in the page of slack after the data
+static void malachite_tag_program(id<MTLBuffer> code, const struct nvk_header *h, NSString *name)
+{
+    struct nvgpu_program_tag t = { NVGPU_PROGRAM_TAG };
+    strlcpy(t.name, name.UTF8String ?: "", sizeof(t.name));
+    for (uint32_t i = 0; i < h->nargs && t.nbuffers < NVGPU_PROGRAM_TAG_BUFFERS; i++) {
+        const struct nvk_arg *a = &h->args[i];
+        if (a->kind == NVK_ARG_BUFFER || a->kind == NVK_ARG_STAGE_IN_BUFFER) {
+            t.buffers[t.nbuffers].index = a->index;
+            t.buffers[t.nbuffers].cbuf_off = a->cbuf_off;
+            t.nbuffers++;
+        }
+    }
+    memcpy((uint8_t *)code.contents + ((h->sass_size + h->data_size + 255) & ~255u), &t, sizeof(t));
+}
+
 // a compile as the cache keeps it
 static NSData *malachite_cache_entry(const struct airc_kernel *k)
 {
@@ -8059,8 +8075,10 @@ static os_unfair_lock malachite_airc_lock = OS_UNFAIR_LOCK_INIT;  // airc has gl
     // the SMs prefetch instructions past a program's end: a page of slack keeps that inside the buffer (with none it
     // reads the next mapping, and faults once that one is freed). The constant data goes between the two.
     id<MTLBuffer> code = failed ? nil : [self newBufferWithLength:h->sass_size + h->data_size + 4096 options:0];
-    if (code)
+    if (code) {
         memcpy(code.contents, c + 1, h->sass_size + h->data_size);
+        malachite_tag_program(code, h, function.name);
+    }
 
     // the AIR, for build/airc to reproduce a failure with; with the trace on, every shader's (not an override)
     // (in /tmp, or for a sandboxed process that can't write there, its own temporary directory)
