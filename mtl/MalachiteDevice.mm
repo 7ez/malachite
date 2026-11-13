@@ -93,6 +93,7 @@ extern "C" {
     unsigned _kept_next;
     id _uploads, _heap_blocks;
     NSMutableSet *_writeback;  // mirrored buffers its OpenCL kernels may write, copied back to system memory at commit
+    bool _writes_capture;  // to a surface WindowServer hands to another process (see commitAndWaitUntilSubmitted)
 }
 @end
 
@@ -157,6 +158,7 @@ extern "C" {
     MalachiteHeapBuffer *_placed;  // its range of the MTLHeap it was made in, which keeps the heap's memory
     MTLTextureType _type;
     IOSurfaceRef _surface;  // retained, for a texture over an IOSurface's memory
+    bool _capture;  // the surface is a screen or window capture
     NSUInteger _plane;
     uint32_t _heap_entry;  // its own descriptor heap entry, once asked for its gpuResourceID
     // a pitch-linear texture's height when the base was made a row high (an IOSurface's rows the base won't take)
@@ -831,6 +833,13 @@ static void malachite_written(__unsafe_unretained id commandBuffer, __unsafe_unr
     [cb->_writeback addObject:b];
 }
 
+static void malachite_texture_written(__unsafe_unretained id commandBuffer, __unsafe_unretained id texture)
+{
+    MalachiteTexture *t = texture;
+    if ([t isKindOfClass:[MalachiteTexture class]] && t->_capture)
+        ((MalachiteCommandBuffer *)commandBuffer)->_writes_capture = true;
+}
+
 // one side of a copy-engine copy: a buffer's rows or a texture's surface, and where the copy starts in it (x in
 // bytes, y in rows)
 struct malachite_side {
@@ -1202,6 +1211,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
        destinationOrigin:(MTLOrigin)dstOrigin
 {
     malachite_mips_written(dst, dstLevel);
+    malachite_texture_written(_cb, dst);
     malachite_keep(_cb, src);
     malachite_keep(_cb, dst);
     malachite_depth_kind(_cb, src);
@@ -1296,6 +1306,7 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
 {
     int aspect = malachite_aspect(dst, options);
     malachite_mips_written(dst, dstLevel);
+    malachite_texture_written(_cb, dst);
     malachite_keep(_cb, src);
     malachite_keep(_cb, dst);
     malachite_depth_kind(_cb, dst);
@@ -3027,6 +3038,7 @@ static void malachite_level_headers(id cb, const struct nvk_header *h, __unsafe_
         return;
     _textures[index] = texture;
     malachite_keep(_cb, texture);
+    malachite_texture_written(_cb, texture);
 }
 
 - (void)setSamplerState:(id)sampler atIndex:(NSUInteger)index
@@ -3635,6 +3647,7 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         struct malachite_sub s;
         malachite_depth_kind(cb, t);
         malachite_mips_written(t, ca.level);
+        malachite_texture_written(cb, t);
         if (!malachite_sub(t, ca.level, ca.slice, ca.depthPlane, &s)) {
             os_log(OS_LOG_DEFAULT, "MalachiteRender: colour attachment %u at level %lu slice %lu, which it lacks", i,
                    (unsigned long)ca.level, (unsigned long)ca.slice);
@@ -6301,6 +6314,10 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
         malachite_upload_managed(self);
     }
     [super commitAndWaitUntilSubmitted];
+    // WindowServer hands a capture to its client once this returns, and the client's CPU lock doesn't wait for our
+    // GPU (only for Apple's): it read the surface's previous frame, or one half drawn
+    if (_writes_capture)
+        [self waitUntilCompleted];
 }
 
 // A drawable goes to WindowServer once its draws are done, not once they're scheduled. WindowServer reads it with no
@@ -7340,6 +7357,8 @@ static uint64_t malachite_vram(void)
         t->_owned = buf;
         t->_surface = (IOSurfaceRef)CFRetain(surface);
         t->_plane = plane;
+        NSString *name = CFBridgingRelease(IOSurfaceCopyValue(surface, kIOSurfaceName));
+        t->_capture = [name containsString:@"DisplayStream"] || [name containsString:@"CaptureSurface"];
     }
     return t;
 }
