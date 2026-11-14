@@ -263,7 +263,9 @@ void nvdec_hevc_setup(const struct h265_dec *d, const struct h265_picture *pic, 
         .num_delta_pocs_of_rps_idx = h->rps_ref_num_deltas,
         .long_term_ref_pics_present = (uint32_t)s->long_term_present,
         .num_bits_short_term_ref_pics_in_slice = h->rps_bits,
-        .ext = { .flt_above_offset = sizes.flt_above >> 8, .sao_above_offset = sizes.sao_above >> 8 },
+        // log2 of the largest transform-skip block, 4x4 without the range extension: at 0 the engine expects no
+        // transform_skip_flag, and fails on the first block that has one
+        .ext = { .pps_flags = 2, .flt_above_offset = sizes.flt_above >> 8, .sao_above_offset = sizes.sao_above >> 8 },
     };
 
     for (int i = 0; i < H265_DPB; i++) {
