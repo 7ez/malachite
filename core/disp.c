@@ -365,6 +365,18 @@ static void drop_unfit_modes(const struct disp *d, struct disp_output *o, int qu
     o->mode = n ? o->modes[0] : (struct disp_mode){ 0 };
 }
 
+// what the EDID lists for HDR and variable refresh, so a report shows what a display offers
+static void log_caps(const struct disp_output *o)
+{
+    const struct edid_caps *c = &o->caps;
+    if (!o->connected || (!c->hdr_pq && !c->hdr_hlg && !c->bt2020_rgb && !c->range_max && !c->hdmi_vrr_max))
+        return;
+    log_msg("disp:   HDR: %s%s%s, peak %u nits, average %u, BT.2020 RGB %s; refresh range %u-%u Hz, HDMI VRR %u-%u Hz\n",
+            c->hdr_pq ? "PQ" : "", c->hdr_pq && c->hdr_hlg ? " + " : "", c->hdr_hlg ? "HLG" : (c->hdr_pq ? "" : "none"),
+            c->max_nits, c->avg_nits, c->bt2020_rgb ? "yes" : "no", c->range_min, c->range_max, c->hdmi_vrr_min,
+            c->hdmi_vrr_max);
+}
+
 void disp_read_outputs(struct disp *d)
 {
     struct gsp *s = d->s;
@@ -426,6 +438,7 @@ void disp_read_outputs(struct disp *d)
                 add_scaled(o, d->scaled, d->nscaled);
                 o->edid_size = size < sizeof(o->edid) ? size : sizeof(o->edid);
                 memcpy(o->edid, e, o->edid_size);
+                edid_caps_parse(o->edid, o->edid_size, &o->caps);
             }
             mem_free(eq);
             if (o->dp_lanes)  // not when AUX is silent, as behind a DP++ adapter to HDMI, which runs as TMDS
@@ -436,6 +449,7 @@ void disp_read_outputs(struct disp *d)
         log_msg("disp: display %#x: %s%u protocol %u%s%s%s%s, %ux%u %u kHz\n", id, or_name(o->or_type), o->or_index,
                 o->protocol, o->dp ? " (DisplayPort)" : "", o->connected ? ", connected" : "", o->connected ? ": " : "",
                 o->connected ? o->name : "", o->mode.hactive, o->mode.vactive, o->mode.clock);
+        log_caps(o);
         for (uint32_t i = 0; i < o->nmodes; i++) {
             const struct disp_mode *t = &o->modes[i];
             uint64_t total = (uint64_t)(t->hactive + t->hblank) * (t->vactive + t->vblank);

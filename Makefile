@@ -8,7 +8,7 @@ CXXFLAGS := $(KFLAGS) -fapple-kext -std=c++17 -fno-rtti -fno-exceptions \
 	-Wno-deprecated-declarations -Wno-inconsistent-missing-override
 CFLAGS := $(KFLAGS) -std=c11
 
-CORE := chip falcon vbios fwsec booter gsp pwr mem bar1 chan gr compute render drawbuild sph texdesc disp dispmode dispdp video bitreader h264 hevc av1 av1cdf av1grain vp9 vp9prob vp8 vp8prob nvdec
+CORE := chip falcon vbios fwsec booter gsp pwr mem bar1 chan gr compute render drawbuild sph texdesc disp dispmode dispdp edidcaps video bitreader h264 hevc av1 av1cdf av1grain vp9 vp9prob vp8 vp8prob nvdec
 # the RM front end speaks NVK's side of the ABI, from the 610 headers in sdk/
 RMFE := rmfe rmfe_ctrl rmfe_mem rmfe_chan
 SDKINC := -Isdk/610/inc -Isdk/610/unix

@@ -1,4 +1,5 @@
 #pragma once
+#include "edidcaps.h"
 #include "gsp.h"
 
 #define DISP_MAX_OUTPUTS 16
@@ -43,6 +44,7 @@ struct disp_output {
     uint32_t nmodes;
     uint8_t edid[512];      // base block and the first three extensions
     uint32_t edid_size;
+    struct edid_caps caps;
     // DP: DPCD 0x0-0xf (DP 1.4 extended caps if present), fastest shared link in 0.27 Gbps units; lanes 0 until read
     uint8_t dpcd[16];
     uint32_t dp_bw, dp_lanes;
