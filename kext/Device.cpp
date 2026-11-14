@@ -3471,6 +3471,8 @@ void Gpu::recover(gpu_ctx *c)
                 IOFree(saved, CHAN_SAVE_WORDS * 4);
             return;
         }
+        // the payload the last launch to run again releases itself
+        const uint32_t last_replayed = c->issued_next ? c->issued[(c->issued_next - 1) % 128].payload : 0;
         c->issued_next = 0;
         c->draws_queued = 0;
         if (saved) {
@@ -3478,11 +3480,14 @@ void Gpu::recover(gpu_ctx *c)
                 log_msg("Malachite: %s's work lost to the fault doesn't fit the new channel\n",
                         c == &kctx ? "kernel" : c->owner);
             else
-                log_msg("Malachite: %s's work from %u on runs again\n", c == &kctx ? "kernel" : c->owner, first);
+                log_msg("Malachite: %s's work from %u on runs again (GP_PUT %u, semaphore %#x, issued up to %#x)\n",
+                        c == &kctx ? "kernel" : c->owner, first, c->compute_ch.gp_put, *c->compute_sem, c->compute_seq);
             IOFree(saved, CHAN_SAVE_WORDS * 4);
             c->replayed = first;
-            // release up to the latest payload, past the one not replayed
-            render_release(&c->compute_ch, c->compute_semva, c->compute_seq);
+            // release up to the latest payload, past the one not replayed; when the last launch to run again releases
+            // it, a second release could land after another channel's release of a later payload and take it back
+            if (c->compute_seq != last_replayed)
+                render_release(&c->compute_ch, c->compute_semva, c->compute_seq);
             c->half_seq[0] = c->half_seq[1] = c->draw_pending = c->compute_seq;
             c->push_half = chan_half(&c->compute_ch, 1);
         }
