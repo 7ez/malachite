@@ -25,6 +25,8 @@ planned.
 
 Geekbench and Unigine (windowed) on an RTX 3060 in a macOS 26.7.1 VM (GPU passed through). Malachite ran on 13 November
 and NullMoth on 12 November, in the same VM with the same displays. Two Malachite runs each, after a restart.
+NullMoth 3.0 came out on 14 November, but WindowServer kept crashing with it in this VM, so its column is 2.9, the
+newest version that ran here.
 
 | | Malachite 2026.11.13 | NullMoth 2.9 |
 |---|---|---|
