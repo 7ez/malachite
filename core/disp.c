@@ -264,6 +264,27 @@ static int listen(struct disp *d, uint32_t handle, uint32_t index)
     return r ? 0 : -1;
 }
 
+// the display engine's registers that aren't zero, four to a line, to compare a good start with a bad one
+void disp_dump_regs(struct disp *d, const char *when)
+{
+    struct gpu *g = gsp_gpu(d->s);
+    uint32_t pair[8], n = 0;
+    for (uint32_t off = 0x610000; off < 0x611100; off += 4) {
+        uint32_t v = rd32(g, off);
+        if (!v || v == 0xbadf5040 || v == 0xbad0ac00)
+            continue;
+        pair[n++] = off;
+        pair[n++] = v;
+        if (n == 8) {
+            log_msg("disp: regs %s: %x=%x %x=%x %x=%x %x=%x\n", when, pair[0], pair[1], pair[2], pair[3], pair[4],
+                    pair[5], pair[6], pair[7]);
+            n = 0;
+        }
+    }
+    for (uint32_t i = 0; i < n; i += 2)
+        log_msg("disp: regs %s: %x=%x\n", when, pair[i], pair[i + 1]);
+}
+
 int disp_probe(struct gsp *s, struct disp *d, const struct disp_size *scaled, uint32_t nscaled)
 {
     const struct rm_client *in = gsp_internal(s);

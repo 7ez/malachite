@@ -120,6 +120,7 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
 void disp_modeset_fini(struct disp *d);
 // the display channels torn down after a modeset the engine refused; the next disp_modeset() starts over
 void disp_reset(struct disp *d);
+void disp_dump_regs(struct disp *d, const char *when);
 // The engine keeps channels allocated after GSP-RM frees them (core IDLE, not DEALLOC), even across an unload, and
 // a fresh GSP-RM then hangs allocating the core channel; this deallocates them all, as at power-on.
 void disp_release_channels(struct gpu *g);

@@ -532,8 +532,13 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
         return -1;
     uint32_t done = vram_rd32(gsp_gpu(d->s), d->ntfy);
     if (done >> 30 != 2) {
+        struct gpu *g = gsp_gpu(d->s);
         log_msg("disp: modeset didn't complete (notifiers: core %#x window %#x)\n", done,
-                vram_rd32(gsp_gpu(d->s), d->ntfy + wn));
+                vram_rd32(g, d->ntfy + wn));
+        log_msg("disp: core channel state %#x control %#x, exception %#x %#x %#x, SOR%u pwr %#x\n", rd32(g, 0x610630),
+                rd32(g, 0x6104e0), rd32(g, 0x611020), rd32(g, 0x611024), rd32(g, 0x611028), sor,
+                rd32(g, 0x61c004 + sor * 0x800));
+        disp_dump_regs(d, "at the failed modeset");
         return -1;
     }
     log_msg("disp: head %d lit, showing %#llx (SOR%u pwr %#x)\n", head, (unsigned long long)fb, sor,
