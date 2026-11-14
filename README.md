@@ -95,7 +95,7 @@ names, and `bootloader`, `booter_load` and `booter_unload` from `nvidia/ad102/gs
 ## Not finished
 
 - Sleep: the display doesn't come back after waking, so turn sleep off.
-- OpenGL apps stop at about 90 frames a second on a 240 Hz monitor.
+- On a 240 Hz monitor, OpenGL apps run at 120 frames a second and Metal ones in a window at about 165.
 - Apps that lean on the GPU may hit unsupported features. They log them, and those logs are what's needed.
 
 ## Special thanks
