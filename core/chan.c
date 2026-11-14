@@ -279,6 +279,24 @@ int chan_replay(struct chan *ch, const uint32_t *saved, uint32_t n)
     return 0;
 }
 
+void chan_log_tail(const struct chan *ch, uint32_t n)
+{
+    const uint8_t *cpu = ch->buf->cpu;
+    for (uint32_t i = n; i > 0; i--) {
+        uint32_t gp = (ch->gp_put + GPFIFO_ENTRIES - i) % GPFIFO_ENTRIES;
+        const uint32_t *e = (const uint32_t *)cpu + gp * 2;
+        uint64_t va = e[0] | (uint64_t)(e[1] & 0xff) << 32;
+        uint32_t len = e[1] >> 10;
+        log_msg("chan: entry %u: %#llx, %u words\n", gp, (unsigned long long)va, len);
+        if (va < ch->va || va >= ch->va + CHAN_BUF)
+            continue;
+        const uint32_t *w = (const uint32_t *)(cpu + (va - ch->va));
+        for (uint32_t j = 0; j < len && j < 16; j += 4)
+            log_msg("chan:   %08x %08x %08x %08x\n", w[j], j + 1 < len ? w[j + 1] : 0, j + 2 < len ? w[j + 2] : 0,
+                    j + 3 < len ? w[j + 3] : 0);
+    }
+}
+
 uint32_t chan_gp_get(struct chan *ch)
 {
     return vram_rd32(gsp_gpu(ch->s), ch->userd + USERD_GP_GET);

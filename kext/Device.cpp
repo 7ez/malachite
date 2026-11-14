@@ -4043,6 +4043,7 @@ IOReturn Gpu::drain(gpu_ctx *c, int ms)
     if (!c->draw_pending)
         return kIOReturnSuccess;
     uint64_t t0 = time_us();
+    const uint32_t wanted = c->draw_pending;
     if ((int32_t)(*c->compute_sem - c->draw_pending) < 0)
         stats[ST_DRAIN_WAITS]++;
     // on a fault, stop waiting once GSP-RM reports it and recover
@@ -4060,8 +4061,16 @@ IOReturn Gpu::drain(gpu_ctx *c, int ms)
     busy_close(c);
     if (prof_on && !r)  // for apps that never present, such as OpenCL
         prof_harvest(c);
-    if (r)
-        log_msg("Malachite: draws never finished (semaphore 0x%x)\n", *c->compute_sem);
+    if (r) {
+        log_msg("Malachite: draws never finished (semaphore %#x, wanted %#x, issued up to %#x, GP_GET %u GP_PUT %u, "
+                "%u queued)\n",
+                *c->compute_sem, wanted, c->compute_seq, chan_gp_get(&c->compute_ch), c->compute_ch.gp_put,
+                c->draws_queued);
+        chan_log_tail(&c->compute_ch, 3);
+        log_msg("Malachite: copy channel GP_GET %u GP_PUT %u, ce_last %#x ce_pending %#x, copy_faulted %d\n",
+                chan_gp_get(&c->copy_ch), c->copy_ch.gp_put, c->ce_last, c->ce_pending, c->copy_faulted);
+        chan_log_tail(&c->copy_ch, 4);
+    }
     return r ? kIOReturnTimeout : kIOReturnSuccess;
 }
 

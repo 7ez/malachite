@@ -66,6 +66,8 @@ void chan_commit(struct chan *ch, uint32_t n);
 void chan_entry(struct chan *ch, uint64_t va, uint32_t words);
 void chan_kick(struct chan *ch);
 uint32_t chan_gp_get(struct chan *ch);
+// the last n GPFIFO entries before GP_PUT, each with the first words of its push, for a channel that stopped answering
+void chan_log_tail(const struct chan *ch, uint32_t n);
 
 // GP_GET can't say when the GPU is done with methods (it moves on fetch and is written back only now and then), so
 // callers wait a pushbuffer half at a time. This is the half `bytes` more of submits would end in.
