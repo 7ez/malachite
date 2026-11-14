@@ -81,7 +81,7 @@ extern "C" {
     unsigned _kept_next;
     id _uploads, _heap_blocks;
     NSMutableSet *_writeback;  // mirrored buffers OpenCL kernels may write, copied back to system memory at commit
-    bool _writes_capture;  // to a surface WindowServer hands to another process (see commitAndWaitUntilSubmitted)
+    bool _writes_capture;  // uses a surface another process reads once it is handed over (see commitAndWaitUntilSubmitted)
 }
 @end
 
@@ -755,6 +755,9 @@ static void malachite_keep(__unsafe_unretained id commandBuffer, __unsafe_unreta
         if (recent == p)
             return;
     cb->_kept_recent[cb->_kept_next++ % 4] = p;
+    MalachiteTexture *t = resource;
+    if ([t isKindOfClass:[MalachiteTexture class]] && t->_capture)
+        cb->_writes_capture = true;
     if (!cb->_kept)
         cb->_kept = [NSMutableArray array];
     [cb->_kept addObject:resource];
@@ -770,13 +773,6 @@ static void malachite_written(__unsafe_unretained id commandBuffer, __unsafe_unr
     if (!cb->_writeback)
         cb->_writeback = [NSMutableSet set];
     [cb->_writeback addObject:b];
-}
-
-static void malachite_texture_written(__unsafe_unretained id commandBuffer, __unsafe_unretained id texture)
-{
-    MalachiteTexture *t = texture;
-    if ([t isKindOfClass:[MalachiteTexture class]] && t->_capture)
-        ((MalachiteCommandBuffer *)commandBuffer)->_writes_capture = true;
 }
 
 struct malachite_side {
@@ -1598,7 +1594,6 @@ static void malachite_icb_bind_buffer(malachite_icb_command *c, bool fragment, i
        destinationOrigin:(MTLOrigin)dstOrigin
 {
     malachite_mips_written(dst, dstLevel);
-    malachite_texture_written(_cb, dst);
     malachite_keep(_cb, src);
     malachite_keep(_cb, dst);
     malachite_depth_kind(_cb, src);
@@ -1690,7 +1685,6 @@ static void malachite_icb_bind_buffer(malachite_icb_command *c, bool fragment, i
 {
     int aspect = malachite_aspect(dst, options);
     malachite_mips_written(dst, dstLevel);
-    malachite_texture_written(_cb, dst);
     malachite_keep(_cb, src);
     malachite_keep(_cb, dst);
     malachite_depth_kind(_cb, dst);
@@ -3471,7 +3465,6 @@ static uint32_t malachite_cl_format(__unsafe_unretained id texture)
         return;
     _textures[index] = texture;
     malachite_keep(_cb, texture);
-    malachite_texture_written(_cb, texture);
 }
 
 - (void)setSamplerState:(id)sampler atIndex:(NSUInteger)index
@@ -4117,7 +4110,6 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         struct malachite_sub s;
         malachite_depth_kind(cb, t);
         malachite_mips_written(t, ca.level);
-        malachite_texture_written(cb, t);
         if (!malachite_sub(t, ca.level, ca.slice, ca.depthPlane, &s)) {
             os_log(OS_LOG_DEFAULT, "MalachiteRender: colour attachment %u at level %lu slice %lu, which it lacks", i,
                    (unsigned long)ca.level, (unsigned long)ca.slice);
@@ -6848,7 +6840,8 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
         malachite_upload_managed(self);
     }
     [super commitAndWaitUntilSubmitted];
-    // the capture's client locks the surface without waiting for our GPU, and read half-drawn frames
+    // the capture's client (and the recorder's encoder) reads the surface without waiting for our GPU, and got half-drawn
+    // or older frames
     if (_writes_capture)
         [self waitUntilCompleted];
 }
@@ -7858,7 +7851,8 @@ static uint64_t malachite_vram(void)
         t->_surface = (IOSurfaceRef)CFRetain(surface);
         t->_plane = plane;
         NSString *name = CFBridgingRelease(IOSurfaceCopyValue(surface, kIOSurfaceName));
-        t->_capture = [name containsString:@"DisplayStream"] || [name containsString:@"CaptureSurface"];
+        t->_capture = [name containsString:@"DisplayStream"] || [name containsString:@"CaptureSurface"] ||
+                      [name containsString:@"encode"];
     }
     return t;
 }
