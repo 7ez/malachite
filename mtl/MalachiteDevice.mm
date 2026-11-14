@@ -1937,6 +1937,34 @@ static uint32_t *malachite_heap_header(uint32_t e);
 static uint32_t malachite_heap_sampler(const uint32_t samp[8]);
 static int malachite_fill_texture_header(uint32_t out[8], id texture, id cb);
 
+// An upload's staging buffer, kept for the next one: a new one costs its mapping and a page fault for each page of it
+// every time. Taken out while in use, so threads don't share it; only one is kept, and not a huge one.
+static id<MTLBuffer> malachite_staging;
+
+static id<MTLBuffer> malachite_staging_take(id<MTLDevice> device, NSUInteger size)
+{
+    @synchronized([MalachiteTexture class]) {
+        id<MTLBuffer> kept = malachite_staging;
+        if (kept && kept.length >= size) {
+            malachite_staging = nil;
+            return kept;
+        }
+    }
+    // a megabyte at a time, so slightly different sizes still fit the kept one
+    return [device newBufferWithLength:MAX((size + 0xfffff) & ~(NSUInteger)0xfffff, 1u)
+                               options:MTLResourceStorageModeShared];
+}
+
+static void malachite_staging_give(id<MTLBuffer> buffer)
+{
+    if (buffer.length > (NSUInteger)64 << 20)
+        return;
+    @synchronized([MalachiteTexture class]) {
+        if (!malachite_staging || buffer.length > malachite_staging.length)
+            malachite_staging = buffer;
+    }
+}
+
 @implementation MalachiteTexture
 - (MTLTextureUsage)usage
 {
@@ -2184,8 +2212,7 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
     // region: a whole-surface round trip undid other threads' uploads and wrote targets before their compressed kind.
     NSUInteger row = w * (malachite_aspect(self, MTLBlitOptionNone) == MALACHITE_ASPECT_STENCIL ? 1 : s.bpp);
     NSUInteger size = row * h;
-    id<MTLBuffer> staging = [backing.device newBufferWithLength:MAX(size * region.size.depth, 1u)
-                                                        options:MTLResourceStorageModeShared];
+    id<MTLBuffer> staging = malachite_staging_take(backing.device, size * region.size.depth);
     if (!staging)
         return;
     uint8_t *rows = (uint8_t *)staging.contents;
@@ -2213,6 +2240,7 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
     for (NSUInteger z = 0; !in && z < region.size.depth; z++)
         for (NSUInteger y = 0; y < h; y++)
             memcpy(bytes + z * image + y * stride, rows + z * size + y * row, row);
+    malachite_staging_give(staging);
 }
 
 - (void)replaceRegion:(MTLRegion)region
