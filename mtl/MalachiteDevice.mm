@@ -661,18 +661,22 @@ static void gl_synchronize(id self, SEL)
         usleep(100);
 }
 
-static void malachite_gl_swaps(void)
+static bool malachite_gl_swaps(void)
 {
     Class surface = objc_getClass("NSCGLSurface");
-    Ivar queue = class_getInstanceVariable(surface, "_imageQueue");
-    Method wait = class_getInstanceMethod(surface, sel_registerName("synchronize"));
+    Ivar queue = surface ? class_getInstanceVariable(surface, "_imageQueue") : NULL;
+    Method wait = surface ? class_getInstanceMethod(surface, sel_registerName("synchronize")) : NULL;
     gl_unconsumed = (long (*)(void *, void *, void *))dlsym(RTLD_DEFAULT, "CAImageQueueGetUnconsumedImageCount");
     gl_context = (void *(*)(void))dlsym(RTLD_DEFAULT, "CGLGetCurrentContext");
     gl_get = (int (*)(void *, int, int *))dlsym(RTLD_DEFAULT, "CGLGetParameter");
-    if (!queue || !wait || !gl_unconsumed || !gl_context || !gl_get)
-        return;
+    if (!queue || !wait || !gl_unconsumed || !gl_context || !gl_get) {
+        os_log(OS_LOG_DEFAULT, "Malachite: GL swap hook not installed (NSCGLSurface %d, _imageQueue %d, synchronize %d, symbols %d)",
+               surface != Nil, queue != NULL, wait != NULL, gl_unconsumed && gl_context && gl_get);
+        return false;
+    }
     gl_queue_offset = ivar_getOffset(queue);
     method_setImplementation(wait, (IMP)gl_synchronize);
+    return true;
 }
 
 static void malachite_hook_function_reflection(void);
@@ -3448,10 +3452,13 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
         return nil;
     _cb = cb;
     if (opengl_renderer) {
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            malachite_gl_swaps();
-        });
+        // AppKit may load after the first encoder, so a missing class is tried again a few times
+        static bool hooked;
+        static int tries = 4;
+        if (!hooked && tries > 0) {
+            tries--;
+            hooked = malachite_gl_swaps();
+        }
     }
     _fast = !malachite_trace && !malachite_snap && !malachite_rec_only;
     _factor_scale = 1.0f;
