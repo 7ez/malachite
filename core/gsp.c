@@ -837,8 +837,11 @@ void *rm_control(struct gsp *s, uint32_t client, uint32_t object, uint32_t cmd, 
     rpc->cmd = cmd;
     rpc->paramsSize = size;
     memcpy(rpc->params, params, size);
+    uint64_t t0 = time_us();
     rpc_gsp_rm_control_v03_00 *rep = rpc_call(s, NV_VGPU_MSG_FUNCTION_GSP_RM_CONTROL, rpc, len);
     mem_free(rpc);
+    if (time_us() - t0 > 1000000)
+        log_msg("gsp: RM_CONTROL %#x on %#x took %llu ms\n", cmd, object, (unsigned long long)(time_us() - t0) / 1000);
     s->ctrl_status = rep ? rep->status : ~0u;
     if (!rep || rep->status) {
         log_msg("gsp: RM_CONTROL %#x on %#x: status %#x\n", cmd, object, rep ? rep->status : 0);
