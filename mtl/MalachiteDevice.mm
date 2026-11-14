@@ -1012,6 +1012,448 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
     free(next);
 }
 
+// Indirect command buffers the CPU fills: a command is kept as the calls that made it, and an encoder replays them
+// through its own methods. Commands the GPU writes aren't supported.
+struct malachite_icb_bind {
+    NSUInteger index, offset, stride;
+    bool fragment;  // else vertex, or kernel in a compute command
+    bool strided;
+    id buffer;
+};
+
+enum {
+    MALACHITE_ICB_CULL = 1,
+    MALACHITE_ICB_WINDING = 2,
+    MALACHITE_ICB_FILL = 4,
+    MALACHITE_ICB_CLIP = 8,
+    MALACHITE_ICB_BIAS = 16,
+    MALACHITE_ICB_DEPTH = 32
+};
+
+enum class malachite_icb_kind {
+    empty,
+    draw,
+    draw_indexed,
+    draw_patches,
+    draw_indexed_patches,
+    dispatch_groups,
+    dispatch_threads
+};
+
+struct malachite_icb_command {
+    malachite_icb_kind kind = malachite_icb_kind::empty;
+    id pipeline;
+    std::vector<malachite_icb_bind> binds;
+    MTLPrimitiveType type = MTLPrimitiveTypeTriangle;
+    NSUInteger start = 0, count = 0, instances = 1, base_instance = 0;
+    NSInteger base_vertex = 0;
+    MTLIndexType index_type = MTLIndexTypeUInt16;
+    id index_buffer;
+    NSUInteger index_offset = 0;
+    NSUInteger patch_points = 0, patch_start = 0, patch_count = 0, patch_index_offset = 0, point_index_offset = 0;
+    id patch_index, point_index;
+    id factor_buffer;
+    NSUInteger factor_offset = 0, factor_stride = 0;
+    unsigned state = 0;  // which of the render states below the command sets
+    MTLCullMode cull = MTLCullModeNone;
+    MTLWinding winding = MTLWindingClockwise;
+    MTLTriangleFillMode fill = MTLTriangleFillModeFill;
+    MTLDepthClipMode clip = MTLDepthClipModeClip;
+    float bias[3] = {};
+    id depth_stencil;
+    MTLSize grid = {}, threads = {};
+    std::vector<std::pair<NSUInteger, NSUInteger>> threadgroup_memory;  // index, length
+    bool stage_in = false;
+    MTLRegion stage_in_region = {};
+};
+
+@interface MalachiteIndirectCommandBuffer : NSObject <MTLIndirectCommandBuffer> {
+@public
+    __weak id _device;
+    MTLIndirectCommandBufferDescriptor *_desc;
+    MTLResourceOptions _options;
+    std::vector<malachite_icb_command> _commands;
+}
+@property (copy) NSString *label;
+- (NSRange)clamp:(NSRange)range;
+@end
+
+@interface MalachiteIndirectCommand : NSObject {
+@public
+    MalachiteIndirectCommandBuffer *_icb;  // its commands are stored in the buffer
+    malachite_icb_command *_command;
+}
+- (instancetype)initWith:(MalachiteIndirectCommandBuffer *)icb index:(NSUInteger)index;
+@end
+
+@interface MalachiteIndirectRenderCommand : MalachiteIndirectCommand <MTLIndirectRenderCommand>
+@end
+
+@interface MalachiteIndirectComputeCommand : MalachiteIndirectCommand <MTLIndirectComputeCommand>
+@end
+
+static void malachite_icb_bind_buffer(malachite_icb_command *c, bool fragment, id buffer, NSUInteger offset,
+                                      NSUInteger index, NSUInteger stride, bool strided)
+{
+    if (index >= 31)
+        return;
+    malachite_icb_bind bind = { index, offset, stride, fragment, strided, buffer };
+    for (malachite_icb_bind &b : c->binds)
+        if (b.index == index && b.fragment == fragment) {
+            b = bind;
+            return;
+        }
+    c->binds.push_back(bind);
+}
+
+@implementation MalachiteIndirectCommand
+- (instancetype)initWith:(MalachiteIndirectCommandBuffer *)icb index:(NSUInteger)index
+{
+    self = [super init];
+    if (self) {
+        _icb = icb;
+        _command = &icb->_commands[index];
+    }
+    return self;
+}
+
+- (void)reset
+{
+    *_command = malachite_icb_command();
+}
+
+// commands run in order, each after the one before
+- (void)setBarrier
+{
+}
+
+- (void)clearBarrier
+{
+}
+@end
+
+@implementation MalachiteIndirectRenderCommand
+- (void)setRenderPipelineState:(id)state
+{
+    _command->pipeline = state;
+}
+
+- (void)setVertexBuffer:(id)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+    malachite_icb_bind_buffer(_command, false, buffer, offset, index, 0, false);
+}
+
+- (void)setVertexBuffer:(id)buffer offset:(NSUInteger)offset attributeStride:(NSUInteger)stride atIndex:(NSUInteger)index
+{
+    malachite_icb_bind_buffer(_command, false, buffer, offset, index, stride, true);
+}
+
+- (void)setFragmentBuffer:(id)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+    malachite_icb_bind_buffer(_command, true, buffer, offset, index, 0, false);
+}
+
+- (void)setCullMode:(MTLCullMode)mode
+{
+    _command->state |= MALACHITE_ICB_CULL;
+    _command->cull = mode;
+}
+
+- (void)setFrontFacingWinding:(MTLWinding)winding
+{
+    _command->state |= MALACHITE_ICB_WINDING;
+    _command->winding = winding;
+}
+
+- (void)setTriangleFillMode:(MTLTriangleFillMode)mode
+{
+    _command->state |= MALACHITE_ICB_FILL;
+    _command->fill = mode;
+}
+
+- (void)setDepthClipMode:(MTLDepthClipMode)mode
+{
+    _command->state |= MALACHITE_ICB_CLIP;
+    _command->clip = mode;
+}
+
+- (void)setDepthBias:(float)bias slopeScale:(float)scale clamp:(float)clamp
+{
+    _command->state |= MALACHITE_ICB_BIAS;
+    _command->bias[0] = bias;
+    _command->bias[1] = scale;
+    _command->bias[2] = clamp;
+}
+
+- (void)setDepthStencilState:(id)state
+{
+    _command->state |= MALACHITE_ICB_DEPTH;
+    _command->depth_stencil = state;
+}
+
+- (void)drawPrimitives:(MTLPrimitiveType)type
+           vertexStart:(NSUInteger)start
+           vertexCount:(NSUInteger)count
+         instanceCount:(NSUInteger)instances
+          baseInstance:(NSUInteger)baseInstance
+{
+    _command->kind = malachite_icb_kind::draw;
+    _command->type = type;
+    _command->start = start;
+    _command->count = count;
+    _command->instances = instances;
+    _command->base_instance = baseInstance;
+}
+
+- (void)drawIndexedPrimitives:(MTLPrimitiveType)type
+                   indexCount:(NSUInteger)count
+                    indexType:(MTLIndexType)indexType
+                  indexBuffer:(id)index
+            indexBufferOffset:(NSUInteger)offset
+                instanceCount:(NSUInteger)instances
+                   baseVertex:(NSInteger)baseVertex
+                 baseInstance:(NSUInteger)baseInstance
+{
+    _command->kind = malachite_icb_kind::draw_indexed;
+    _command->type = type;
+    _command->count = count;
+    _command->index_type = indexType;
+    _command->index_buffer = index;
+    _command->index_offset = offset;
+    _command->instances = instances;
+    _command->base_vertex = baseVertex;
+    _command->base_instance = baseInstance;
+}
+
+- (void)drawPatches:(NSUInteger)controlPoints
+                         patchStart:(NSUInteger)start
+                         patchCount:(NSUInteger)count
+                   patchIndexBuffer:(id)patchIndex
+             patchIndexBufferOffset:(NSUInteger)patchIndexOffset
+                      instanceCount:(NSUInteger)instances
+                       baseInstance:(NSUInteger)baseInstance
+           tessellationFactorBuffer:(id)factors
+     tessellationFactorBufferOffset:(NSUInteger)factorOffset
+    tessellationFactorBufferInstanceStride:(NSUInteger)factorStride
+{
+    _command->kind = malachite_icb_kind::draw_patches;
+    _command->patch_points = controlPoints;
+    _command->patch_start = start;
+    _command->patch_count = count;
+    _command->patch_index = patchIndex;
+    _command->patch_index_offset = patchIndexOffset;
+    _command->instances = instances;
+    _command->base_instance = baseInstance;
+    _command->factor_buffer = factors;
+    _command->factor_offset = factorOffset;
+    _command->factor_stride = factorStride;
+}
+
+- (void)drawIndexedPatches:(NSUInteger)controlPoints
+                         patchStart:(NSUInteger)start
+                         patchCount:(NSUInteger)count
+                   patchIndexBuffer:(id)patchIndex
+             patchIndexBufferOffset:(NSUInteger)patchIndexOffset
+            controlPointIndexBuffer:(id)pointIndex
+      controlPointIndexBufferOffset:(NSUInteger)pointIndexOffset
+                      instanceCount:(NSUInteger)instances
+                       baseInstance:(NSUInteger)baseInstance
+           tessellationFactorBuffer:(id)factors
+     tessellationFactorBufferOffset:(NSUInteger)factorOffset
+    tessellationFactorBufferInstanceStride:(NSUInteger)factorStride
+{
+    _command->kind = malachite_icb_kind::draw_indexed_patches;
+    _command->patch_points = controlPoints;
+    _command->patch_start = start;
+    _command->patch_count = count;
+    _command->patch_index = patchIndex;
+    _command->patch_index_offset = patchIndexOffset;
+    _command->point_index = pointIndex;
+    _command->point_index_offset = pointIndexOffset;
+    _command->instances = instances;
+    _command->base_instance = baseInstance;
+    _command->factor_buffer = factors;
+    _command->factor_offset = factorOffset;
+    _command->factor_stride = factorStride;
+}
+
+- (void)drawMeshThreadgroups:(MTLSize)groups
+    threadsPerObjectThreadgroup:(MTLSize)objectThreads
+      threadsPerMeshThreadgroup:(MTLSize)meshThreads
+{
+    os_log(OS_LOG_DEFAULT, "Malachite: mesh draws in an indirect command buffer are not supported");
+}
+
+- (void)drawMeshThreads:(MTLSize)threads
+    threadsPerObjectThreadgroup:(MTLSize)objectThreads
+      threadsPerMeshThreadgroup:(MTLSize)meshThreads
+{
+    os_log(OS_LOG_DEFAULT, "Malachite: mesh draws in an indirect command buffer are not supported");
+}
+
+- (void)setObjectBuffer:(id)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+}
+
+- (void)setMeshBuffer:(id)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+}
+
+- (void)setObjectThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index
+{
+}
+@end
+
+@implementation MalachiteIndirectComputeCommand
+- (void)setComputePipelineState:(id)state
+{
+    _command->pipeline = state;
+}
+
+- (void)setKernelBuffer:(id)buffer offset:(NSUInteger)offset atIndex:(NSUInteger)index
+{
+    malachite_icb_bind_buffer(_command, false, buffer, offset, index, 0, false);
+}
+
+- (void)setKernelBuffer:(id)buffer offset:(NSUInteger)offset attributeStride:(NSUInteger)stride atIndex:(NSUInteger)index
+{
+    malachite_icb_bind_buffer(_command, false, buffer, offset, index, stride, true);
+}
+
+- (void)concurrentDispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)threads
+{
+    _command->kind = malachite_icb_kind::dispatch_groups;
+    _command->grid = groups;
+    _command->threads = threads;
+}
+
+- (void)concurrentDispatchThreads:(MTLSize)grid threadsPerThreadgroup:(MTLSize)threads
+{
+    _command->kind = malachite_icb_kind::dispatch_threads;
+    _command->grid = grid;
+    _command->threads = threads;
+}
+
+- (void)setThreadgroupMemoryLength:(NSUInteger)length atIndex:(NSUInteger)index
+{
+    for (auto &m : _command->threadgroup_memory)
+        if (m.first == index) {
+            m.second = length;
+            return;
+        }
+    _command->threadgroup_memory.push_back({ index, length });
+}
+
+- (void)setImageblockWidth:(NSUInteger)width height:(NSUInteger)height
+{
+}
+
+- (void)setStageInRegion:(MTLRegion)region
+{
+    _command->stage_in = true;
+    _command->stage_in_region = region;
+}
+@end
+
+@implementation MalachiteIndirectCommandBuffer
+- (id)device
+{
+    return _device;
+}
+
+- (NSUInteger)size
+{
+    return _commands.size();
+}
+
+- (MTLResourceID)gpuResourceID
+{
+    return (MTLResourceID){ 0 };
+}
+
+- (NSUInteger)allocatedSize
+{
+    return _commands.size() * sizeof(malachite_icb_command);
+}
+
+- (MTLResourceOptions)resourceOptions
+{
+    return _options;
+}
+
+- (MTLStorageMode)storageMode
+{
+    return (MTLStorageMode)((_options & MTLResourceStorageModeMask) >> MTLResourceStorageModeShift);
+}
+
+- (MTLCPUCacheMode)cpuCacheMode
+{
+    return (MTLCPUCacheMode)(_options & MTLResourceCPUCacheModeMask);
+}
+
+- (MTLHazardTrackingMode)hazardTrackingMode
+{
+    return (MTLHazardTrackingMode)((_options & MTLResourceHazardTrackingModeMask) >> 8);
+}
+
+- (id<MTLHeap>)heap
+{
+    return nil;
+}
+
+- (NSUInteger)heapOffset
+{
+    return 0;
+}
+
+- (BOOL)isAliasable
+{
+    return NO;
+}
+
+- (void)makeAliasable
+{
+}
+
+- (kern_return_t)setOwnerWithIdentity:(mach_port_t)identity
+{
+    return KERN_SUCCESS;
+}
+
+- (MTLPurgeableState)setPurgeableState:(MTLPurgeableState)state
+{
+    return MTLPurgeableStateNonVolatile;
+}
+
+- (void)resetWithRange:(NSRange)range
+{
+    range = [self clamp:range];
+    for (NSUInteger i = 0; i < range.length; i++)
+        _commands[range.location + i] = malachite_icb_command();
+}
+
+- (NSRange)clamp:(NSRange)range
+{
+    if (range.location > _commands.size() || range.length > _commands.size() - range.location) {
+        os_log(OS_LOG_DEFAULT, "Malachite: indirect command range %lu + %lu is past the %lu commands",
+               (unsigned long)range.location, (unsigned long)range.length, (unsigned long)_commands.size());
+        range.location = MIN(range.location, _commands.size());
+        range.length = MIN(range.length, _commands.size() - range.location);
+    }
+    return range;
+}
+
+- (id)indirectRenderCommandAtIndex:(NSUInteger)index
+{
+    return index < _commands.size() ? [[MalachiteIndirectRenderCommand alloc] initWith:self index:index] : nil;
+}
+
+- (id)indirectComputeCommandAtIndex:(NSUInteger)index
+{
+    return index < _commands.size() ? [[MalachiteIndirectComputeCommand alloc] initWith:self index:index] : nil;
+}
+@end
+
 // The kernel runs these on the copy engine (0xC7B5), which lays out block-linear surfaces itself.
 @interface MalachiteBlitCommandEncoder : MTLIOAccelBlitCommandEncoder <MTLBlitCommandEncoder> {
     __unsafe_unretained id _cb;  // outlives the encoder; retaining it would be a cycle
@@ -1038,6 +1480,32 @@ static void malachite_mip_fill(MalachiteTexture *t, MTLRegion region, NSUInteger
 
 - (void)barrierAfterQueueStages:(MTLStages)after beforeStages:(MTLStages)before
 {
+}
+
+// the CPU encoded the commands, so these act on them as they are encoded
+- (void)copyIndirectCommandBuffer:(id)source
+                      sourceRange:(NSRange)range
+                      destination:(id)destination
+                 destinationIndex:(NSUInteger)index
+{
+    MalachiteIndirectCommandBuffer *from = source, *to = destination;
+    range = [from clamp:range];
+    if (index > to->_commands.size() || range.length > to->_commands.size() - index) {
+        os_log(OS_LOG_DEFAULT, "Malachite: indirect command copy does not fit the destination");
+        return;
+    }
+    std::vector<malachite_icb_command> copy(from->_commands.begin() + range.location,
+                                            from->_commands.begin() + NSMaxRange(range));
+    std::copy(copy.begin(), copy.end(), to->_commands.begin() + index);
+}
+
+- (void)optimizeIndirectCommandBuffer:(id)buffer withRange:(NSRange)range
+{
+}
+
+- (void)resetCommandsInBuffer:(id)buffer withRange:(NSRange)range
+{
+    [(MalachiteIndirectCommandBuffer *)buffer resetWithRange:range];
 }
 
 - (void)copyFromBuffer:(id)src sourceOffset:(NSUInteger)srcOff
@@ -2982,6 +3450,56 @@ static uint32_t malachite_cl_format(__unsafe_unretained id texture)
 {
     if (index < MALACHITE_BINDINGS)
         _samplers[index] = sampler;
+}
+
+// what the commands set is not kept, as the encoder's state before is what later calls expect
+- (void)executeCommandsInBuffer:(id)buffer withRange:(NSRange)range
+{
+    MalachiteIndirectCommandBuffer *icb = buffer;
+    range = [icb clamp:range];
+    bool own_pipeline = !icb->_desc.inheritPipelineState, own_buffers = !icb->_desc.inheritBuffers;
+    NSUInteger bindable = MIN(icb->_desc.maxKernelBufferBindCount, 31u);
+    MalachiteComputePipelineState *pipeline = _pipeline;
+    uint64_t buffers[31], region = _region;
+    __unsafe_unretained id bound[31];
+    uint32_t threadgroup[31];
+    memcpy(buffers, _buffers, sizeof buffers);
+    memcpy(bound, _bound, sizeof bound);
+    memcpy(threadgroup, _threadgroup, sizeof threadgroup);
+    for (NSUInteger i = range.location; i < NSMaxRange(range); i++) {
+        const malachite_icb_command &c = icb->_commands[i];
+        if (c.kind != malachite_icb_kind::dispatch_groups && c.kind != malachite_icb_kind::dispatch_threads)
+            continue;
+        if (own_pipeline && c.pipeline)
+            [self setComputePipelineState:c.pipeline];
+        if (own_buffers) {
+            for (NSUInteger k = 0; k < bindable; k++)
+                [self setBuffer:nil offset:0 atIndex:k];
+            for (const malachite_icb_bind &b : c.binds)
+                if (b.strided)
+                    [self setBuffer:b.buffer offset:b.offset attributeStride:b.stride atIndex:b.index];
+                else
+                    [self setBuffer:b.buffer offset:b.offset atIndex:b.index];
+        }
+        for (const auto &m : c.threadgroup_memory)
+            [self setThreadgroupMemoryLength:m.second atIndex:m.first];
+        if (c.stage_in)
+            [self setStageInRegion:c.stage_in_region];
+        if (c.kind == malachite_icb_kind::dispatch_groups)
+            [self dispatchThreadgroups:c.grid threadsPerThreadgroup:c.threads];
+        else
+            [self dispatchThreads:c.grid threadsPerThreadgroup:c.threads];
+    }
+    _pipeline = pipeline;
+    _region = region;
+    memcpy(_buffers, buffers, sizeof buffers);
+    memcpy(_bound, bound, sizeof bound);
+    memcpy(_threadgroup, threadgroup, sizeof threadgroup);
+}
+
+- (void)executeCommandsInBuffer:(id)buffer indirectBuffer:(id)range indirectBufferOffset:(NSUInteger)offset
+{
+    os_log(OS_LOG_DEFAULT, "Malachite: executing commands from an indirect range buffer is not supported");
 }
 
 - (void)dispatchThreadgroups:(MTLSize)groups threadsPerThreadgroup:(MTLSize)threads
@@ -5795,6 +6313,112 @@ static MTLPixelFormat malachite_stored_format(MTLPixelFormat f)
          index:index offset:offset type:indexType];
 }
 
+// A command sets its own pipeline and buffers unless the buffer inherits them, and the render states it sets itself.
+// What they leave isn't kept: the encoder's state before is what later calls expect.
+- (void)executeCommandsInBuffer:(id)buffer withRange:(NSRange)range
+{
+    MalachiteIndirectCommandBuffer *icb = buffer;
+    range = [icb clamp:range];
+    bool own_pipeline = !icb->_desc.inheritPipelineState, own_buffers = !icb->_desc.inheritBuffers;
+    NSUInteger vertex_binds = MIN(icb->_desc.maxVertexBufferBindCount, 31u);
+    NSUInteger fragment_binds = MIN(icb->_desc.maxFragmentBufferBindCount, 31u);
+    MalachiteRenderPipelineState *pipeline = _pipeline;
+    MalachiteDepthStencilState *ds = _ds;
+    uint64_t vbuffers[31], fbuffers[31], factors = _factors;
+    uint32_t vsizes[31], fsizes[31], vstrides[31], factor_stride = _factor_stride;
+    __unsafe_unretained id vbound[31], fbound[31];
+    memcpy(vbuffers, _vbuffers, sizeof vbuffers);
+    memcpy(fbuffers, _fbuffers, sizeof fbuffers);
+    memcpy(vsizes, _vsizes, sizeof vsizes);
+    memcpy(fsizes, _fsizes, sizeof fsizes);
+    memcpy(vstrides, _vstrides, sizeof vstrides);
+    memcpy(vbound, _vbound, sizeof vbound);
+    memcpy(fbound, _fbound, sizeof fbound);
+    auto cull = _pass.cull_face;
+    auto ccw = _pass.front_ccw;
+    auto lines = _pass.fill_lines;
+    auto clamped = _pass.depth_clamp;
+    float bias[3];
+    memcpy(bias, _pass.depth_bias, sizeof bias);
+    for (NSUInteger i = range.location; i < NSMaxRange(range); i++) {
+        const malachite_icb_command &c = icb->_commands[i];
+        if (c.kind < malachite_icb_kind::draw || c.kind > malachite_icb_kind::draw_indexed_patches)
+            continue;
+        if (own_pipeline && c.pipeline)
+            [self setRenderPipelineState:c.pipeline];
+        if (own_buffers) {
+            for (NSUInteger k = 0; k < vertex_binds; k++)
+                [self setVertexBuffer:nil offset:0 atIndex:k];
+            for (NSUInteger k = 0; k < fragment_binds; k++)
+                [self setFragmentBuffer:nil offset:0 atIndex:k];
+            for (const malachite_icb_bind &b : c.binds)
+                if (b.fragment)
+                    [self setFragmentBuffer:b.buffer offset:b.offset atIndex:b.index];
+                else if (b.strided)
+                    [self setVertexBuffer:b.buffer offset:b.offset attributeStride:b.stride atIndex:b.index];
+                else
+                    [self setVertexBuffer:b.buffer offset:b.offset atIndex:b.index];
+        }
+        if (c.state & MALACHITE_ICB_CULL)
+            [self setCullMode:c.cull];
+        if (c.state & MALACHITE_ICB_WINDING)
+            [self setFrontFacingWinding:c.winding];
+        if (c.state & MALACHITE_ICB_FILL)
+            [self setTriangleFillMode:c.fill];
+        if (c.state & MALACHITE_ICB_CLIP)
+            [self setDepthClipMode:c.clip];
+        if (c.state & MALACHITE_ICB_BIAS)
+            [self setDepthBias:c.bias[0] slopeScale:c.bias[1] clamp:c.bias[2]];
+        if (c.state & MALACHITE_ICB_DEPTH)
+            [self setDepthStencilState:c.depth_stencil];
+        switch (c.kind) {
+        case malachite_icb_kind::draw:
+            [self drawPrimitives:c.type vertexStart:c.start vertexCount:c.count instanceCount:c.instances
+                    baseInstance:c.base_instance];
+            break;
+        case malachite_icb_kind::draw_indexed:
+            [self drawIndexedPrimitives:c.type indexCount:c.count indexType:c.index_type indexBuffer:c.index_buffer
+                      indexBufferOffset:c.index_offset instanceCount:c.instances baseVertex:c.base_vertex
+                           baseInstance:c.base_instance];
+            break;
+        case malachite_icb_kind::draw_patches:
+            [self setTessellationFactorBuffer:c.factor_buffer offset:c.factor_offset instanceStride:c.factor_stride];
+            [self drawPatches:c.patch_points patchStart:c.patch_start patchCount:c.patch_count
+                patchIndexBuffer:c.patch_index patchIndexBufferOffset:c.patch_index_offset
+                instanceCount:c.instances baseInstance:c.base_instance];
+            break;
+        default:
+            [self setTessellationFactorBuffer:c.factor_buffer offset:c.factor_offset instanceStride:c.factor_stride];
+            [self drawIndexedPatches:c.patch_points patchStart:c.patch_start patchCount:c.patch_count
+                     patchIndexBuffer:c.patch_index patchIndexBufferOffset:c.patch_index_offset
+                     controlPointIndexBuffer:c.point_index controlPointIndexBufferOffset:c.point_index_offset
+                     instanceCount:c.instances baseInstance:c.base_instance];
+            break;
+        }
+    }
+    _pipeline = pipeline;
+    _ds = ds;
+    _factors = factors;
+    _factor_stride = factor_stride;
+    memcpy(_vbuffers, vbuffers, sizeof vbuffers);
+    memcpy(_fbuffers, fbuffers, sizeof fbuffers);
+    memcpy(_vsizes, vsizes, sizeof vsizes);
+    memcpy(_fsizes, fsizes, sizeof fsizes);
+    memcpy(_vstrides, vstrides, sizeof vstrides);
+    memcpy(_vbound, vbound, sizeof vbound);
+    memcpy(_fbound, fbound, sizeof fbound);
+    _pass.cull_face = cull;
+    _pass.front_ccw = ccw;
+    _pass.fill_lines = lines;
+    _pass.depth_clamp = clamped;
+    memcpy(_pass.depth_bias, bias, sizeof bias);
+}
+
+- (void)executeCommandsInBuffer:(id)buffer indirectBuffer:(id)range indirectBufferOffset:(NSUInteger)offset
+{
+    os_log(OS_LOG_DEFAULT, "Malachite: executing commands from an indirect range buffer is not supported");
+}
+
 // before the first draw, or the clears of a pass with none
 - (void)loadAttachments
 {
@@ -6986,8 +7610,8 @@ static void malachite_nothing(const char *cls, const char *protocol, NSArray<NSS
     malachite_nothing("MalachiteDevice", "MTLDeviceSPI", @[
         @"newIntersectionFunctionTableWithDescriptor:", @"newVisibleFunctionTableWithDescriptor:",
         @"functionHandleWithFunction:", @"functionHandleWithFunction:resourceIndex:",
-        @"newIndirectCommandBufferWithDescriptor:maxCount:options:", @"newIndirectComputeCommandEncoderWithBuffer:",
-        @"newIndirectRenderCommandEncoderWithBuffer:", @"supportsPlacementSparse", @"doubleFPConfig", @"halfFPConfig",
+        @"newIndirectComputeCommandEncoderWithBuffer:", @"newIndirectRenderCommandEncoderWithBuffer:",
+        @"supportsPlacementSparse", @"doubleFPConfig", @"halfFPConfig",
         @"metalAssertionsEnabled", @"setMetalAssertionsEnabled:"
     ]);
     malachite_nothing("MalachiteDepthStencilState", "MTLDepthStencilStateSPI", @[ @"resourceIndex" ]);
@@ -7019,8 +7643,7 @@ static void malachite_nothing(const char *cls, const char *protocol, NSArray<NSS
         @"setVisibleFunctionTable:atBufferIndex:", @"setVisibleFunctionTables:withBufferRange:"
     ]);
     malachite_nothing("MalachiteRenderCommandEncoder", "MTLRenderCommandEncoder", @[
-        @"sampleCountersInBuffer:atSampleIndex:withBarrier:", @"executeCommandsInBuffer:withRange:",
-        @"executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:", @"setVertexAmplificationCount:viewMappings:",
+        @"sampleCountersInBuffer:atSampleIndex:withBarrier:", @"setVertexAmplificationCount:viewMappings:",
         @"setColorAttachmentMap:",
         @"setVertexAccelerationStructure:atBufferIndex:", @"setFragmentAccelerationStructure:atBufferIndex:",
         @"setTileAccelerationStructure:atBufferIndex:", @"setVertexIntersectionFunctionTable:atBufferIndex:",
@@ -7228,6 +7851,33 @@ static uint64_t malachite_vram(void)
 {
     return [self newIndirectArgumentEncoderWithLayout:layout];
 }
+
+- (id)newIndirectCommandBufferWithDescriptor:(MTLIndirectCommandBufferDescriptor *)descriptor
+                                    maxCount:(NSUInteger)count
+                                     options:(MTLResourceOptions)options
+{
+    MTLIndirectCommandType mesh = MTLIndirectCommandTypeDrawMeshThreadgroups | MTLIndirectCommandTypeDrawMeshThreads;
+    if (descriptor.supportRayTracing || (descriptor.commandTypes & mesh)) {
+        os_log(OS_LOG_DEFAULT, "Malachite: indirect command buffers with ray tracing or mesh draws are not supported");
+        return nil;
+    }
+    MalachiteIndirectCommandBuffer *b = [MalachiteIndirectCommandBuffer new];
+    b->_device = self;
+    b->_desc = [descriptor copy];
+    b->_options = options;
+    b->_commands.resize(count);
+    return b;
+}
+
+- (id)newIndirectCommandBufferWithDescriptor:(MTLIndirectCommandBufferDescriptor *)descriptor
+                             maxCommandCount:(NSUInteger)count
+                                     options:(MTLResourceOptions)options
+{
+    return [self newIndirectCommandBufferWithDescriptor:descriptor maxCount:count options:options];
+}
+
+- (BOOL)supportsGFXIndirectCommandBuffers { return YES; }
+- (BOOL)supportsCMPIndirectCommandBuffers { return YES; }
 
 // sparse heaps map pages on demand, which we don't do
 - (id)newHeapWithDescriptor:(MTLHeapDescriptor *)descriptor
