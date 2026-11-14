@@ -6996,7 +6996,7 @@ static void malachite_nothing(const char *cls, const char *protocol, NSArray<NSS
         @"newAccelerationStructureWithDescriptor:", @"newAccelerationStructureWithDescriptor:offset:"
     ]);
     malachite_nothing("MalachiteBuffer", "MTLBuffer", @[ @"newTensorWithDescriptor:offset:error:", @"sparseBufferTier" ]);
-    malachite_nothing("MalachiteTexture", "MTLTexture", @[ @"sparseTextureTier" ]);
+    malachite_nothing("MalachiteTexture", "MTLTexture", @[ @"sparseTextureTier", @"firstMipmapInTail", @"tailSizeInBytes" ]);
     malachite_nothing("MalachiteComputePipelineState", "MTLComputePipelineState", @[
         @"functionHandleWithFunction:", @"functionHandleWithBinaryFunction:", @"functionHandleWithName:",
         @"newComputePipelineStateWithAdditionalBinaryFunctions:error:", @"newComputePipelineStateWithBinaryFunctions:error:"
@@ -7009,7 +7009,9 @@ static void malachite_nothing(const char *cls, const char *protocol, NSArray<NSS
     ]);
     malachite_nothing("MalachiteBlitCommandEncoder", "MTLBlitCommandEncoder", @[
         @"sampleCountersInBuffer:atSampleIndex:withBarrier:", @"resolveCounters:inRange:destinationBuffer:destinationOffset:",
-        @"copyFromTensor:sourceOrigin:sourceDimensions:toTensor:destinationOrigin:destinationDimensions:"
+        @"copyFromTensor:sourceOrigin:sourceDimensions:toTensor:destinationOrigin:destinationDimensions:",
+        @"getTextureAccessCounters:region:mipLevel:slice:resetCounters:countersBuffer:countersBufferOffset:",
+        @"resetTextureAccessCounters:region:mipLevel:slice:"
     ]);
     malachite_nothing("MalachiteComputeCommandEncoder", "MTLComputeCommandEncoder", @[
         @"sampleCountersInBuffer:atSampleIndex:withBarrier:", @"setAccelerationStructure:atBufferIndex:",
