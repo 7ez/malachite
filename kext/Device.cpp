@@ -2894,7 +2894,7 @@ void Gpu::pump_flips()
             if (!sc.pend.valid)
                 continue;
             const int head = index(sc);
-            if (!disp || suspended || !sc.shown || sc.asleep || sc.unplugged) {
+            if (!disp || suspended || !sc.shown || sc.asleep || sc.unplugged || !disp->head[head].set_up) {
                 sc.pend.valid = false;
                 continue;
             }

@@ -564,6 +564,8 @@ int disp_flip_queue(struct disp *d, int head, uint64_t fb, uint32_t acquire, uns
 {
     struct gpu *g = gsp_gpu(d->s);
     struct dchan *wc = &d->head[head].wndw;
+    if (!d->head[head].set_up)  // a modeset the engine refused took the channels
+        return -1;
     uint32_t slot = d->head[head].wndw_ntfy ^= 0x30;
     vram_wr32(g, d->ntfy + slot, 0);
     vram_flush(g);
