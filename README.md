@@ -94,7 +94,7 @@ names, and `bootloader`, `booter_load` and `booter_unload` from `nvidia/ad102/gs
 
 ## Not finished
 
-- Sleep: the display doesn't come back after waking, so turn sleep off.
+- Sleep and wake work in a virtual machine with the GPU passed through. They haven't been confirmed on a real Mac yet, so tell me if the displays or the desktop don't come back.
 - On a 240 Hz monitor, OpenGL apps run at 120 frames a second and Metal ones in a window at about 165.
 - Apps that lean on the GPU may hit unsupported features. They log them, and those logs are what's needed.
 
