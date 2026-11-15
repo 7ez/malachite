@@ -879,9 +879,21 @@ class Gpu : public IOService
     {
         return !c->compute_sem || (int32_t)(*c->compute_sem - c->compute_seq) >= 0;
     }
+    // The driver's own idle detection drops the clocks between the short bursts an app submits, and each burst then
+    // runs at the low clock. WindowServer's steady stream of small frames doesn't need it.
+    uint64_t boosted_at = 0;
+    void boost_clocks(const gpu_ctx *c, uint64_t now)
+    {
+        if (now - boosted_at < 500000 || !strcmp(c->owner, "WindowServer"))
+            return;
+        boosted_at = now;
+        pwr_boost(gsp, 2);
+    }
     IOReturn busy_open(gpu_ctx *c, IOReturn r)
     {
         uint64_t none = 0, now = time_us();
+        if (r == kIOReturnSuccess)
+            boost_clocks(c, now);
         if (r == kIOReturnSuccess &&
             __atomic_compare_exchange_n(&c->busy_since, &none, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED))
             busy_step(1, now);

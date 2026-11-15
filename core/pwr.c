@@ -28,3 +28,13 @@ void pwr_read(struct gsp *s, struct pwr *out)
     }
     mem_free(cp);
 }
+
+void pwr_boost(struct gsp *s, uint32_t seconds)
+{
+    const struct rm_client *in = gsp_internal(s);
+    NV2080_CTRL_PERF_BOOST_PARAMS b = {
+        .flags = NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX | NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES,
+        .duration = seconds,
+    };
+    rm_control(s, in->client, in->subdevice, NV2080_CTRL_CMD_PERF_BOOST, &b, sizeof(b));
+}

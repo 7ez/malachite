@@ -10,3 +10,6 @@ struct pwr {
 };
 
 void pwr_read(struct gsp *s, struct pwr *out);
+
+// lifts the GPU to its highest P-state for the next <seconds>, as CUDA does while it has kernels to run
+void pwr_boost(struct gsp *s, uint32_t seconds);
