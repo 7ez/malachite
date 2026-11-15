@@ -7788,6 +7788,7 @@ static uint64_t malachite_vram(void)
 - (NSUInteger)maxBufferLength { return (NSUInteger)(malachite_vram() / 4 * 3); }
 - (MTLReadWriteTextureTier)readWriteTextureSupport { return MTLReadWriteTextureTier2; }
 - (BOOL)supportsBCTextureCompression { return YES; }
+- (BOOL)supportsQueryTextureLOD { return YES; }
 
 - (BOOL)supportsFeatureSet:(MTLFeatureSet)set
 {
