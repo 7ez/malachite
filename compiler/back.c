@@ -3057,9 +3057,9 @@ static void guard_helper_loads(struct ir_func *f)
     int sinks = 0;
     for (struct ir_block *b = f->entry; b; b = b->next)
         for (struct ir_val *v = b->first; v; v = v->next) {
-            int lod = IR_TEXA_FLAGS(v->aux);
+            int lod = IR_TEXA_FLAGS(v->aux), op = IR_TEXA_OP(v->aux);
             if (v->op == IR_DERIV || v->op == IR_SHFL || v->op == IR_VOTE ||
-                (v->op == IR_TEX && IR_TEXA_OP(v->aux) == SASS_TEX && SASS_TEXF_LOD(lod) != SASS_LOD_ZERO &&
+                (v->op == IR_TEX && (op == SASS_TEX || op == SASS_TMML) && SASS_TEXF_LOD(lod) != SASS_LOD_ZERO &&
                  SASS_TEXF_LOD(lod) != SASS_LOD_LOD)) {
                 reach[v->id] = 1;
                 sinks = 1;
@@ -4742,7 +4742,8 @@ static void emit_mops_in(const int *list, int n, enum nvk_stage stage)
                 for (int r = 0; r < (int)(m->imm >> 4 * j & 15); r++)
                     ss[n++] = (uint8_t)(s[j] + r);
             c = sched(ss, n, 1, d, 4, 1);
-            sched_push(sass_texop(IR_TEXA_OP(m->aux), d, s[0], s[1], m->aux & IR_TEXA_SCALAR ? 1 : 0xf,
+            int mask = m->aux & IR_TEXA_SCALAR ? 1 : IR_TEXA_OP(m->aux) == SASS_TMML ? 3 : 0xf;
+            sched_push(sass_texop(IR_TEXA_OP(m->aux), d, s[0], s[1], mask,
                                   IR_TEXA_DIM(m->aux), IR_TEXA_FLAGS(m->aux), c),
                        ss, n, d, 0, 0);
             break;

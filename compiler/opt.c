@@ -503,9 +503,9 @@ static int speculatable(const struct ir_val *v)
 
 static int takes_derivatives(const struct ir_val *v)
 {
-    int lod = SASS_TEXF_LOD(IR_TEXA_FLAGS(v->aux));
-    return v->op == IR_DERIV ||
-           (v->op == IR_TEX && IR_TEXA_OP(v->aux) == SASS_TEX && lod != SASS_LOD_ZERO && lod != SASS_LOD_LOD);
+    int lod = SASS_TEXF_LOD(IR_TEXA_FLAGS(v->aux)), op = IR_TEXA_OP(v->aux);
+    return v->op == IR_DERIV || (v->op == IR_TEX && (op == SASS_TEX || op == SASS_TMML) && lod != SASS_LOD_ZERO &&
+                                 lod != SASS_LOD_LOD);
 }
 
 // s is reached only from b, has no effects and goes on to m

@@ -477,7 +477,7 @@ struct sass_insn sass_texop(int op, uint8_t rd, uint8_t ra, uint8_t rb, uint8_t 
         hi |= 1u << 14;
     if (op == SASS_TLD4)
         hi |= (flags >> 5 & 3) << 23;
-    else if (op != SASS_TXD)
+    else if (op != SASS_TXD && op != SASS_TMML)
         hi |= SASS_TEXF_LOD(flags) << 23;
     return mk(lo, hi, ctrl);
 }

@@ -109,7 +109,7 @@ enum ir_cond { IR_EQ, IR_NE, IR_LT, IR_LE, IR_GT, IR_GE };
 #define IR_ATOMA_TYPE(a) ((a) >> 4 & 15)
 #define IR_ATOMA_SHARED(a) ((a) >> 8 & 1)
 
-// op is SASS_TEX/TLD/TLD4/TXD; n0 is the first source vector's length
+// op is SASS_TEX/TLD/TLD4/TXD/TMML; n0 is the first source vector's length
 #define IR_TEXA(op, dim, flags, n0) ((op) | (dim) << 12 | (int)(flags) << 15 | (n0) << 24)
 #define IR_TEXA_SCALAR (1 << 27)
 #define IR_TEXA_OP(a) ((a) & 0xfff)

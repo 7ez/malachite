@@ -3974,6 +3974,57 @@ static void texture_op(LLVMValueRef call, const char *name)
         set(call, results, konst(IR_I32, 1));
 }
 
+// TMML gives the computed LOD as signed 8.8 in its first result and the clamped one as unsigned 8.8 in its second.
+// Outside a fragment function a sample's LOD is 0, which the sampler raises to its minimum, so the coordinates are one
+// constant whose LOD is below any clamp.
+static void lod_query(LLVMValueRef call, const char *name)
+{
+    int clamped = name[14] == 'c';
+    int cube = strstr(name, "_cube") != NULL, array = strstr(name, "_array") != NULL;
+    int d3 = strstr(name, "_3d") != NULL;
+    if (!cube && !d3 && !strstr(name, "_2d"))
+        airc_fail("unsupported LOD query (%s)", name);
+    if (!is_konst(get(LLVMGetOperand(call, 3), 0), 0))
+        airc_fail("a LOD query with flags (%s)", name);
+    int fragment = g_info->stage == NVK_FRAGMENT;
+    if (!clamped && !fragment) {
+        set(call, 0, fconst(0.0f));
+        return;
+    }
+    struct ir_val *handle = op2(IR_OR, IR_I32, handle_of(LLVMGetOperand(call, 0), SP_TEXTURE),
+                                handle_of(LLVMGetOperand(call, 1), SP_SAMPLER));
+    unsigned ncoord = d3 || cube ? 3 : 2, n = 0;
+    struct ir_val *src[5], *c[3];
+    for (unsigned i = 0; i < ncoord; i++)
+        c[i] = fragment ? get(LLVMGetOperand(call, 2), i) : fconst(cube && !i ? 1.0f : 0.0f);
+    if (array)
+        src[n++] = konst(IR_I32, 0);
+    struct ir_val *cube_scale = NULL;
+    if (cube && fragment) {
+        struct ir_val *major = op1(IR_FABS, IR_F32, c[0]);
+        for (unsigned i = 1; i < 3; i++)
+            major = op2(IR_FMAX, IR_F32, major, op1(IR_FABS, IR_F32, c[i]));
+        cube_scale = mufu(MUFU_RCP, major);
+    }
+    for (unsigned i = 0; i < ncoord; i++)
+        src[n++] = cube_scale ? op2(IR_FMUL, IR_F32, c[i], cube_scale) : c[i];
+    unsigned n0 = n;
+    src[n++] = handle;
+    int dim = cube ? (array ? SASS_DIM_ARRAY_CUBE : SASS_DIM_CUBE) : d3 ? SASS_DIM_3D
+              : array                                                  ? SASS_DIM_ARRAY_2D
+                                                                       : SASS_DIM_2D;
+    struct ir_val *t = ir_add(g_cur, IR_TEX, IR_VOID, n);
+    memcpy(t->src, src, n * sizeof(src[0]));
+    t->aux = IR_TEXA(SASS_TMML, dim, SASS_TEXF_LOD(SASS_LOD_AUTO), n0);
+    struct ir_val *w = op1(IR_PROJ, IR_I32, t);
+    w->imm = clamped;
+    struct ir_val *fixed = clamped ? op2(IR_AND, IR_I32, w, konst(IR_I32, 0xffff))
+                                   : op2(IR_SAR, IR_I32, op2(IR_SHL, IR_I32, w, konst(IR_I32, 16)), konst(IR_I32, 16));
+    struct ir_val *f = op1(IR_I2F, IR_F32, fixed);
+    f->aux = !clamped;
+    set(call, 0, op2(IR_FMUL, IR_F32, f, fconst(1.0f / 256)));
+}
+
 static void store_value(struct ptr p, LLVMTypeRef t, LLVMValueRef val, unsigned align);
 
 static void inline_call(LLVMValueRef call, LLVMValueRef fn);
@@ -4324,6 +4375,10 @@ static void call(LLVMValueRef in)
     if (!strncmp(name, "air.sample_", 11) || !strncmp(name, "air.gather_", 11) || !strncmp(name, "air.read_texture", 16) ||
         !strncmp(name, "air.read_depth", 14)) {
         texture_op(in, name);
+        return;
+    }
+    if (!strncmp(name, "air.calculate_clamped_lod_", 26) || !strncmp(name, "air.calculate_unclamped_lod_", 28)) {
+        lod_query(in, name);
         return;
     }
     if (!strncmp(name, "air.is_null_texture", 19)) {  // header index 0 is the unbound texture
