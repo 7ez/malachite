@@ -6867,6 +6867,8 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
         while (((id<MTLCommandBuffer>)self).status < MTLCommandBufferStatusCompleted &&
                clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < give_up)
             usleep(50);
+        if (((id<MTLCommandBuffer>)self).status < MTLCommandBufferStatusCompleted)
+            os_log(OS_LOG_DEFAULT, "Malachite: a capture's GPU work was not done after 250 ms");
     }
 }
 
