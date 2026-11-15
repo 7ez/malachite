@@ -519,28 +519,40 @@ class Gpu : public IOService
         map_slack(c, base + 0x1000 + size);
         return base + 0x1000;
     }
-    // Image blit helper lanes read a row or two (8 KB) before their source and a compositor reduction reads past its
-    // partial sums, so big pages get 64 KB of zeros either side.
+    // Image blit helper lanes read a row or two (8 KB) before their source, so big pages get 64 KB of zeros before them.
+    // A compositor's reduction kernel sums as many float4s as it is told from a buffer that holds fewer, which Apple's
+    // GPUs read as zeros; a tester's desktop went past 64 KB, so what follows is 2 MB of one shared zero range.
+    static constexpr uint64_t big_before = 0x10000, big_after = 0x200000;
+    struct dma *zero_pad = nullptr;
+    bool map_pad(gpu_ctx *c, uint64_t va)
+    {
+        if (!zero_pad && (zero_pad = gsp_dma(gsp, big_after, 0)))
+            memset(zero_pad->cpu, 0, big_after);
+        return zero_pad && !vmm_map_sys(&c->vm, va, zero_pad, 0, big_after, VMM_RO);
+    }
     uint64_t map_va_big(gpu_ctx *c, uint64_t size)
     {
-        uint64_t base = vmm_alloc(&c->vm, size + 0x20000, 0x10000);
+        uint64_t base = vmm_alloc(&c->vm, big_before + size + big_after, 0x10000);
         if (!base)
             return 0;
-        for (uint64_t off = 0; off < 0x10000; off += 0x1000) {
+        for (uint64_t off = 0; off < big_before; off += 0x1000)
             map_slack(c, base + off);
-            map_slack(c, base + 0x10000 + size + off);
-        }
-        return base + 0x10000;
+        map_pad(c, base + big_before + size);
+        return base + big_before;
     }
-    static uint64_t slack(uint64_t size, bool vram)
+    static uint64_t slack_before(uint64_t size, bool vram)
     {
-        return vram && size >= 0x10000 ? 0x10000 : 0x1000;
+        return vram && size >= 0x10000 ? big_before : 0x1000;
+    }
+    static uint64_t slack_after(uint64_t size, bool vram)
+    {
+        return vram && size >= 0x10000 ? big_after : 0x1000;
     }
     void map_va_free(gpu_ctx *c, uint64_t va, uint64_t size, bool vram)
     {
-        uint64_t s = slack(size, vram);
-        vmm_unmap(&c->vm, va - s, size + 2 * s);
-        vmm_free(&c->vm, va - s, size + 2 * s);
+        uint64_t before = slack_before(size, vram), all = before + size + slack_after(size, vram);
+        vmm_unmap(&c->vm, va - before, all);
+        vmm_free(&c->vm, va - before, all);
     }
     IOReturn set_kind(gpu_ctx *c, uint64_t va, uint8_t kind, bool compress);
     void log_code(uint64_t va)
@@ -2402,10 +2414,12 @@ IOReturn Gpu::gpu_unmap(uint64_t va, uint64_t size, gpu_ctx *owner)
         return kIOReturnNotFound;
     gpu_maps[i].ctx->kind_va = 0;
     struct dma *d = &gpu_maps[i].dma;
-    uint64_t s = slack(d->size, gpu_maps[i].vram != 0);
-    vmm_unmap(&gpu_maps[i].ctx->vm, va - s, d->size + 2 * s);
+    uint64_t before = slack_before(d->size, gpu_maps[i].vram != 0);
+    uint64_t all = before + d->size + slack_after(d->size, gpu_maps[i].vram != 0);
+    vmm_unmap(&gpu_maps[i].ctx->vm, va - before, all);
     vmm_flush(&gpu);
-    vmm_free(&gpu_maps[i].ctx->vm, va - s, d->size + 2 * s);
+    // the address and its page tables are the next map's
+    vmm_free(&gpu_maps[i].ctx->vm, va - before, all);
     if (d->pages)
         mem_free(d->pages);
     if (d->handle) {
