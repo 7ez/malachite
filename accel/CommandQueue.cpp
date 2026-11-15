@@ -6,6 +6,7 @@
 #include "commands.h"
 #include "Task.h"
 #include <IOKit/IOLib.h>
+#include <kern/clock.h>
 
 // A refused task fails every command, and logging each costs WindowServer time: the first 20, then one in 1000.
 #include <stdarg.h>
@@ -30,25 +31,6 @@ static void failed_log(const char *fmt, ...)
 
 MalachiteDefineClass(CommandQueue, IOAccelCommandQueue)
 
-// Feeds Activity Monitor's GPU time. Off by default: macOS 26 doesn't export it, and kmutil won't link a kext with a
-// weak import it can't see tested, which fails the whole auxiliary collection.
-#ifdef MALACHITE_GPU_STAT
-extern "C" void ml_gpu_stat_update(uint64_t gpu_ns_delta) __attribute__((weak_import));
-#endif
-
-// Charged at the next submit, as ml_gpu_stat_update bills only the current thread; a task's last few ms go unbilled.
-static void charge_gpu_time(uintptr_t ctx)
-{
-#ifdef MALACHITE_GPU_STAT
-    uint64_t busy_us = 0;
-    if (ml_gpu_stat_update && gGpu &&
-        gGpu->callPlatformFunction(NVGPU_FN_CTX_BUSY, true, (void *)ctx, &busy_us, nullptr, nullptr) ==
-            kIOReturnSuccess &&
-        busy_us)
-        ml_gpu_stat_update(busy_us * 1000);
-#endif
-}
-
 // only so the abstract base can be instantiated; its exported methods handle a count-0 header
 class SegmentResourceList : public IOAccelSegmentResourceList {
     OSDeclareDefaultStructors(SegmentResourceList)
@@ -72,6 +54,28 @@ static uintptr_t queue_ctx(const IOAccelCommandQueue *q)
 {
     Task *t = OSDynamicCast(Task, (OSObject *)q->getGPUTask());
     return t ? t->context() : 0;
+}
+
+// Activity Monitor adds up each queue's accumulatedGPUTime, which the base fills in from the interval between a command
+// buffer's fence and the stamp it waits for. A submit that waits for the GPU itself leaves it a few microseconds, so the
+// time the kext saw the context busy goes in beside it.
+void CommandQueue::bill()
+{
+    uint64_t busy_us = 0;
+    if (!gGpu || gGpu->callPlatformFunction(NVGPU_FN_CTX_BUSY, true, (void *)queue_ctx(this), &busy_us, nullptr,
+                                            nullptr) != kIOReturnSuccess)
+        return;
+    billed_ns += busy_us * 1000;
+    uint64_t now;
+    absolutetime_to_nanoseconds(mach_absolute_time(), &now);
+    if (!billed_ns || now - billed_at < 50 * 1000 * 1000)
+        return;
+    billed_at = now;
+    OSObject *was = copyProperty("accumulatedGPUTime");
+    OSNumber *n = OSDynamicCast(OSNumber, was);
+    setProperty("accumulatedGPUTime", (n ? n->unsigned64BitValue() : 0) + billed_ns, 64);
+    OSSafeReleaseNULL(was);
+    billed_ns = 0;
 }
 
 // copied out, as the client can still write the segment
@@ -196,7 +200,8 @@ uint64_t CommandQueue::processCommandBuffer(unsigned int a, unsigned int b)
                                                                   app);
     else if (gGpu)
         gGpu->callPlatformFunction(NVGPU_FN_SYNC, true, (void *)queue_ctx(this), nullptr, nullptr, nullptr);
-    charge_gpu_time(queue_ctx(this));
+    if (!async)
+        bill();
     return r;
 }
 

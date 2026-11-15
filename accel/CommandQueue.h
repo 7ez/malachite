@@ -28,6 +28,10 @@ public:
 private:
     int async = -1;  // completion follows the GPU: NVGPU_FN_ASYNC at the first command buffer, unless OpenGL
     bool app = false;  // not WindowServer's, per NVGPU_FN_ASYNC
+    uint64_t billed_ns = 0;  // GPU time its synchronous submits took, not yet in accumulatedGPUTime
+    uint64_t billed_at = 0;
+
+    void bill();
 };
 
 }  // namespace malachite::accel
