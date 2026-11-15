@@ -286,6 +286,16 @@ static int setup(struct disp *d)
     ctxdma_write(d, NTFY_OFF, d->ntfy, d->ntfy + 0xfff);
     ctxdma_insert(d, 0, NTFY_CTXDMA, NTFY_OFF);
     ctxdma_insert(d, 0, FB_CTXDMA, CTXDMA_OFF);  // the core, for the output LUTs
+    if (d->core_fresh) {
+        // the engine refuses an owner under an allocated window channel, so they go in before head_setup()
+        for (int i = 0; i < 8; i++)
+            dmthd(&d->core, NVC37D_WINDOW_SET_CONTROL(i), NVV(NVC37D, WINDOW_SET_CONTROL_OWNER, i >> 1));
+        dmthd(&d->core, NVC37D_SET_INTERLOCK_FLAGS, 0);
+        dmthd(&d->core, NVC37D_SET_WINDOW_INTERLOCK_FLAGS, 0);
+        dmthd(&d->core, NVC37D_UPDATE, 1);
+        if (dkick(d, &d->core))
+            return -1;
+    }
     d->set_up = 1;
     return 0;
 }
@@ -438,7 +448,8 @@ int disp_modeset(struct disp *d, int head, int out, const struct disp_mode *t, u
 
     // core: window bounds and owners, then the head (corec57d_init, headc57d, sorc37d_ctrl)
     for (int i = 0; i < 8; i++) {
-        dmthd(c, NVC37D_WINDOW_SET_CONTROL(i), NVV(NVC37D, WINDOW_SET_CONTROL_OWNER, i >> 1));
+        if (!d->core_fresh)
+            dmthd(c, NVC37D_WINDOW_SET_CONTROL(i), NVV(NVC37D, WINDOW_SET_CONTROL_OWNER, i >> 1));
         dmthd(c, NVC57D_WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS(i),
               NVD(NVC57D, WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS_RGB_PACKED1BPP, TRUE) |
                   NVD(NVC57D, WINDOW_SET_WINDOW_FORMAT_USAGE_BOUNDS_RGB_PACKED2BPP, TRUE) |

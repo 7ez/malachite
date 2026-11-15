@@ -306,6 +306,7 @@ int disp_probe(struct gsp *s, struct disp *d, const struct disp_size *scaled, ui
     struct gpu *g = gsp_gpu(s);
     log_msg("disp: ownership %#x, core channel state %#x control %#x, capabilities %#x %#x %#x\n", rd32(g, 0x6254e8),
             rd32(g, 0x610630), rd32(g, 0x6104e0), rd32(g, 0x640000), rd32(g, 0x640004), rd32(g, 0x64000c));
+    d->core_fresh = !(rd32(g, 0x610630) >> 16 & 0x1f);  // NV_PDISP_FE_CHNSTATUS_CORE_STATE_DEALLOC
 
     if (rm_client(s, &d->c) || rm_alloc(s, d->c.client, d->c.device, DISP_COMMON, NV04_DISPLAY_COMMON, NULL, 0))
         return -1;

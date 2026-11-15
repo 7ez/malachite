@@ -90,6 +90,7 @@ struct disp {
     int probe_only;
     uint64_t ntfy;  // notifier memory: the core's at 0, each head's window's and flip semaphore after
     int set_up;     // the root object, the core channel and the notifier memory exist
+    int core_fresh;  // the hardware's core channel was deallocated when probed, no firmware had set the windows' owners
     struct disp_head head[DISP_MAX_HEADS];
     uint32_t hotplug;    // displays plugged or unplugged since the caller last looked (it clears this)
     uint32_t dp_irq;     // DisplayPort displays that raised IRQ_HPD since then (cleared the same way)
