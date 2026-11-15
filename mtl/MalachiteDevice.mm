@@ -3482,8 +3482,10 @@ static uint32_t malachite_cl_format(__unsafe_unretained id texture)
 
 - (void)setSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
-    if (index < MALACHITE_BINDINGS)
-        _samplers[index] = sampler;
+    if (index >= MALACHITE_BINDINGS)
+        return;
+    _samplers[index] = sampler;
+    malachite_keep(_cb, sampler);
 }
 
 // what the commands set is not kept, as the encoder's state before is what later calls expect
@@ -4365,8 +4367,10 @@ static id<MTLBuffer> malachite_shadow(id<MTLCommandQueue> queue, unsigned n, NSU
 
 - (void)setVertexSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
-    if (index < MALACHITE_BINDINGS)
-        _vsamplers[index] = sampler;
+    if (index >= MALACHITE_BINDINGS)
+        return;
+    _vsamplers[index] = sampler;
+    malachite_keep(_cb, sampler);
 }
 
 - (void)setCullMode:(MTLCullMode)mode
@@ -4648,8 +4652,10 @@ static bool malachite_resolves(MTLStoreAction action)
 
 - (void)setFragmentSamplerState:(id)sampler atIndex:(NSUInteger)index
 {
-    if (index < MALACHITE_BINDINGS)
-        _samplers[index] = sampler;
+    if (index >= MALACHITE_BINDINGS)
+        return;
+    _samplers[index] = sampler;
+    malachite_keep(_cb, sampler);
 }
 
 - (void)setViewport:(MTLViewport)v
