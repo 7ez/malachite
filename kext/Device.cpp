@@ -884,10 +884,10 @@ class Gpu : public IOService
     uint64_t boosted_at = 0;
     void boost_clocks(const gpu_ctx *c, uint64_t now)
     {
-        if (now - boosted_at < 500000 || !strcmp(c->owner, "WindowServer"))
+        if (now - boosted_at < 4000000 || !strcmp(c->owner, "WindowServer"))
             return;
         boosted_at = now;
-        pwr_boost(gsp, 2);
+        pwr_boost(gsp, 10);
     }
     IOReturn busy_open(gpu_ctx *c, IOReturn r)
     {
