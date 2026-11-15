@@ -20,6 +20,11 @@
 #import <mach-o/dyld.h>
 #import <mach/mach.h>
 #import <mach-o/loader.h>
+
+// CAMetalLayer sets it on its drawables' descriptors, and no public property carries it
+@interface MTLTextureDescriptor (MalachiteFramebufferOnly)
+@property(readonly) BOOL framebufferOnly;
+@end
 #import <mach-o/nlist.h>
 #import <string.h>
 #include <map>
@@ -130,6 +135,7 @@ extern "C" {
     __unsafe_unretained id _backing;
     uint64_t _offset;
     MTLTextureUsage _usage;  // the base reports none, and CoreImage then won't write to it
+    bool _framebuffer_only;  // CAMetalLayer sets it on its descriptors, apart from the usage
     uint32_t _pitch;  // an image's: level 0's row of GOBs
     id _owned;  // the backing buffer, when the device made it for the texture
     MalachiteHeapBuffer *_placed;  // keeps the MTLHeap's memory
@@ -593,6 +599,7 @@ static bool malachite_opencl_memory(void *ptr)
         t->_pitch = (uint32_t)bytesPerRow;
         t->_type = descriptor.textureType;
         t->_usage = descriptor.usage;
+        t->_framebuffer_only = descriptor.framebufferOnly;
         t->_width = descriptor.width;  // the base keeps 16 bits, a texture buffer's can be millions
     }
     return malachite_swizzled(t, descriptor.swizzle);  // CoreAnimation reads its one-channel surfaces through one
@@ -1965,6 +1972,11 @@ static void malachite_staging_give(id<MTLBuffer> buffer)
     return _usage;
 }
 
+- (BOOL)isFramebufferOnly
+{
+    return _framebuffer_only;
+}
+
 - (BOOL)canGenerateMipmapLevels
 {
     return NO;
@@ -2048,6 +2060,7 @@ static MalachiteTexture *malachite_swizzled(MalachiteTexture *t, MTLTextureSwizz
     if (t) {
         t->_owned = self;
         t->_type = type;
+        t->_framebuffer_only = _framebuffer_only;
         // a moved texture's view answering Private let malachite_depth_kind compress over the CPU's data
         t->_asked = _asked;
         t->_moved = _moved;
@@ -7855,6 +7868,10 @@ static uint64_t malachite_vram(void)
         t->_owned = buf;
         t->_surface = (IOSurfaceRef)CFRetain(surface);
         t->_plane = plane;
+        // Apple's drivers give an IOSurface texture of unspecified usage every use they support
+        if (t->_usage == MTLTextureUsageUnknown)
+            t->_usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget |
+                        MTLTextureUsagePixelFormatView;
         NSString *name = CFBridgingRelease(IOSurfaceCopyValue(surface, kIOSurfaceName));
         t->_capture = [name containsString:@"DisplayStream"] || [name containsString:@"CaptureSurface"] ||
                       [name containsString:@"encode"];
@@ -8063,6 +8080,7 @@ static struct malachite_layout malachite_layout_of(MTLTextureDescriptor *descrip
     t->_placed = placed;
     t->_offset = own ? 0 : placed->_offset;
     t->_type = descriptor.textureType;
+    t->_framebuffer_only = descriptor.framebufferOnly;
     t->_pitch = (uint32_t)l.pitch;
     t->_samples = l.samples;
     t->_format = descriptor.pixelFormat;
