@@ -6842,8 +6842,13 @@ static void malachite_write_back(MalachiteCommandBuffer *cb)
     [super commitAndWaitUntilSubmitted];
     // the capture's client (and the recorder's encoder) reads the surface without waiting for our GPU, and got half-drawn
     // or older frames
-    if (_writes_capture)
-        [self waitUntilCompleted];
+    // bounded, as a GPU that never finishes held WindowServer until its watchdog killed it
+    if (_writes_capture) {
+        uint64_t give_up = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 250 * NSEC_PER_MSEC;
+        while (((id<MTLCommandBuffer>)self).status < MTLCommandBufferStatusCompleted &&
+               clock_gettime_nsec_np(CLOCK_UPTIME_RAW) < give_up)
+            usleep(50);
+    }
 }
 
 // WindowServer reads a drawable without waiting, so it goes once its draws are done, not scheduled.
