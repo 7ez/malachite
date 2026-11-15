@@ -53,12 +53,12 @@ final class Steps {
     }
 
     @discardableResult
-    func tool(_ path: String, _ args: [String], log: String? = nil) -> Output {
+    func tool(_ path: String, _ args: [String], log: String? = nil, timeout: Double? = nil) -> Output {
         if dry {
             say("    would run \(shown(path, args))" + (log.map { " > \($0)" } ?? ""))
             return Output(status: 0, text: "")
         }
-        return capture(path, args, log: log.flatMap(openLog))
+        return capture(path, args, timeout: timeout, log: log.flatMap(openLog))
     }
 
     func must(_ path: String, _ args: [String]) throws {

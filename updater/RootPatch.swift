@@ -108,7 +108,12 @@ private func onSystemVolume(_ root: RootVolume, steps: Steps, _ body: (String) t
         }
     }
     try steps.must("/sbin/mount", ["-o", "nobrowse", "-t", "apfs", "/dev/\(root.device)", mnt])
-    defer { steps.tool("/usr/sbin/diskutil", ["unmount", mnt]) }
+    // diskutil sat for 27 minutes on a mount nothing had open
+    defer {
+        if steps.tool("/usr/sbin/diskutil", ["unmount", mnt], timeout: 30).status != 0 {
+            steps.tool("/sbin/umount", ["-f", mnt])
+        }
+    }
     try body(mnt)
 }
 

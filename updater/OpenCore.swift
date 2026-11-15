@@ -42,7 +42,7 @@ struct EFI {
     // a FAT volume still mounted at shutdown is marked dirty
     func release() {
         if let mounted {
-            _ = capture(diskutil, ["unmount", mounted])
+            _ = capture(diskutil, ["unmount", mounted], timeout: 30)
         }
     }
 }
@@ -60,7 +60,7 @@ func findEFI(_ given: String?, say: Say) -> EFI? {
             return EFI(path: mp, mounted: mounted ? guid : nil)
         }
         if mounted {
-            _ = capture(diskutil, ["unmount", guid])
+            _ = capture(diskutil, ["unmount", guid], timeout: 30)
         }
     }
     var mounted: [String] = []
@@ -82,7 +82,7 @@ func findEFI(_ given: String?, say: Say) -> EFI? {
         say("More than one OpenCore EFI, pick one with --efi /Volumes/<name>")
     }
     for part in mounted where mountPoint(part) != path {
-        _ = capture(diskutil, ["unmount", part])
+        _ = capture(diskutil, ["unmount", part], timeout: 30)
     }
     guard let path else { return nil }
     return EFI(path: path, mounted: mounted.first { mountPoint($0) == path })
