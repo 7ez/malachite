@@ -19,6 +19,7 @@ class Framebuffer : public IOFramebuffer {
 
     IODeviceMemory *aperture = nullptr;
     bool online = false, hw_cursor = false;
+    uint32_t power = 2;  // 0 asleep, 1 doze, 2 on
     mode modes[kMaxModes] = {};
     uint32_t nmodes = 0, current = 0;  // current: index into modes
     uint8_t edid[512] = {};

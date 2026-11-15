@@ -127,7 +127,25 @@ IOReturn Framebuffer::setAttribute(IOSelect attribute, uintptr_t value)
 {
     if (attribute != kIOPowerAttribute)
         return super::setAttribute(attribute, value);
+    // IOFramebuffer only lets WindowServer's acknowledgement through once it has seen these
+    uint32_t old = power, now = (uint32_t)value;
+    const uint32_t full = 2;
+    IOIndex after = 0;
+    if (old == full && now != full) {
+        handleEvent(kIOFBNotifyWillPowerOff);
+        after = kIOFBNotifyDidPowerOff;
+    } else if (old != full && now == full) {
+        handleEvent(kIOFBNotifyWillPowerOn);
+        after = kIOFBNotifyDidPowerOn;
+    }
+    if (now == 0 && old != 0)
+        handleEvent(kIOFBNotifyWillSleep, (void *)true);
+    power = now;
     IOReturn r = getProvider()->callPlatformFunction(SURFACE_FN_POWER, true, (void *)value, nullptr, nullptr, nullptr);
+    if (old == 0 && now != 0)
+        handleEvent(kIOFBNotifyDidWake, (void *)true);
+    if (after)
+        handleEvent(after);
     return r == kIOReturnNotReady ? kIOReturnSuccess : r;  // dark
 }
 
